@@ -1,0 +1,78 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+[build-system]
+requires = ["setuptools>=77.0.3", "pybind11>=2.13.6"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pypto"
+version = "0.1.0"
+authors = [{ name = "PyPTO Contributors", email = "pto@cann.osinfra.cn" }]
+description = "A high-performance programming framework for tile-centric computing"
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "LicenseRef-CANN-Open-Software-License-Agreement-Version-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+dependencies = [
+    # TODO
+]
+keywords = ["python", "pto", "tile", "tile-centric"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Software Development :: Compilers",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pyright>=1.1.407",
+    "ruff>=0.14.8",
+]
+
+[project.urls]
+Homepage = "https://gitcode.com/cann/pypto"
+Repository = "https://gitcode.com/cann/pypto"
+"Bug Tracker" = "https://gitcode.com/cann/pypto/issues"
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+required-version = "0.14.8"
+
+[tool.ruff.lint]
+select = [
+    "PL", # pylint, https://docs.astral.sh/ruff/rules/#pylint-pl
+    "I",  # isort, https://docs.astral.sh/ruff/rules/#isort-i
+    "E",  # pycodestyle errors, https://docs.astral.sh/ruff/rules/#error-e
+    "W",  # pycodestyle warnings, https://docs.astral.sh/ruff/rules/#warning-w
+    "F",  # pyflakes, https://docs.astral.sh/ruff/rules/#pyflakes-f
+]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+skip-magic-trailing-comma = false
+line-ending = "lf"
+
+[tool.ruff.lint.isort]
+known-first-party = ["pypto"]
+
+[tool.pylint]
+disbale="all"

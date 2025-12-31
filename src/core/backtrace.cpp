@@ -1,0 +1,167 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <cxxabi.h>
+#include <dlfcn.h>
+
+#include <cstdio>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "pypto/core/error.h"
+
+namespace pypto {
+
+std::string StackFrame::to_string() const {
+  std::ostringstream oss;
+
+  if (!function.empty()) {
+    oss << function;
+  } else {
+    oss << "0x" << std::hex << pc;
+  }
+
+  if (!filename.empty()) {
+    oss << " at " << filename;
+    if (lineno > 0) {
+      oss << ":" << std::dec << lineno;
+    }
+  }
+
+  return oss.str();
+}
+
+Backtrace& Backtrace::GetInstance() {
+  static Backtrace instance;
+  return instance;
+}
+
+Backtrace::Backtrace() {
+  // Get the path of the current shared library using dladdr
+  Dl_info info;
+  const char* filename = nullptr;
+
+  // Use the address of this function to find the shared library path
+  if (dladdr(reinterpret_cast<void*>(&Backtrace::GetInstance), &info)) {
+    filename = info.dli_fname;
+  }
+
+  // Use the filename from dladdr - this is the shared library path
+  state_ = backtrace_create_state(filename, 1, ErrorCallback, nullptr);
+}
+
+void Backtrace::ErrorCallback(void* data, const char* msg, int errnum) {
+  // Log errors in backtrace generation to stderr for debugging
+  if (msg) {
+    fprintf(stderr, "libbacktrace error: %s (errno: %d)\n", msg, errnum);
+  }
+}
+
+int Backtrace::FullCallback(void* data, uintptr_t pc, const char* filename, int lineno,
+                            const char* function) {
+  auto* frames = static_cast<std::vector<StackFrame>*>(data);
+
+  std::string func_str = function ? function : "";
+  std::string file_str = filename ? filename : "";
+
+  frames->emplace_back(func_str, file_str, lineno, pc);
+  return 0;  // Continue collecting frames
+}
+
+std::vector<StackFrame> Backtrace::CaptureStackTrace(int skip) {
+  std::vector<StackFrame> frames;
+
+  if (state_ != nullptr) {
+    // Skip one additional frame for this function itself
+    backtrace_full(state_, skip + 1, FullCallback, ErrorCallback, &frames);
+  }
+
+  return frames;
+}
+
+// Helper function to read a specific line from a file
+std::string ReadSourceLine(const std::string& filename, int lineno) {
+  std::ifstream file(filename);
+  if (!file.is_open()) {
+    return "";
+  }
+
+  std::string line;
+  int current_line = 0;
+  while (std::getline(file, line)) {
+    current_line++;
+    if (current_line == lineno) {
+      // Trim leading whitespace for display
+      size_t start = line.find_first_not_of(" \t");
+      if (start != std::string::npos) {
+        return line.substr(start);
+      }
+      return line;
+    }
+  }
+  return "";
+}
+
+std::string DemangleFunctionName(std::string name) {
+  int status = 0;
+  size_t length = name.size();
+  char* demangled_name = abi::__cxa_demangle(name.c_str(), nullptr, &length, &status);
+  if (demangled_name && status == 0 && length > 0) {
+    name = demangled_name;
+  }
+  if (demangled_name) {
+    std::free(demangled_name);
+  }
+  return name;
+}
+
+std::string Backtrace::FormatStackTrace(const std::vector<StackFrame>& frames) {
+  if (frames.empty()) {
+    return "";
+  }
+
+  std::ostringstream oss;
+
+  // Reverse the frames to show most recent last (like Python)
+  std::vector<StackFrame> reversed_frames(frames.rbegin(), frames.rend());
+
+  for (const auto& frame : reversed_frames) {
+    // Format: File "filename", line X in function_name
+    if (!frame.filename.empty()) {
+      if (frame.filename.find("libbacktrace") != std::string::npos ||
+          frame.filename.find("pybind11") != std::string::npos) {
+        // Skip libbacktrace and pybind11 frames
+        continue;
+      }
+      oss << " File \"" << frame.filename << "\", line " << frame.lineno;
+
+      std::string func_name = DemangleFunctionName(frame.function);
+      if (!func_name.empty() && func_name != "<unknown>") {
+        oss << " in " << func_name;
+      }
+      oss << "\n";
+
+      // Try to read and display the source line
+      std::string source_line = ReadSourceLine(frame.filename, frame.lineno);
+      if (!source_line.empty()) {
+        oss << "   " << source_line << "\n";
+      }
+    } else if (frame.pc != 0) {
+      // If we don't have filename info, skip this frame
+    }
+  }
+
+  return oss.str();
+}
+
+}  // namespace pypto
