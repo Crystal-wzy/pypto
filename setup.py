@@ -8,7 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import os
-import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +26,10 @@ class CMakeBuild(_build_ext):
         except OSError:
             raise RuntimeError("CMake must be installed to build this package")
 
+        # For editable installs, ensure we build in-place
+        if self.editable_mode:
+            self.inplace = True
+
         for ext in self.extensions:
             self.build_cmake(ext)
 
@@ -41,12 +44,21 @@ class CMakeBuild(_build_ext):
         build_temp.mkdir(parents=True, exist_ok=True)
 
         # Determine build type
-        cfg = "Debug" if self.debug else "Release"
+        cfg = "Debug" if self.debug else "RelWithDebInfo"
+
+        # For editable installs, output to source tree; otherwise to build_lib
+        # Check if this is an editable install (inplace build)
+        if self.inplace:
+            output_dir = source_dir / "python" / "pypto"
+        else:
+            output_dir = build_lib
+
+        output_dir = output_dir.absolute()
 
         # CMake configuration arguments
         cmake_args = [
-            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={build_lib}",
-            f"-DPYTHON_EXECUTABLE={sys.executable}",
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={output_dir}",
+            f"-DPython3_EXECUTABLE={sys.executable}",
             f"-DCMAKE_BUILD_TYPE={cfg}",
         ]
 
@@ -54,10 +66,7 @@ class CMakeBuild(_build_ext):
         build_args = ["--config", cfg]
 
         # Add parallel build flag
-        if platform.system() != "Windows":
-            build_args += ["--", f"-j{os.cpu_count() or 4}"]
-        else:
-            build_args += ["--", f"/m:{os.cpu_count() or 4}"]
+        build_args += ["--", f"-j{os.cpu_count() or 4}"]
 
         # Set CMAKE_BUILD_PARALLEL_LEVEL
         env = os.environ.copy()
