@@ -52,6 +52,8 @@ class StructuralHasher {
 
   result_type operator()(const IRNodePtr& node) { return HashNode(node); }
 
+  result_type operator()(const TypePtr& type) { return HashType(type); }
+
   // FieldVisitor interface methods
   [[nodiscard]] result_type InitResult() const { return 0; }
 
@@ -113,6 +115,10 @@ class StructuralHasher {
   }
 
   result_type VisitLeafField(const int& field) { return static_cast<result_type>(std::hash<int>{}(field)); }
+
+  result_type VisitLeafField(const double& field) {
+    return static_cast<result_type>(std::hash<double>{}(field));
+  }
 
   result_type VisitLeafField(const std::string& field) {
     return static_cast<result_type>(std::hash<std::string>{}(field));
@@ -241,6 +247,7 @@ StructuralHasher::result_type StructuralHasher::HashNode(const IRNodePtr& node) 
 
   HASH_DISPATCH(Var)
   HASH_DISPATCH(ConstInt)
+  HASH_DISPATCH(ConstFloat)
   HASH_DISPATCH(Call)
   HASH_DISPATCH(TupleGetItemExpr)
   HASH_DISPATCH(BinaryExpr)
@@ -281,6 +288,11 @@ StructuralHasher::result_type StructuralHasher::HashNode(const IRNodePtr& node) 
 uint64_t structural_hash(const IRNodePtr& node, bool enable_auto_mapping) {
   StructuralHasher hasher(enable_auto_mapping);
   return hasher(node);
+}
+
+uint64_t structural_hash(const TypePtr& type, bool enable_auto_mapping) {
+  StructuralHasher hasher(enable_auto_mapping);
+  return hasher(type);
 }
 
 }  // namespace ir

@@ -17,15 +17,16 @@
 #include <vector>
 
 #include "pypto/core/error.h"
+#include "pypto/core/logging.h"
 
 namespace pypto {
 namespace ir {
 
 // ========== IRBuilder Implementation ==========
 
-IRBuilder::IRBuilder() {}
+IRBuilder::IRBuilder() = default;
 
-IRBuilder::~IRBuilder() {}
+IRBuilder::~IRBuilder() = default;
 
 // ========== Function Building ==========
 
@@ -113,6 +114,9 @@ StmtPtr IRBuilder::EndForLoop(const Span& end_span) {
 
   // Validate iter_args and return_vars match
   if (loop_ctx->GetIterArgs().size() != loop_ctx->GetReturnVars().size()) {
+    // Pop context before throwing to maintain stack consistency
+    context_stack_.pop_back();
+
     std::ostringstream oss;
     oss << "For loop has " << loop_ctx->GetIterArgs().size() << " iteration arguments but "
         << loop_ctx->GetReturnVars().size() << " return variables. They must match.";
@@ -154,21 +158,19 @@ StmtPtr IRBuilder::EndForLoop(const Span& end_span) {
 // ========== If Statement Building ==========
 
 void IRBuilder::BeginIf(const ExprPtr& condition, const Span& span) {
-  if (context_stack_.empty()) {
-    throw pypto::RuntimeError(
-        "Cannot begin if statement: not inside a function or another valid context at " + span.to_string());
-  }
-
+  LOG_DEBUG << "BeginIf: " << context_stack_.size();
+  CHECK(!context_stack_.empty())
+      << "Cannot begin if statement: not inside a function or another valid context at " << span.to_string();
   context_stack_.push_back(std::make_unique<IfStmtContext>(condition, span));
 }
 
 void IRBuilder::BeginElse(const Span& span) {
+  LOG_DEBUG << "BeginElse: " << context_stack_.size();
   ValidateInIf("BeginElse");
 
   auto* if_ctx = static_cast<IfStmtContext*>(CurrentContext());
-  if (if_ctx->InElseBranch()) {
-    throw pypto::RuntimeError("Cannot begin else branch: already in else branch at " + span.to_string());
-  }
+  CHECK(!if_ctx->InElseBranch()) << "Cannot begin else branch: already in else branch at "
+                                 << span.to_string();
 
   if_ctx->BeginElseBranch();
 }
@@ -179,6 +181,7 @@ void IRBuilder::AddIfReturnVar(const VarPtr& var) {
 }
 
 StmtPtr IRBuilder::EndIf(const Span& end_span) {
+  LOG_DEBUG << "EndIf: " << context_stack_.size();
   ValidateInIf("EndIf");
 
   auto* if_ctx = static_cast<IfStmtContext*>(CurrentContext());
@@ -230,22 +233,12 @@ StmtPtr IRBuilder::EndIf(const Span& end_span) {
 // ========== Statement Recording ==========
 
 void IRBuilder::Emit(const StmtPtr& stmt) {
+  LOG_DEBUG << "Emit: " << stmt->TypeName() << " " << context_stack_.size();
   if (context_stack_.empty()) {
     throw pypto::RuntimeError("Cannot emit statement: not inside any context");
   }
 
   auto* ctx = CurrentContext();
-
-  // If in if statement and in else branch, add to else statements
-  if (ctx->GetType() == BuildContext::Type::IF_STMT) {
-    auto* if_ctx = static_cast<IfStmtContext*>(ctx);
-    if (if_ctx->InElseBranch()) {
-      if_ctx->AddElseStmt(stmt);
-      return;
-    }
-  }
-
-  // Otherwise add to main statement list
   ctx->AddStmt(stmt);
 }
 
@@ -315,24 +308,17 @@ T* IRBuilder::GetCurrentContextAs() {
 }
 
 void IRBuilder::ValidateInFunction(const std::string& operation) {
-  if (!InFunction()) {
-    throw pypto::RuntimeError(operation + " can only be called inside a function context");
-  }
-  if (CurrentContext()->GetType() != BuildContext::Type::FUNCTION) {
-    throw pypto::RuntimeError(operation + " must be called directly in function context, not nested");
-  }
+  CHECK(InFunction()) << operation << " can only be called inside a function context";
+  CHECK(CurrentContext()->GetType() == BuildContext::Type::FUNCTION)
+      << operation << " must be called directly in function context, not nested";
 }
 
 void IRBuilder::ValidateInLoop(const std::string& operation) {
-  if (!InLoop()) {
-    throw pypto::RuntimeError(operation + " can only be called inside a for loop context");
-  }
+  CHECK(InLoop()) << operation << " can only be called inside a for loop context";
 }
 
 void IRBuilder::ValidateInIf(const std::string& operation) {
-  if (!InIf()) {
-    throw pypto::RuntimeError(operation + " can only be called inside an if statement context");
-  }
+  CHECK(InIf()) << operation << " can only be called inside an if statement context";
 }
 
 }  // namespace ir

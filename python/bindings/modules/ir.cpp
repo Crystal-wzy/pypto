@@ -171,23 +171,15 @@ void BindIR(nb::module_& m) {
       .def(nb::init<std::string>(), nb::arg("name"),
            "Create a global variable reference with the given name");
 
-  // IRNode - abstract base, const shared_ptr
-  auto irnode_class = nb::class_<IRNode>(ir, "IRNode", "Base class for all IR nodes");
-  BindFields<IRNode>(irnode_class);
-
-  // Expr - abstract base, const shared_ptr
-  auto expr_class = nb::class_<Expr, IRNode>(ir, "Expr", "Base class for all expressions");
-  BindFields<Expr>(expr_class);
-
-  // ScalarExpr - abstract, const shared_ptr
-  auto scalar_expr_class =
-      nb::class_<ScalarExpr, Expr>(ir, "ScalarExpr", "Base class for all scalar expressions");
-  BindFields<ScalarExpr>(scalar_expr_class);
-  BindStrRepr<ScalarExpr>(scalar_expr_class);
-
   // Type - abstract base, const shared_ptr
   auto type_class = nb::class_<Type>(ir, "Type", "Base class for type representations");
   BindFields<Type>(type_class);
+  type_class.def(
+      "__str__", [](const TypePtr& self) { return PythonPrint(self, "pi"); },
+      "Python-style string representation");
+  type_class.def(
+      "__eq__", [](const TypePtr& self, const TypePtr& other) { return structural_equal(self, other); },
+      "Equality comparison");
 
   // UnknownType - const shared_ptr
   auto unknown_type_class =
@@ -202,16 +194,27 @@ void BindIR(nb::module_& m) {
   scalar_type_class.def(nb::init<DataType>(), nb::arg("dtype"), "Create a scalar type");
   BindFields<ScalarType>(scalar_type_class);
 
+  // IRNode - abstract base, const shared_ptr
+  auto irnode_class = nb::class_<IRNode>(ir, "IRNode", "Base class for all IR nodes");
+  BindFields<IRNode>(irnode_class);
+  irnode_class.def(
+      "same_as", [](const IRNodePtr& self, const IRNodePtr& other) { return self == other; },
+      nb::arg("other"), "Check if this IR node is the same as another IR node.");
+
+  // Expr - abstract base, const shared_ptr
+  auto expr_class = nb::class_<Expr, IRNode>(ir, "Expr", "Base class for all expressions");
+  BindFields<Expr>(expr_class);
+
   // TensorType - const shared_ptr
   auto tensor_type_class = nb::class_<TensorType, Type>(ir, "TensorType", "Tensor type representation");
-  tensor_type_class.def(nb::init<DataType, const std::vector<ExprPtr>&>(), nb::arg("dtype"), nb::arg("shape"),
+  tensor_type_class.def(nb::init<const std::vector<ExprPtr>&, DataType>(), nb::arg("shape"), nb::arg("dtype"),
                         "Create a tensor type");
   BindFields<TensorType>(tensor_type_class);
 
   // TileType - const shared_ptr
   auto tile_type_class = nb::class_<TileType, Type>(
       ir, "TileType", "Tile type representation (2D tensor with at most 2 dimensions)");
-  tile_type_class.def(nb::init<DataType, const std::vector<ExprPtr>&>(), nb::arg("dtype"), nb::arg("shape"),
+  tile_type_class.def(nb::init<const std::vector<ExprPtr>&, DataType>(), nb::arg("shape"), nb::arg("dtype"),
                       "Create a tile type (validates shape has at most 2 dimensions)");
   BindFields<TileType>(tile_type_class);
 
@@ -259,16 +262,18 @@ void BindIR(nb::module_& m) {
   BindFields<IterArg>(iterarg_class);
 
   // ConstInt - const shared_ptr
-  auto constint_class = nb::class_<ConstInt, ScalarExpr>(ir, "ConstInt", "Constant integer expression");
+  auto constint_class = nb::class_<ConstInt, Expr>(ir, "ConstInt", "Constant integer expression");
   constint_class.def(nb::init<int, DataType, const Span&>(), nb::arg("value"), nb::arg("dtype"),
                      nb::arg("span"), "Create a constant integer expression");
   BindFields<ConstInt>(constint_class);
+  constint_class.def_prop_ro("dtype", &ConstInt::dtype, "Data type of the expression");
 
   // ConstFloat - const shared_ptr
-  auto constfloat_class = nb::class_<ConstFloat, ScalarExpr>(ir, "ConstFloat", "Constant float expression");
+  auto constfloat_class = nb::class_<ConstFloat, Expr>(ir, "ConstFloat", "Constant float expression");
   constfloat_class.def(nb::init<double, DataType, const Span&>(), nb::arg("value"), nb::arg("dtype"),
                        nb::arg("span"), "Create a constant float expression");
   BindFields<ConstFloat>(constfloat_class);
+  constfloat_class.def_prop_ro("dtype", &ConstFloat::dtype, "Data type of the expression");
 
   // Call - const shared_ptr
   auto call_class = nb::class_<Call, Expr>(ir, "Call", "Function call expression");
@@ -289,13 +294,11 @@ void BindIR(nb::module_& m) {
   BindStrRepr<TupleGetItemExpr>(tuple_get_item_class);
 
   // BinaryExpr - abstract, const shared_ptr
-  auto binaryexpr_class =
-      nb::class_<BinaryExpr, ScalarExpr>(ir, "BinaryExpr", "Base class for binary operations");
+  auto binaryexpr_class = nb::class_<BinaryExpr, Expr>(ir, "BinaryExpr", "Base class for binary operations");
   BindFields<BinaryExpr>(binaryexpr_class);
 
   // UnaryExpr - abstract, const shared_ptr
-  auto unaryexpr_class =
-      nb::class_<UnaryExpr, ScalarExpr>(ir, "UnaryExpr", "Base class for unary operations");
+  auto unaryexpr_class = nb::class_<UnaryExpr, Expr>(ir, "UnaryExpr", "Base class for unary operations");
   BindFields<UnaryExpr>(unaryexpr_class);
 
 // Macro to bind binary expression nodes
@@ -342,21 +345,38 @@ void BindIR(nb::module_& m) {
   BIND_UNARY_EXPR(Neg, "Negation expression (-operand)")
   BIND_UNARY_EXPR(Not, "Logical not expression (not operand)")
   BIND_UNARY_EXPR(BitNot, "Bitwise not expression (~operand)")
+  BIND_UNARY_EXPR(Cast, "Cast expression (cast operand to dtype)")
 
 #undef BIND_UNARY_EXPR
 
   // Bind structural hash and equality functions
-  ir.def("structural_hash", &structural_hash, nb::arg("node"), nb::arg("enable_auto_mapping") = false,
+  ir.def("structural_hash", static_cast<uint64_t (*)(const IRNodePtr&, bool)>(&structural_hash),
+         nb::arg("node"), nb::arg("enable_auto_mapping") = false,
          "Compute structural hash of an IR node. "
          "Ignores source location (Span). Two IR nodes with identical structure hash to the same value. "
          "If enable_auto_mapping=True, variable names are ignored (e.g., x+1 and y+1 hash the same). "
          "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
          "name).");
+  ir.def("structural_hash", static_cast<uint64_t (*)(const TypePtr&, bool)>(&structural_hash),
+         nb::arg("type"), nb::arg("enable_auto_mapping") = false,
+         "Compute structural hash of a type. "
+         "Ignores source location (Span). Two types with identical structure hash to the same value. "
+         "If enable_auto_mapping=True, variable names are ignored (e.g., x+1 and y+1 hash the same). "
+         "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
+         "name).");
 
-  ir.def("structural_equal", &structural_equal, nb::arg("lhs"), nb::arg("rhs"),
-         nb::arg("enable_auto_mapping") = false,
+  ir.def("structural_equal",
+         static_cast<bool (*)(const IRNodePtr&, const IRNodePtr&, bool)>(&structural_equal), nb::arg("lhs"),
+         nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
          "Check if two IR nodes are structurally equal. "
          "Ignores source location (Span). Returns True if IR nodes have identical structure. "
+         "If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1). "
+         "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
+         "name).");
+  ir.def("structural_equal", static_cast<bool (*)(const TypePtr&, const TypePtr&, bool)>(&structural_equal),
+         nb::arg("lhs"), nb::arg("rhs"), nb::arg("enable_auto_mapping") = false,
+         "Check if two types are structurally equal. "
+         "Ignores source location (Span). Returns True if types have identical structure. "
          "If enable_auto_mapping=True, automatically map variables (e.g., x+1 equals y+1). "
          "If enable_auto_mapping=False (default), variable objects must be exactly the same (not just same "
          "name).");
@@ -502,6 +522,51 @@ void BindIR(nb::module_& m) {
       "Args:\n"
       "    node: IR node to print\n"
       "    prefix: Module prefix (default 'pi' for 'import pypto.ir as pi')");
+
+  // operator functions for Var (wrapped in Python for span capture and normalization)
+  // Using standalone C++ API functions from scalar_expr.h
+  // Note: first parameter (self) is implicit when binding as method
+  ir.def("add", &MakeAdd, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Addition operator");
+  ir.def("sub", &MakeSub, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Subtraction operator");
+  ir.def("mul", &MakeMul, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Multiplication operator");
+  ir.def("truediv", &MakeFloatDiv, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "True division operator");
+  ir.def("floordiv", &MakeFloorDiv, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Floor division operator");
+  ir.def("mod", &MakeFloorMod, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Modulo operator");
+  ir.def("pow", &MakePow, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Power operator");
+  ir.def("eq", &MakeEq, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Equality operator");
+  ir.def("ne", &MakeNe, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Inequality operator");
+  ir.def("lt", &MakeLt, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Less than operator");
+  ir.def("le", &MakeLe, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Less than or equal operator");
+  ir.def("gt", &MakeGt, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Greater than operator");
+  ir.def("ge", &MakeGe, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Greater than or equal operator");
+  ir.def("neg", &MakeNeg, nb::arg("operand"), nb::arg("span") = Span::unknown(), "Negation operator");
+  ir.def("cast", &MakeCast, nb::arg("operand"), nb::arg("dtype"), nb::arg("span") = Span::unknown(),
+         "Cast operator");
+  ir.def("bit_and", &MakeBitAnd, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Bitwise and operator");
+  ir.def("bit_or", &MakeBitOr, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Bitwise or operator");
+  ir.def("bit_xor", &MakeBitXor, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Bitwise xor operator");
+  ir.def("bit_shift_left", &MakeBitShiftLeft, nb::arg("lhs"), nb::arg("rhs"),
+         nb::arg("span") = Span::unknown(), "Bitwise left shift operator");
+  ir.def("bit_shift_right", &MakeBitShiftRight, nb::arg("lhs"), nb::arg("rhs"),
+         nb::arg("span") = Span::unknown(), "Bitwise right shift operator");
+  ir.def("bit_not", &MakeBitNot, nb::arg("operand"), nb::arg("span") = Span::unknown(),
+         "Bitwise not operator");
 }
 
 }  // namespace python

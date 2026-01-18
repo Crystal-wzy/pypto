@@ -16,7 +16,6 @@
 #include <string>
 #include <tuple>
 #include <utility>
-#include <vector>
 
 #include "pypto/core/dtype.h"
 #include "pypto/ir/core.h"
@@ -75,7 +74,7 @@ using ScalarExprPtr = std::shared_ptr<const ScalarExpr>;
  *
  * Represents a constant numeric value.
  */
-class ConstInt : public ScalarExpr {
+class ConstInt : public Expr {
  public:
   const int value_;  // Numeric constant value (immutable)
 
@@ -85,7 +84,8 @@ class ConstInt : public ScalarExpr {
    * @param value Numeric value
    * @param span Source location
    */
-  ConstInt(int value, DataType dtype, Span span) : ScalarExpr(std::move(span), dtype), value_(value) {}
+  ConstInt(int value, DataType dtype, Span span)
+      : Expr(std::move(span), std::make_shared<ScalarType>(dtype)), value_(value) {}
 
   [[nodiscard]] std::string TypeName() const override { return "ConstInt"; }
 
@@ -95,8 +95,15 @@ class ConstInt : public ScalarExpr {
    * @return Tuple of field descriptors (value as USUAL field)
    */
   static constexpr auto GetFieldDescriptors() {
-    return std::tuple_cat(ScalarExpr::GetFieldDescriptors(),
+    return std::tuple_cat(Expr::GetFieldDescriptors(),
                           std::make_tuple(reflection::UsualField(&ConstInt::value_, "value")));
+  }
+
+  [[nodiscard]] DataType dtype() const {
+    auto scalar_type = std::dynamic_pointer_cast<const ScalarType>(GetType());
+    INTERNAL_CHECK(scalar_type) << "ConstInt is expected to have ScalarType type, but got " +
+                                       GetType()->TypeName();
+    return scalar_type->dtype_;
   }
 };
 
@@ -107,7 +114,7 @@ using ConstIntPtr = std::shared_ptr<const ConstInt>;
  *
  * Represents a constant floating-point value.
  */
-class ConstFloat : public ScalarExpr {
+class ConstFloat : public Expr {
  public:
   const double value_;  // Floating-point constant value (immutable)
 
@@ -118,7 +125,8 @@ class ConstFloat : public ScalarExpr {
    * @param dtype Data type
    * @param span Source location
    */
-  ConstFloat(double value, DataType dtype, Span span) : ScalarExpr(std::move(span), dtype), value_(value) {}
+  ConstFloat(double value, DataType dtype, Span span)
+      : Expr(std::move(span), std::make_shared<ScalarType>(dtype)), value_(value) {}
 
   [[nodiscard]] std::string TypeName() const override { return "ConstFloat"; }
 
@@ -128,8 +136,15 @@ class ConstFloat : public ScalarExpr {
    * @return Tuple of field descriptors (value as USUAL field)
    */
   static constexpr auto GetFieldDescriptors() {
-    return std::tuple_cat(ScalarExpr::GetFieldDescriptors(),
+    return std::tuple_cat(Expr::GetFieldDescriptors(),
                           std::make_tuple(reflection::UsualField(&ConstFloat::value_, "value")));
+  }
+
+  [[nodiscard]] DataType dtype() const {
+    auto scalar_type = std::dynamic_pointer_cast<const ScalarType>(GetType());
+    INTERNAL_CHECK(scalar_type) << "ConstFloat is expected to have ScalarType type, but got " +
+                                       GetType()->TypeName();
+    return scalar_type->dtype_;
   }
 };
 
@@ -140,13 +155,15 @@ using ConstFloatPtr = std::shared_ptr<const ConstFloat>;
  *
  * Abstract base for all operations with two operands.
  */
-class BinaryExpr : public ScalarExpr {
+class BinaryExpr : public Expr {
  public:
   ExprPtr left_;   // Left operand
   ExprPtr right_;  // Right operand
 
   BinaryExpr(ExprPtr left, ExprPtr right, DataType dtype, Span span)
-      : ScalarExpr(std::move(span), dtype), left_(std::move(left)), right_(std::move(right)) {}
+      : Expr(std::move(span), std::make_shared<ScalarType>(dtype)),
+        left_(std::move(left)),
+        right_(std::move(right)) {}
 
   /**
    * @brief Get field descriptors for reflection-based visitation
@@ -154,7 +171,7 @@ class BinaryExpr : public ScalarExpr {
    * @return Tuple of field descriptors (left and right as USUAL fields)
    */
   static constexpr auto GetFieldDescriptors() {
-    return std::tuple_cat(ScalarExpr::GetFieldDescriptors(),
+    return std::tuple_cat(Expr::GetFieldDescriptors(),
                           std::make_tuple(reflection::UsualField(&BinaryExpr::left_, "left"),
                                           reflection::UsualField(&BinaryExpr::right_, "right")));
   }
@@ -164,15 +181,16 @@ using BinaryExprPtr = std::shared_ptr<const BinaryExpr>;
 
 // Macro to define binary expression node classes
 // Usage: DEFINE_BINARY_EXPR_NODE(Add, "Addition expression (left + right)")
-#define DEFINE_BINARY_EXPR_NODE(OpName, Description)                               \
-  /* Description */                                                                \
-  class OpName : public BinaryExpr {                                               \
-   public:                                                                         \
-    OpName(ExprPtr left, ExprPtr right, DataType dtype, Span span)                 \
-        : BinaryExpr(std::move(left), std::move(right), dtype, std::move(span)) {} \
-    [[nodiscard]] std::string TypeName() const override { return #OpName; }        \
-  };                                                                               \
-                                                                                   \
+// NOLINTNEXTLINE(bugprone-macro-parentheses)
+#define DEFINE_BINARY_EXPR_NODE(OpName, Description)                                          \
+  /* Description */                                                                           \
+  class OpName : public BinaryExpr {                                                          \
+   public:                                                                                    \
+    OpName(ExprPtr left, ExprPtr right, DataType dtype, Span span)                            \
+        : BinaryExpr(std::move(left), std::move(right), std::move(dtype), std::move(span)) {} \
+    [[nodiscard]] std::string TypeName() const override { return #OpName; }                   \
+  };                                                                                          \
+                                                                                              \
   using OpName##Ptr = std::shared_ptr<const OpName>;
 
 DEFINE_BINARY_EXPR_NODE(Add, "Addition expression (left + right)");
@@ -206,20 +224,15 @@ DEFINE_BINARY_EXPR_NODE(BitShiftRight, "Bitwise right shift expression (left >> 
  *
  * Abstract base for all operations with one operand.
  */
-class UnaryExpr : public ScalarExpr {
+class UnaryExpr : public Expr {
  public:
   ExprPtr operand_;  // Operand
 
   UnaryExpr(ExprPtr operand, DataType dtype, Span span)
-      : ScalarExpr(std::move(span), dtype), operand_(std::move(operand)) {}
+      : Expr(std::move(span), std::make_shared<ScalarType>(dtype)), operand_(std::move(operand)) {}
 
-  /**
-   * @brief Get field descriptors for reflection-based visitation
-   *
-   * @return Tuple of field descriptors (operand_ as USUAL field)
-   */
   static constexpr auto GetFieldDescriptors() {
-    return std::tuple_cat(ScalarExpr::GetFieldDescriptors(),
+    return std::tuple_cat(Expr::GetFieldDescriptors(),
                           std::make_tuple(reflection::UsualField(&UnaryExpr::operand_, "operand")));
   }
 };
@@ -228,6 +241,7 @@ using UnaryExprPtr = std::shared_ptr<const UnaryExpr>;
 
 // Macro to define unary expression node classes
 // Usage: DEFINE_UNARY_EXPR_NODE(Neg, "Negation expression (-operand)")
+// NOLINTNEXTLINE(bugprone-macro-parentheses)
 #define DEFINE_UNARY_EXPR_NODE(OpName, Description)                         \
   /* Description */                                                         \
   class OpName : public UnaryExpr {                                         \
@@ -243,8 +257,212 @@ DEFINE_UNARY_EXPR_NODE(Abs, "Absolute value expression (abs(operand))")
 DEFINE_UNARY_EXPR_NODE(Neg, "Negation expression (-operand)")
 DEFINE_UNARY_EXPR_NODE(Not, "Logical not expression (not operand)")
 DEFINE_UNARY_EXPR_NODE(BitNot, "Bitwise not expression (~operand)")
+DEFINE_UNARY_EXPR_NODE(Cast, "Cast expression (cast operand to dtype)")
 
 #undef DEFINE_UNARY_EXPR_NODE
+// ========== Helper Functions for Operator Construction ==========
+
+/**
+ * @brief Get the dtype from a scalar expression or scalar var
+ *
+ * @param expr Expression to extract dtype from
+ * @return DataType of the expression
+ * @throws pypto::TypeError if expr is not a scalar expression or scalar var
+ */
+inline DataType GetScalarDtype(const ExprPtr& expr) {
+  if (auto scalar_type = std::dynamic_pointer_cast<const ScalarType>(expr->GetType())) {
+    return scalar_type->dtype_;
+  } else {
+    throw TypeError("Expression must be ScalarExpr or Var with ScalarType, got " + expr->TypeName() +
+                    " with type " + expr->GetType()->TypeName());
+  }
+}
+
+inline bool IsBoolDtype(const DataType& dtype) { return dtype == DataType::BOOL; }
+
+enum class ScalarCategory {
+  kInt,
+  kFloat,
+};
+
+inline ScalarCategory GetNumericCategory(const DataType& dtype, const std::string& op_name) {
+  if (dtype.IsFloat()) {
+    return ScalarCategory::kFloat;
+  }
+  if (dtype.IsInt()) {
+    return ScalarCategory::kInt;
+  }
+  throw TypeError("Operator '" + op_name + "' requires numeric scalar dtype, got " + dtype.ToString());
+}
+
+inline DataType PromoteSameCategoryDtype(const DataType& left_dtype, const DataType& right_dtype,
+                                         const std::string& op_name) {
+  if (IsBoolDtype(left_dtype) || IsBoolDtype(right_dtype)) {
+    throw TypeError("Operator '" + op_name + "' does not accept bool dtype");
+  }
+  auto left_category = GetNumericCategory(left_dtype, op_name);
+  auto right_category = GetNumericCategory(right_dtype, op_name);
+  if (left_category != right_category) {
+    throw TypeError("Operator '" + op_name + "' requires same numeric dtype category, got " +
+                    left_dtype.ToString() + " and " + right_dtype.ToString());
+  }
+  size_t left_bits = left_dtype.GetBit();
+  size_t right_bits = right_dtype.GetBit();
+  if (left_bits > right_bits) {
+    return left_dtype;
+  }
+  if (right_bits > left_bits) {
+    return right_dtype;
+  }
+  return left_dtype;
+}
+
+struct BinaryOperands {
+  ExprPtr left;
+  ExprPtr right;
+  DataType dtype;
+};
+
+inline ExprPtr MaybeCast(const ExprPtr& expr, DataType target_dtype, const Span& span) {
+  DataType dtype = GetScalarDtype(expr);
+  if (dtype == target_dtype) {
+    return expr;
+  }
+  return std::make_shared<Cast>(expr, target_dtype, span);
+}
+
+inline BinaryOperands PromoteBinaryOperands(const ExprPtr& left, const ExprPtr& right,
+                                            const std::string& op_name, const Span& span) {
+  DataType left_dtype = GetScalarDtype(left);
+  DataType right_dtype = GetScalarDtype(right);
+  DataType promoted_dtype = PromoteSameCategoryDtype(left_dtype, right_dtype, op_name);
+  return {MaybeCast(left, promoted_dtype, span), MaybeCast(right, promoted_dtype, span), promoted_dtype};
+}
+
+inline BinaryOperands PromoteIntBinaryOperands(const ExprPtr& left, const ExprPtr& right,
+                                               const std::string& op_name, const Span& span) {
+  DataType left_dtype = GetScalarDtype(left);
+  DataType right_dtype = GetScalarDtype(right);
+  if (!left_dtype.IsInt() || !right_dtype.IsInt()) {
+    throw TypeError("Operator '" + op_name + "' requires integer dtype, got " + left_dtype.ToString() +
+                    " and " + right_dtype.ToString());
+  }
+  DataType promoted_dtype = PromoteSameCategoryDtype(left_dtype, right_dtype, op_name);
+  return {MaybeCast(left, promoted_dtype, span), MaybeCast(right, promoted_dtype, span), promoted_dtype};
+}
+
+// ========== Binary Operator Construction Functions ==========
+
+inline ExprPtr MakeCast(const ExprPtr& operand, DataType dtype, const Span& span = Span::unknown()) {
+  return std::make_shared<Cast>(operand, dtype, span);
+}
+
+inline ExprPtr MakeAdd(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "add", span);
+  return std::make_shared<Add>(operands.left, operands.right, operands.dtype, span);
+}
+
+inline ExprPtr MakeSub(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "sub", span);
+  return std::make_shared<Sub>(operands.left, operands.right, operands.dtype, span);
+}
+
+inline ExprPtr MakeMul(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "mul", span);
+  return std::make_shared<Mul>(operands.left, operands.right, operands.dtype, span);
+}
+
+inline ExprPtr MakeFloatDiv(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "truediv", span);
+  return std::make_shared<FloatDiv>(operands.left, operands.right, operands.dtype, span);
+}
+
+inline ExprPtr MakeFloorDiv(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "floordiv", span);
+  return std::make_shared<FloorDiv>(operands.left, operands.right, operands.dtype, span);
+}
+
+inline ExprPtr MakeFloorMod(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "mod", span);
+  return std::make_shared<FloorMod>(operands.left, operands.right, operands.dtype, span);
+}
+
+inline ExprPtr MakePow(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "pow", span);
+  return std::make_shared<Pow>(operands.left, operands.right, operands.dtype, span);
+}
+
+inline ExprPtr MakeEq(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "eq", span);
+  return std::make_shared<Eq>(operands.left, operands.right, DataType::BOOL, span);
+}
+
+inline ExprPtr MakeNe(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "ne", span);
+  return std::make_shared<Ne>(operands.left, operands.right, DataType::BOOL, span);
+}
+
+inline ExprPtr MakeLt(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "lt", span);
+  return std::make_shared<Lt>(operands.left, operands.right, DataType::BOOL, span);
+}
+
+inline ExprPtr MakeLe(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "le", span);
+  return std::make_shared<Le>(operands.left, operands.right, DataType::BOOL, span);
+}
+
+inline ExprPtr MakeGt(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "gt", span);
+  return std::make_shared<Gt>(operands.left, operands.right, DataType::BOOL, span);
+}
+
+inline ExprPtr MakeGe(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteBinaryOperands(left, right, "ge", span);
+  return std::make_shared<Ge>(operands.left, operands.right, DataType::BOOL, span);
+}
+
+inline ExprPtr MakeBitAnd(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteIntBinaryOperands(left, right, "bit_and", span);
+  return std::make_shared<BitAnd>(operands.left, operands.right, operands.dtype, span);
+}
+
+inline ExprPtr MakeBitOr(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteIntBinaryOperands(left, right, "bit_or", span);
+  return std::make_shared<BitOr>(operands.left, operands.right, operands.dtype, span);
+}
+
+inline ExprPtr MakeBitXor(const ExprPtr& left, const ExprPtr& right, const Span& span = Span::unknown()) {
+  auto operands = PromoteIntBinaryOperands(left, right, "bit_xor", span);
+  return std::make_shared<BitXor>(operands.left, operands.right, operands.dtype, span);
+}
+
+inline ExprPtr MakeBitShiftLeft(const ExprPtr& left, const ExprPtr& right,
+                                const Span& span = Span::unknown()) {
+  auto operands = PromoteIntBinaryOperands(left, right, "bit_shift_left", span);
+  return std::make_shared<BitShiftLeft>(operands.left, operands.right, operands.dtype, span);
+}
+
+inline ExprPtr MakeBitShiftRight(const ExprPtr& left, const ExprPtr& right,
+                                 const Span& span = Span::unknown()) {
+  auto operands = PromoteIntBinaryOperands(left, right, "bit_shift_right", span);
+  return std::make_shared<BitShiftRight>(operands.left, operands.right, operands.dtype, span);
+}
+
+// ========== Unary Operator Construction Functions ==========
+
+inline ExprPtr MakeNeg(const ExprPtr& operand, const Span& span = Span::unknown()) {
+  return std::make_shared<Neg>(operand, GetScalarDtype(operand), span);
+}
+
+inline ExprPtr MakeBitNot(const ExprPtr& operand, const Span& span = Span::unknown()) {
+  DataType dtype = GetScalarDtype(operand);
+  if (!dtype.IsInt()) {
+    throw TypeError("Operator 'bit_not' requires integer dtype, got " + dtype.ToString());
+  }
+  return std::make_shared<BitNot>(operand, dtype, span);
+}
+
 }  // namespace ir
 }  // namespace pypto
 

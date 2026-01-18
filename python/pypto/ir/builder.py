@@ -16,9 +16,11 @@ automatic span tracking via the inspect module.
 
 import inspect
 from contextlib import contextmanager
-from typing import Optional
+from typing import Iterator, List, Optional, Union
 
 from pypto.pypto_core import ir
+
+from .utils import _normalize_expr
 
 
 class IRBuilder:
@@ -39,7 +41,7 @@ class IRBuilder:
         >>> func = f.get_result()
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the IR builder."""
         # Import here to avoid circular dependency
         from pypto.pypto_core.ir import (  # noqa: PLC0415
@@ -47,12 +49,12 @@ class IRBuilder:
         )
 
         self._builder = CppIRBuilder()
-        self._begin_spans = {}  # Track begin spans for multi-line contexts
+        self._begin_spans: dict[int, ir.Span] = {}  # Track begin spans for multi-line contexts
 
     # ========== Context Managers for Multi-line Constructs ==========
 
     @contextmanager
-    def function(self, name: str, span: Optional[ir.Span] = None):
+    def function(self, name: str, span: Optional[ir.Span] = None) -> Iterator["FunctionBuilder"]:
         """Context manager for building functions.
 
         Args:
@@ -83,14 +85,21 @@ class IRBuilder:
             del self._begin_spans[ctx_id]
 
     @contextmanager
-    def for_loop(self, loop_var, start, stop, step, span: Optional[ir.Span] = None):
+    def for_loop(
+        self,
+        loop_var: ir.Var,
+        start: Union[int, ir.Expr],
+        stop: Union[int, ir.Expr],
+        step: Union[int, ir.Expr],
+        span: Optional[ir.Span] = None,
+    ) -> Iterator["ForLoopBuilder"]:
         """Context manager for building for loops.
 
         Args:
             loop_var: Loop variable
-            start: Start value expression
-            stop: Stop value expression
-            step: Step value expression
+            start: Start value (int or Expr)
+            stop: Stop value (int or Expr)
+            step: Step value (int or Expr)
             span: Optional explicit span. If None, automatically captured.
 
         Yields:
@@ -98,14 +107,19 @@ class IRBuilder:
 
         Example:
             >>> i = ib.var("i", ir.ScalarType(ir.DataType.INT64))
-            >>> with ib.for_loop(i, start, stop, step) as loop:
-            ...     sum_iter = loop.iter_arg("sum", type, init_val)
+            >>> with ib.for_loop(i, 0, 10, 1) as loop:
+            ...     sum_iter = loop.iter_arg("sum", init_val)
         """
         begin_span = span if span is not None else self._capture_call_span()
         ctx_id = id(begin_span) + 1  # Different id
         self._begin_spans[ctx_id] = begin_span
 
-        self._builder.BeginForLoop(loop_var, start, stop, step, begin_span)
+        # Normalize all expression parameters
+        start_expr = _normalize_expr(start, begin_span)
+        stop_expr = _normalize_expr(stop, begin_span)
+        step_expr = _normalize_expr(step, begin_span)
+
+        self._builder.BeginForLoop(loop_var, start_expr, stop_expr, step_expr, begin_span)
         builder_obj = ForLoopBuilder(self)
         try:
             yield builder_obj
@@ -117,11 +131,13 @@ class IRBuilder:
             del self._begin_spans[ctx_id]
 
     @contextmanager
-    def if_stmt(self, condition, span: Optional[ir.Span] = None):
+    def if_stmt(
+        self, condition: Union[int, ir.Expr], span: Optional[ir.Span] = None
+    ) -> Iterator["IfStmtBuilder"]:
         """Context manager for building if statements.
 
         Args:
-            condition: Condition expression
+            condition: Condition expression (int or Expr)
             span: Optional explicit span. If None, automatically captured.
 
         Yields:
@@ -139,7 +155,8 @@ class IRBuilder:
         ctx_id = id(begin_span) + 2
         self._begin_spans[ctx_id] = begin_span
 
-        self._builder.BeginIf(condition, begin_span)
+        condition_expr = _normalize_expr(condition, begin_span)
+        self._builder.BeginIf(condition_expr, begin_span)
         builder_obj = IfStmtBuilder(self)
         try:
             yield builder_obj
@@ -152,7 +169,7 @@ class IRBuilder:
 
     # ========== Single-line Methods with Optional Explicit Span ==========
 
-    def var(self, name: str, type, span: Optional[ir.Span] = None):
+    def var(self, name: str, type: ir.Type, span: Optional[ir.Span] = None) -> ir.Var:
         """Create a variable with span from call site or explicit span.
 
         Args:
@@ -166,21 +183,79 @@ class IRBuilder:
         actual_span = span if span is not None else self._capture_call_span()
         return self._builder.Var(name, type, actual_span)
 
-    def assign(self, var, value, span: Optional[ir.Span] = None):
+    def assign(
+        self,
+        var: ir.Var,
+        value: Union[int, float, ir.Expr],
+        span: Optional[ir.Span] = None,
+    ) -> ir.AssignStmt:
         """Create assignment statement and emit it.
 
         Args:
-            var: Variable to assign to
-            value: Expression value
+            var: Variable to assign to (must be an ir.Var)
+            value: Expression value (int, float, or Expr)
             span: Optional explicit span. If None, captured from call site.
 
         Returns:
             AssignStmt: The created assignment statement
         """
         actual_span = span if span is not None else self._capture_call_span()
-        return self._builder.Assign(var, value, actual_span)
+        value_expr = _normalize_expr(value, actual_span)
+        return self._builder.Assign(var, value_expr, actual_span)
 
-    def emit(self, stmt):
+    def let(
+        self,
+        name: str,
+        value: Union[int, float, ir.Expr],
+        type: Optional[ir.Type] = None,
+        span: Optional[ir.Span] = None,
+    ) -> ir.Var:
+        """Create a variable and assign a value to it in one statement.
+
+        This is a convenience method that combines var() and assign() for the
+        common pattern of creating a variable and immediately assigning to it.
+
+        The type is automatically inferred from the value expression. If an explicit
+        type is provided, it is used to validate that the inferred type matches.
+
+        Args:
+            name: Variable name
+            value: Expression value (int, float, or Expr)
+            type: Optional type for validation. If provided, must match the inferred type.
+            span: Optional explicit span. If None, captured from call site.
+
+        Returns:
+            Var: The created variable
+
+        Raises:
+            ValueError: If explicit type is provided and doesn't match inferred type
+
+        Example:
+            >>> # Type is inferred from the expression:
+            >>> x = ib.let("x", 42)
+            >>> # Or with explicit type validation:
+            >>> x = ib.let("x", 42, type=ir.ScalarType(ir.DataType.INT64))
+        """
+        actual_span = span if span is not None else self._capture_call_span()
+        value_expr = _normalize_expr(value, actual_span)
+
+        # Infer type from the value expression
+        inferred_type = value_expr.type
+
+        # If explicit type is provided, validate it matches the inferred type
+        if type is not None and type != inferred_type:
+            raise ValueError(
+                f"Type mismatch in let statement for variable '{name}':\n"
+                f"  Inferred type: {inferred_type}\n"
+                f"  Provided type: {type}"
+            )
+        final_type = inferred_type
+
+        var = self._builder.Var(name, final_type, actual_span)
+        self._builder.Assign(var, value_expr, actual_span)
+        return var
+
+    def emit(self, stmt: ir.Stmt) -> None:
         """Add a statement to the current context.
 
         Args:
@@ -188,14 +263,18 @@ class IRBuilder:
         """
         self._builder.Emit(stmt)
 
-    def return_stmt(self, values=None, span: Optional[ir.Span] = None):
+    def return_stmt(
+        self,
+        values: Optional[Union[int, float, ir.Expr, List[Union[int, float, ir.Expr]]]] = None,
+        span: Optional[ir.Span] = None,
+    ) -> ir.ReturnStmt:
         """Create return statement and emit it.
 
         Args:
             values: Expression value(s) to return. Can be:
                    - None for empty return
-                   - Single expression
-                   - List of expressions
+                   - Single expression (int, float, or Expr)
+                   - List of expressions (int, float, or Expr)
             span: Optional explicit span. If None, captured from call site.
 
         Returns:
@@ -203,13 +282,13 @@ class IRBuilder:
         """
         actual_span = span if span is not None else self._capture_call_span()
 
-        # Normalize values to list
+        # Normalize values to list and convert each element
         if values is None:
             value_list = []
         elif isinstance(values, list):
-            value_list = values
+            value_list = [_normalize_expr(v, actual_span) for v in values]
         else:
-            value_list = [values]
+            value_list = [_normalize_expr(values, actual_span)]
 
         return self._builder.Return(value_list, actual_span)
 
@@ -257,22 +336,28 @@ class IRBuilder:
         Returns:
             Span: Combined span covering the range
         """
-        return ir.Span(begin.filename, begin.begin_line, begin.begin_column, end.begin_line, end.begin_column)
+        return ir.Span(
+            begin.filename,
+            begin.begin_line,
+            begin.begin_column,
+            end.begin_line,
+            end.begin_column,
+        )
 
 
 class FunctionBuilder:
     """Helper for building functions within a function context."""
 
-    def __init__(self, builder: IRBuilder):
+    def __init__(self, builder: IRBuilder) -> None:
         """Initialize function builder.
 
         Args:
             builder: Parent IR builder
         """
         self._builder = builder
-        self._result = None
+        self._result: Optional[ir.Function] = None
 
-    def param(self, name: str, type, span: Optional[ir.Span] = None):
+    def param(self, name: str, type: ir.Type, span: Optional[ir.Span] = None) -> ir.Var:
         """Add function parameter.
 
         Args:
@@ -286,7 +371,7 @@ class FunctionBuilder:
         actual_span = span if span is not None else self._builder._capture_call_span()
         return self._builder._builder.FuncArg(name, type, actual_span)
 
-    def return_type(self, type):
+    def return_type(self, type: ir.Type) -> None:
         """Add return type to the function.
 
         Args:
@@ -294,82 +379,156 @@ class FunctionBuilder:
         """
         self._builder._builder.ReturnType(type)
 
-    def get_result(self):  # type: ignore[return]
+    def get_result(self) -> ir.Function:
         """Get the built Function.
 
         Returns:
             Function: The completed function IR node (or None if not yet finalized)
         """
+        assert self._result is not None
         return self._result
 
 
 class ForLoopBuilder:
     """Helper for building for loops within a loop context."""
 
-    def __init__(self, builder: IRBuilder):
+    def __init__(self, builder: IRBuilder) -> None:
         """Initialize for loop builder.
 
         Args:
             builder: Parent IR builder
         """
         self._builder = builder
-        self._result = None
+        self._result: Optional[ir.ForStmt] = None
+        self._iter_args: List[ir.IterArg] = []  # Track iter_args for type inference
+        self._return_var_count = 0  # Track number of return_vars added
 
-    def iter_arg(self, name: str, type, init_value, span: Optional[ir.Span] = None):
+    def iter_arg(
+        self,
+        name: str,
+        init_value: Union[int, float, ir.Expr],
+        type: Optional[ir.Type] = None,
+        span: Optional[ir.Span] = None,
+    ) -> ir.IterArg:
         """Add iteration argument (loop-carried value).
+
+        The type is automatically inferred from the init_value expression. If an explicit
+        type is provided, it is used to validate that the inferred type matches.
 
         Args:
             name: Iteration argument name
-            type: Variable type
-            init_value: Initial value expression
+            init_value: Initial value (int, float, or Expr)
+            type: Optional type for validation. If provided, must match the inferred type.
             span: Optional explicit span. If None, captured from call site.
 
         Returns:
             IterArg: The iteration argument variable
+
+        Raises:
+            ValueError: If explicit type is provided and doesn't match inferred type
+
+        Example:
+            >>> # Type is inferred from the initial value:
+            >>> sum_iter = loop.iter_arg("sum", 0)
+            >>> # Or with explicit type validation:
+            >>> sum_iter = loop.iter_arg("sum", 0, type=ir.ScalarType(ir.DataType.INT64))
         """
         actual_span = span if span is not None else self._builder._capture_call_span()
-        iter_arg = ir.IterArg(name, type, init_value, actual_span)
+        init_expr = _normalize_expr(init_value, actual_span)
+
+        # Infer type from the init_value expression
+        inferred_type = init_expr.type
+
+        # If explicit type is provided, validate it matches the inferred type
+        if type is not None and type != inferred_type:
+            raise ValueError(
+                f"Type mismatch in iter_arg for '{name}':\n"
+                f"  Inferred type: {inferred_type}\n"
+                f"  Provided type: {type}"
+            )
+        final_type = inferred_type
+
+        iter_arg = ir.IterArg(name, final_type, init_expr, actual_span)
         self._builder._builder.AddIterArg(iter_arg)
+        self._iter_args.append(iter_arg)  # Track for return_var type inference
         return iter_arg
 
-    def return_var(self, name: str, type, span: Optional[ir.Span] = None):
+    def return_var(self, name: str, type: Optional[ir.Type] = None, span: Optional[ir.Span] = None) -> ir.Var:
         """Add return variable to capture final iteration value.
+
+        The type can be automatically inferred from the corresponding iter_arg (by index).
+        If explicit type is provided, it is used to validate against the inferred type.
 
         Args:
             name: Return variable name
-            type: Variable type
+            type: Optional type. If None, inferred from corresponding iter_arg by index.
             span: Optional explicit span. If None, captured from call site.
 
         Returns:
             Var: The return variable
+
+        Raises:
+            ValueError: If type cannot be inferred or provided type doesn't match
+
+        Example:
+            >>> # Type is inferred from corresponding iter_arg:
+            >>> sum_final = loop.return_var("sum_final")
+            >>> # Or with explicit type validation:
+            >>> sum_final = loop.return_var("sum_final", type=ir.ScalarType(ir.DataType.INT64))
         """
         actual_span = span if span is not None else self._builder._capture_call_span()
-        var = ir.Var(name, type, actual_span)
+
+        # Try to infer type from corresponding iter_arg by index
+        inferred_type = None
+        if self._return_var_count < len(self._iter_args):
+            inferred_type = self._iter_args[self._return_var_count].type
+
+        # Determine final type
+        if type is None:
+            if inferred_type is None:
+                raise ValueError(
+                    f"Cannot infer type for return_var '{name}': "
+                    f"no corresponding iter_arg found. Please provide explicit type."
+                )
+            final_type = inferred_type
+        else:
+            # Validate provided type if we have inferred type
+            if inferred_type is not None and type != inferred_type:
+                raise ValueError(
+                    f"Type mismatch in return_var '{name}':\n"
+                    f"  Inferred type (from iter_arg): {inferred_type}\n"
+                    f"  Provided type: {type}"
+                )
+            final_type = type
+
+        var = ir.Var(name, final_type, actual_span)
         self._builder._builder.AddReturnVar(var)
+        self._return_var_count += 1
         return var
 
-    def get_result(self):
+    def get_result(self) -> ir.ForStmt:
         """Get the built ForStmt.
 
         Returns:
             ForStmt: The completed for loop IR node
         """
+        assert self._result is not None
         return self._result
 
 
 class IfStmtBuilder:
     """Helper for building if statements within an if context."""
 
-    def __init__(self, builder: IRBuilder):
+    def __init__(self, builder: IRBuilder) -> None:
         """Initialize if statement builder.
 
         Args:
             builder: Parent IR builder
         """
         self._builder = builder
-        self._result = None
+        self._result: Optional[ir.IfStmt] = None
 
-    def else_(self, span: Optional[ir.Span] = None):
+    def else_(self, span: Optional[ir.Span] = None) -> None:
         """Begin else branch of the if statement.
 
         Args:
@@ -378,28 +537,88 @@ class IfStmtBuilder:
         actual_span = span if span is not None else self._builder._capture_call_span()
         self._builder._builder.BeginElse(actual_span)
 
-    def return_var(self, name: str, type, span: Optional[ir.Span] = None):
+    def return_var(self, name: str, type: ir.Type, span: Optional[ir.Span] = None) -> None:
         """Add return variable for SSA phi node.
+
+        Note: Type must be provided explicitly. Type inference is not supported for
+        if statement return_vars because they are declared before yield statements
+        are executed. Type inference could be implemented in C++ EndIf logic.
 
         Args:
             name: Return variable name
-            type: Variable type
+            type: Variable type (required)
             span: Optional explicit span. If None, captured from call site.
 
-        Returns:
-            Var: The return variable
+        Example:
+            >>> # Type must be provided explicitly:
+            >>> if_builder.return_var("result", ir.ScalarType(ir.DataType.INT64))
         """
         actual_span = span if span is not None else self._builder._capture_call_span()
         var = ir.Var(name, type, actual_span)
         self._builder._builder.AddIfReturnVar(var)
-        return var
 
-    def get_result(self):
+    def output(self, index: int = 0) -> ir.Var:
+        """Get a single output return variable from the if statement.
+
+        This is a convenience method to access the return variables after the if
+        statement is built. Use the index parameter to select which return variable.
+
+        Args:
+            index: Index of the return variable to get (default: 0)
+
+        Returns:
+            Var: The return variable at the specified index
+
+        Raises:
+            AssertionError: If called before if statement is complete
+            IndexError: If index is out of range
+
+        Example:
+            >>> with ib.if_stmt(condition) as if_builder:
+            ...     if_builder.return_var("result", ir.ScalarType(DataType.INT64))
+            ...     # ... if/else branches ...
+            >>> result = if_builder.output()  # Get the first return variable
+            >>> # Or for multiple return vars:
+            >>> result1 = if_builder.output(0)
+            >>> result2 = if_builder.output(1)
+        """
+        assert self._result is not None, "If statement not yet complete"
+        if index >= len(self._result.return_vars):
+            raise IndexError(
+                f"Return variable index {index} out of range "
+                f"(if statement has {len(self._result.return_vars)} return vars)"
+            )
+        return self._result.return_vars[index]
+
+    def outputs(self) -> List[ir.Var]:
+        """Get all output return variables from the if statement.
+
+        This is a convenience method to access all return variables at once after
+        the if statement is built.
+
+        Returns:
+            List[Var]: List of all return variables
+
+        Raises:
+            AssertionError: If called before if statement is complete
+
+        Example:
+            >>> with ib.if_stmt(condition) as if_builder:
+            ...     if_builder.return_var("x", ir.ScalarType(DataType.INT64))
+            ...     if_builder.return_var("y", ir.ScalarType(DataType.INT64))
+            ...     # ... if/else branches ...
+            >>> x, y = if_builder.outputs()  # Get all return variables
+        """
+        assert self._result is not None, "If statement not yet complete"
+        return list(self._result.return_vars)
+
+    def get_result(self) -> ir.IfStmt:
         """Get the built IfStmt.
 
         Returns:
             IfStmt: The completed if statement IR node
         """
+        assert self._result is not None
         return self._result
 
 
