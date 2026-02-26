@@ -11,7 +11,8 @@
 
 import pypto.language as pl
 import pytest
-from pypto import DataType, ir
+from pypto import DataType, backend, ir
+from pypto.backend import BackendType
 from pypto.ir.op import block
 from pypto.ir.pass_manager import PassManager
 
@@ -378,6 +379,8 @@ class TestBlockReductionOps:
                 return result
 
         program = RowMaxKernel
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.CCE)
         pm = PassManager.get_strategy()
         optimized_program = pm.run_passes(program)
 
@@ -402,6 +405,8 @@ class TestBlockReductionOps:
                 return result
 
         program = RowSumKernel
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.CCE)
         pm = PassManager.get_strategy()
         optimized_program = pm.run_passes(program)
 
@@ -577,6 +582,88 @@ class TestBlockBroadcastOps:
         ir_str = str(Program)
         assert "block.row_expand_add" in ir_str
 
+    def test_block_row_expand_sub(self):
+        """Test block.row_expand_sub operator - subtract row vector from each tile row."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                row: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_row: pl.Tile[[32, 1], pl.FP32] = pl.load(row, [0, 0], [32, 1])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.row_expand_sub(tile_a, tile_row)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.row_expand_sub" in ir_str
+
+    def test_block_row_expand_div(self):
+        """Test block.row_expand_div operator - divide each tile row by row vector."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                row: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_row: pl.Tile[[32, 1], pl.FP32] = pl.load(row, [0, 0], [32, 1])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.row_expand_div(tile_a, tile_row)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.row_expand_div" in ir_str
+
+    def test_block_row_expand_mul(self):
+        """Test block.row_expand_mul operator - multiply each tile row by row vector."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                row: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_row: pl.Tile[[32, 1], pl.FP32] = pl.load(row, [0, 0], [32, 1])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.row_expand_mul(tile_a, tile_row)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.row_expand_mul" in ir_str
+
+    def test_block_row_expand(self):
+        """Test block.row_expand operator - broadcast first element of each row across the row."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.row_expand(tile_a)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.row_expand" in ir_str
+
     def test_block_expands(self):
         """Test block.expands operator - expand scalar to tile shape."""
 
@@ -620,6 +707,122 @@ class TestBlockMatMulOps:
 
         ir_str = str(Program)
         assert "block.matmul" in ir_str
+
+    def test_block_matmul_acc(self):
+        """Test block.matmul_acc operator - matrix multiplication with accumulation (TMATMUL_ACC).
+
+        Computes: acc_out = acc_in + lhs @ rhs
+        """
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                acc_in: pl.Tensor[[128, 128], pl.FP32],
+                a: pl.Tensor[[128, 64], pl.FP32],
+                b: pl.Tensor[[64, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_acc: pl.Tile[[32, 32], pl.FP32] = pl.load(acc_in, [0, 0], [32, 32])
+                tile_a: pl.Tile[[32, 16], pl.FP32] = pl.load(a, [0, 0], [32, 16])
+                tile_b: pl.Tile[[16, 32], pl.FP32] = pl.load(b, [0, 0], [16, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.matmul_acc(tile_acc, tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.matmul_acc" in ir_str
+
+    def test_block_matmul_bias(self):
+        """Test block.matmul_bias operator - matrix multiplication with bias add."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 64], pl.FP32],
+                b: pl.Tensor[[64, 128], pl.FP32],
+                bias: pl.Tensor[[1, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 16], pl.FP32] = pl.load(a, [0, 0], [32, 16])
+                tile_b: pl.Tile[[16, 32], pl.FP32] = pl.load(b, [0, 0], [16, 32])
+                tile_bias: pl.Tile[[1, 32], pl.FP32] = pl.load(bias, [0, 0], [1, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.matmul_bias(tile_a, tile_b, tile_bias)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.matmul_bias" in ir_str
+
+    def test_block_gemv(self):
+        """Test block.gemv operator - general matrix-vector multiplication."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[1, 64], pl.FP32],
+                b: pl.Tensor[[64, 128], pl.FP32],
+                output: pl.Tensor[[1, 128], pl.FP32],
+            ) -> pl.Tensor[[1, 128], pl.FP32]:
+                tile_a: pl.Tile[[1, 16], pl.FP32] = pl.load(a, [0, 0], [1, 16])
+                tile_b: pl.Tile[[16, 32], pl.FP32] = pl.load(b, [0, 0], [16, 32])
+                tile_c: pl.Tile[[1, 32], pl.FP32] = pl.gemv(tile_a, tile_b)
+                result: pl.Tensor[[1, 128], pl.FP32] = pl.store(tile_c, [0, 0], [1, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.gemv" in ir_str
+
+    def test_block_gemv_acc(self):
+        """Test block.gemv_acc operator - GEMV with accumulation."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                acc_in: pl.Tensor[[1, 128], pl.FP32],
+                a: pl.Tensor[[1, 64], pl.FP32],
+                b: pl.Tensor[[64, 128], pl.FP32],
+                output: pl.Tensor[[1, 128], pl.FP32],
+            ) -> pl.Tensor[[1, 128], pl.FP32]:
+                tile_acc: pl.Tile[[1, 32], pl.FP32] = pl.load(acc_in, [0, 0], [1, 32])
+                tile_a: pl.Tile[[1, 16], pl.FP32] = pl.load(a, [0, 0], [1, 16])
+                tile_b: pl.Tile[[16, 32], pl.FP32] = pl.load(b, [0, 0], [16, 32])
+                tile_c: pl.Tile[[1, 32], pl.FP32] = pl.gemv_acc(tile_acc, tile_a, tile_b)
+                result: pl.Tensor[[1, 128], pl.FP32] = pl.store(tile_c, [0, 0], [1, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.gemv_acc" in ir_str
+
+    def test_block_gemv_bias(self):
+        """Test block.gemv_bias operator - GEMV with bias add."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[1, 64], pl.FP32],
+                b: pl.Tensor[[64, 128], pl.FP32],
+                bias: pl.Tensor[[1, 128], pl.FP32],
+                output: pl.Tensor[[1, 128], pl.FP32],
+            ) -> pl.Tensor[[1, 128], pl.FP32]:
+                tile_a: pl.Tile[[1, 16], pl.FP32] = pl.load(a, [0, 0], [1, 16])
+                tile_b: pl.Tile[[16, 32], pl.FP32] = pl.load(b, [0, 0], [16, 32])
+                tile_bias: pl.Tile[[1, 32], pl.FP32] = pl.load(bias, [0, 0], [1, 32])
+                tile_c: pl.Tile[[1, 32], pl.FP32] = pl.gemv_bias(tile_a, tile_b, tile_bias)
+                result: pl.Tensor[[1, 128], pl.FP32] = pl.store(tile_c, [0, 0], [1, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.gemv_bias" in ir_str
 
 
 class TestBlockTransformOps:
@@ -912,6 +1115,544 @@ class TestMultiDimensionalTileOps:
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert len(result_type.shape) == 3
+
+
+class TestBlockBitwiseArithmeticOps:
+    """Test suite for newly added block-level bitwise and arithmetic ops (rem, and, or, xor)."""
+
+    def test_block_rem(self):
+        """Test block.rem operator - element-wise remainder of two tiles."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.rem(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.rem" in ir_str
+
+    def test_block_rems(self):
+        """Test block.rems operator - element-wise remainder of tile and scalar."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.rems(tile_a, 3.0)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.rems" in ir_str
+
+    def test_block_and(self):
+        """Test block.and operator - element-wise bitwise AND of two tiles."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.INT32],
+                b: pl.Tensor[[128, 128], pl.INT32],
+                output: pl.Tensor[[128, 128], pl.INT32],
+            ) -> pl.Tensor[[128, 128], pl.INT32]:
+                tile_a: pl.Tile[[32, 32], pl.INT32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.INT32] = pl.load(b, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.INT32] = pl.and_(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.INT32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.and" in ir_str
+
+    def test_block_ands(self):
+        """Test block.ands operator - element-wise bitwise AND of tile and scalar."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.INT32],
+                scalar: pl.Scalar[pl.INT32],
+                output: pl.Tensor[[128, 128], pl.INT32],
+            ) -> pl.Tensor[[128, 128], pl.INT32]:
+                tile_a: pl.Tile[[32, 32], pl.INT32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.INT32] = pl.ands(tile_a, scalar)
+                result: pl.Tensor[[128, 128], pl.INT32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.ands" in ir_str
+
+    def test_block_or(self):
+        """Test block.or operator - element-wise bitwise OR of two tiles."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.INT32],
+                b: pl.Tensor[[128, 128], pl.INT32],
+                output: pl.Tensor[[128, 128], pl.INT32],
+            ) -> pl.Tensor[[128, 128], pl.INT32]:
+                tile_a: pl.Tile[[32, 32], pl.INT32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.INT32] = pl.load(b, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.INT32] = pl.or_(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.INT32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.or" in ir_str
+
+    def test_block_ors(self):
+        """Test block.ors operator - element-wise bitwise OR of tile and scalar."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.INT32],
+                scalar: pl.Scalar[pl.INT32],
+                output: pl.Tensor[[128, 128], pl.INT32],
+            ) -> pl.Tensor[[128, 128], pl.INT32]:
+                tile_a: pl.Tile[[32, 32], pl.INT32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.INT32] = pl.ors(tile_a, scalar)
+                result: pl.Tensor[[128, 128], pl.INT32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.ors" in ir_str
+
+    def test_block_xor(self):
+        """Test block.xor operator - element-wise bitwise XOR of two tiles with tmp buffer."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.INT32],
+                b: pl.Tensor[[128, 128], pl.INT32],
+                output: pl.Tensor[[128, 128], pl.INT32],
+            ) -> pl.Tensor[[128, 128], pl.INT32]:
+                tile_a: pl.Tile[[32, 32], pl.INT32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.INT32] = pl.load(b, [0, 0], [32, 32])
+                tmp: pl.Tile[[32, 32], pl.INT32] = pl.block.create_tile(
+                    [32, 32], dtype=pl.INT32, target_memory=pl.MemorySpace.UB
+                )
+                tile_c: pl.Tile[[32, 32], pl.INT32] = pl.xor(tile_a, tile_b, tmp)
+                result: pl.Tensor[[128, 128], pl.INT32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.xor" in ir_str
+
+    def test_block_xors(self):
+        """Test block.xors operator - element-wise bitwise XOR of tile and scalar with tmp buffer."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.INT32],
+                scalar: pl.Scalar[pl.INT32],
+                output: pl.Tensor[[128, 128], pl.INT32],
+            ) -> pl.Tensor[[128, 128], pl.INT32]:
+                tile_a: pl.Tile[[32, 32], pl.INT32] = pl.load(a, [0, 0], [32, 32])
+                tmp: pl.Tile[[32, 32], pl.INT32] = pl.block.create_tile(
+                    [32, 32], dtype=pl.INT32, target_memory=pl.MemorySpace.UB
+                )
+                tile_c: pl.Tile[[32, 32], pl.INT32] = pl.xors(tile_a, scalar, tmp)
+                result: pl.Tensor[[128, 128], pl.INT32] = pl.store(tile_c, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.xors" in ir_str
+
+    def test_block_shl(self):
+        """Test block.shl operator - element-wise bitwise left shift of two tiles."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.UINT32],
+                b: pl.Tensor[[128, 128], pl.UINT32],
+                output: pl.Tensor[[128, 128], pl.UINT32],
+            ) -> pl.Tensor[[128, 128], pl.UINT32]:
+                tile_a: pl.Tile[[16, 16], pl.UINT32] = pl.load(a, [0, 0], [16, 16])
+                tile_b: pl.Tile[[16, 16], pl.UINT32] = pl.load(b, [0, 0], [16, 16])
+                tile_c: pl.Tile[[16, 16], pl.UINT32] = pl.shl(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.UINT32] = pl.store(tile_c, [0, 0], [16, 16], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.shl" in ir_str
+
+    def test_block_shls(self):
+        """Test block.shls operator - element-wise bitwise left shift of tile and scalar."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.UINT32],
+                scalar: pl.Scalar[pl.INT32],
+                output: pl.Tensor[[128, 128], pl.UINT32],
+            ) -> pl.Tensor[[128, 128], pl.UINT32]:
+                tile_a: pl.Tile[[16, 16], pl.UINT32] = pl.load(a, [0, 0], [16, 16])
+                tile_c: pl.Tile[[16, 16], pl.UINT32] = pl.shls(tile_a, scalar)
+                result: pl.Tensor[[128, 128], pl.UINT32] = pl.store(tile_c, [0, 0], [16, 16], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.shls" in ir_str
+
+    def test_block_maxs(self):
+        """Test block.maxs operator - element-wise maximum of tile and scalar."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                tile_c: pl.Tile[[16, 16], pl.FP32] = pl.maxs(tile_a, 0.0)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [16, 16], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.maxs" in ir_str
+
+    def test_block_mins(self):
+        """Test block.mins operator - element-wise minimum of tile and scalar."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                tile_c: pl.Tile[[16, 16], pl.FP32] = pl.mins(tile_a, 0.0)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [16, 16], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.mins" in ir_str
+
+    def test_block_shr(self):
+        """Test block.shr operator - element-wise bitwise right shift of two tiles."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.UINT32],
+                b: pl.Tensor[[128, 128], pl.UINT32],
+                output: pl.Tensor[[128, 128], pl.UINT32],
+            ) -> pl.Tensor[[128, 128], pl.UINT32]:
+                tile_a: pl.Tile[[16, 16], pl.UINT32] = pl.load(a, [0, 0], [16, 16])
+                tile_b: pl.Tile[[16, 16], pl.UINT32] = pl.load(b, [0, 0], [16, 16])
+                tile_c: pl.Tile[[16, 16], pl.UINT32] = pl.shr(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.UINT32] = pl.store(tile_c, [0, 0], [16, 16], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.shr" in ir_str
+
+    def test_block_shrs(self):
+        """Test block.shrs operator - element-wise bitwise right shift of tile and scalar."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.UINT32],
+                scalar: pl.Scalar[pl.INT32],
+                output: pl.Tensor[[128, 128], pl.UINT32],
+            ) -> pl.Tensor[[128, 128], pl.UINT32]:
+                tile_a: pl.Tile[[16, 16], pl.UINT32] = pl.load(a, [0, 0], [16, 16])
+                tile_c: pl.Tile[[16, 16], pl.UINT32] = pl.shrs(tile_a, scalar)
+                result: pl.Tensor[[128, 128], pl.UINT32] = pl.store(tile_c, [0, 0], [16, 16], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.shrs" in ir_str
+
+    def test_block_shl_preserves_lhs_dtype(self):
+        """Regression: block.shl result dtype must match LHS dtype, not the promoted type.
+
+        When lhs is UINT16 and rhs is UINT32, the result must be UINT16 (LHS dtype),
+        consistent with the scalar variant block.shls which preserves the LHS tile dtype.
+        """
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.UINT16],
+                b: pl.Tensor[[128, 128], pl.UINT32],
+                output: pl.Tensor[[128, 128], pl.UINT16],
+            ) -> pl.Tensor[[128, 128], pl.UINT16]:
+                tile_a: pl.Tile[[16, 16], pl.UINT16] = pl.load(a, [0, 0], [16, 16])
+                tile_b: pl.Tile[[16, 16], pl.UINT32] = pl.load(b, [0, 0], [16, 16])
+                tile_c: pl.Tile[[16, 16], pl.UINT16] = pl.shl(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.UINT16] = pl.store(tile_c, [0, 0], [16, 16], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.shl" in ir_str
+
+    def test_block_shr_preserves_lhs_dtype(self):
+        """Regression: block.shr result dtype must match LHS dtype, not the promoted type.
+
+        When lhs is UINT16 and rhs is UINT32, the result must be UINT16 (LHS dtype),
+        consistent with the scalar variant block.shrs which preserves the LHS tile dtype.
+        """
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.UINT16],
+                b: pl.Tensor[[128, 128], pl.UINT32],
+                output: pl.Tensor[[128, 128], pl.UINT16],
+            ) -> pl.Tensor[[128, 128], pl.UINT16]:
+                tile_a: pl.Tile[[16, 16], pl.UINT16] = pl.load(a, [0, 0], [16, 16])
+                tile_b: pl.Tile[[16, 16], pl.UINT32] = pl.load(b, [0, 0], [16, 16])
+                tile_c: pl.Tile[[16, 16], pl.UINT16] = pl.shr(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.UINT16] = pl.store(tile_c, [0, 0], [16, 16], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.shr" in ir_str
+
+    def test_block_prelu(self):
+        """Test block.prelu operator - element-wise parametric ReLU with slope and tmp buffer."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_x: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                slope: pl.Tile[[16, 16], pl.FP32] = pl.block.create_tile(
+                    [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.UB
+                )
+                tmp: pl.Tile[[16, 16], pl.FP32] = pl.block.create_tile(
+                    [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.UB
+                )
+                tile_c: pl.Tile[[16, 16], pl.FP32] = pl.prelu(tile_x, slope, tmp)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], [16, 16], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.prelu" in ir_str
+
+    def test_block_not(self):
+        """Test block.not operator - element-wise bitwise NOT of a tile (int16/uint16 only)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.INT16],
+                output: pl.Tensor[[128, 128], pl.INT16],
+            ) -> pl.Tensor[[128, 128], pl.INT16]:
+                tile_a: pl.Tile[[16, 16], pl.INT16] = pl.load(a, [0, 0], [16, 16])
+                tile_c: pl.Tile[[16, 16], pl.INT16] = pl.not_(tile_a)
+                result: pl.Tensor[[128, 128], pl.INT16] = pl.store(tile_c, [0, 0], [16, 16], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.not" in ir_str
+
+    def test_block_addc(self):
+        """Test block.addc operator - element-wise addition of three tiles."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                c: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.load(c, [0, 0], [32, 32])
+                tile_out: pl.Tile[[32, 32], pl.FP32] = pl.addc(tile_a, tile_b, tile_c)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_out, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.addc" in ir_str
+
+    def test_block_subc(self):
+        """Test block.subc operator - element-wise subtraction of three tiles."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                c: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.load(c, [0, 0], [32, 32])
+                tile_out: pl.Tile[[32, 32], pl.FP32] = pl.subc(tile_a, tile_b, tile_c)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_out, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.subc" in ir_str
+
+    def test_block_addsc(self):
+        """Test block.addsc operator - element-wise addition of tile, scalar, and tile."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_out: pl.Tile[[32, 32], pl.FP32] = pl.addsc(tile_a, 2.0, tile_b)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_out, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.addsc" in ir_str
+
+    def test_block_subsc(self):
+        """Test block.subsc operator - element-wise subtraction of tile, scalar, and tile."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_out: pl.Tile[[32, 32], pl.FP32] = pl.subsc(tile_a, 2.0, tile_b)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_out, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.subsc" in ir_str
+
+    def test_block_lrelu(self):
+        """Test block.lrelu operator - element-wise leaky ReLU with scalar slope."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_out: pl.Tile[[32, 32], pl.FP32] = pl.lrelu(tile_a, 0.1)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_out, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.lrelu" in ir_str
+
+    def test_block_sels(self):
+        """Test block.sels operator - select between two tiles via integer scalar mode."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_out: pl.Tile[[32, 32], pl.FP32] = pl.sels(tile_a, tile_b, 1)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_out, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.sels" in ir_str
+
+    def test_block_sel(self):
+        """Test block.sel operator - per-element selection between two tiles via mask tile."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                m: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_m: pl.Tile[[32, 32], pl.FP32] = pl.load(m, [0, 0], [32, 32])
+                tile_out: pl.Tile[[32, 32], pl.FP32] = pl.sel(tile_m, tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_out, [0, 0], [32, 32], output)
+                return result
+
+        ir_str = str(Program)
+        assert "block.sel" in ir_str
 
 
 if __name__ == "__main__":

@@ -45,10 +45,15 @@ __all__ = [
     "cast",
     "matmul",
     "matmul_acc",
+    "matmul_bias",
+    "gemv",
+    "gemv_acc",
+    "gemv_bias",
     "row_max",
     "row_sum",
     "row_min",
     "maximum",
+    "row_expand",
     "row_expand_sub",
     "row_expand_div",
     "row_expand_mul",
@@ -67,6 +72,29 @@ __all__ = [
     "view",
     "reshape",
     "transpose",
+    "rem",
+    "rems",
+    "and_",
+    "ands",
+    "or_",
+    "ors",
+    "xor",
+    "xors",
+    "shl",
+    "shls",
+    "shr",
+    "shrs",
+    "maxs",
+    "mins",
+    "prelu",
+    "not_",
+    "addc",
+    "subc",
+    "addsc",
+    "subsc",
+    "lrelu",
+    "sel",
+    "sels",
 ]
 
 from pypto.ir.op import block_ops as _ir_ops
@@ -524,6 +552,65 @@ def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
+def matmul_bias(lhs: Tile, rhs: Tile, bias: Tile) -> Tile:
+    """Matrix multiplication with bias add: C = lhs @ rhs + bias.
+
+    Args:
+        lhs: Left-hand side tile [M, K]
+        rhs: Right-hand side tile [K, N]
+        bias: Bias tile [1, N]
+
+    Returns:
+        Tile wrapping the matmul_bias operation
+    """
+    call_expr = _ir_ops.matmul_bias(lhs.unwrap(), rhs.unwrap(), bias.unwrap())
+    return Tile(expr=call_expr)
+
+
+def gemv(lhs: Tile, rhs: Tile) -> Tile:
+    """General Matrix-Vector multiplication: C[1,N] = A[1,K] @ B[K,N].
+
+    Args:
+        lhs: Row vector tile [1, K]
+        rhs: Right-hand side tile [K, N]
+
+    Returns:
+        Tile wrapping the gemv operation
+    """
+    call_expr = _ir_ops.gemv(lhs.unwrap(), rhs.unwrap())
+    return Tile(expr=call_expr)
+
+
+def gemv_acc(acc: Tile, lhs: Tile, rhs: Tile) -> Tile:
+    """GEMV with accumulation: C[1,N] += A[1,K] @ B[K,N].
+
+    Args:
+        acc: Accumulator tile [1, N]
+        lhs: Row vector tile [1, K]
+        rhs: Right-hand side tile [K, N]
+
+    Returns:
+        Tile wrapping the gemv_acc operation
+    """
+    call_expr = _ir_ops.gemv_acc(acc.unwrap(), lhs.unwrap(), rhs.unwrap())
+    return Tile(expr=call_expr)
+
+
+def gemv_bias(lhs: Tile, rhs: Tile, bias: Tile) -> Tile:
+    """GEMV with bias add: C[1,N] = A[1,K] @ B[K,N] + bias[1,N].
+
+    Args:
+        lhs: Row vector tile [1, K]
+        rhs: Right-hand side tile [K, N]
+        bias: Bias tile [1, N]
+
+    Returns:
+        Tile wrapping the gemv_bias operation
+    """
+    call_expr = _ir_ops.gemv_bias(lhs.unwrap(), rhs.unwrap(), bias.unwrap())
+    return Tile(expr=call_expr)
+
+
 def row_max(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise max reduction.
 
@@ -577,6 +664,21 @@ def maximum(lhs: Tile, rhs: Tile) -> Tile:
         Tile wrapping the maximum operation
     """
     call_expr = _ir_ops.maximum(lhs.unwrap(), rhs.unwrap())
+    return Tile(expr=call_expr)
+
+
+def row_expand(src: Tile) -> Tile:
+    """Broadcast the first element of each source row across the destination row.
+
+    For each element (i, j): dst[i, j] = src[i, 0].
+
+    Args:
+        src: Input tile [M, N]
+
+    Returns:
+        Tile wrapping the row_expand operation
+    """
+    call_expr = _ir_ops.row_expand(src.unwrap())
     return Tile(expr=call_expr)
 
 
@@ -873,4 +975,402 @@ def transpose(tile: Tile, axis1: int, axis2: int) -> Tile:
     """
     tile_expr = tile.unwrap()
     call_expr = _ir_ops.transpose(tile_expr, axis1, axis2)
+    return Tile(expr=call_expr)
+
+
+def rem(lhs: Tile, rhs: Tile) -> Tile:
+    """Element-wise remainder (modulo) of two tiles.
+
+    Computes lhs % rhs element-wise. Maps to the TREM hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+
+    Returns:
+        Tile wrapping the rem operation
+    """
+    call_expr = _ir_ops.rem(lhs.unwrap(), rhs.unwrap())
+    return Tile(expr=call_expr)
+
+
+def rems(lhs: Tile, rhs: int | float | Expr | Scalar) -> Tile:
+    """Element-wise remainder (modulo) of tile and scalar.
+
+    Computes lhs % rhs element-wise. Maps to the TREMS hardware intrinsic.
+
+    Args:
+        lhs: Tile
+        rhs: Scalar value
+
+    Returns:
+        Tile wrapping the rems operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.rems(lhs.unwrap(), rhs_expr)
+    return Tile(expr=call_expr)
+
+
+def and_(lhs: Tile, rhs: Tile) -> Tile:
+    """Element-wise bitwise AND of two tiles.
+
+    Computes lhs & rhs element-wise. Maps to the TAND hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+
+    Returns:
+        Tile wrapping the and operation
+    """
+    call_expr = _ir_ops.and_(lhs.unwrap(), rhs.unwrap())
+    return Tile(expr=call_expr)
+
+
+def ands(lhs: Tile, rhs: int | Expr | Scalar) -> Tile:
+    """Element-wise bitwise AND of tile and scalar.
+
+    Computes lhs & rhs element-wise. Maps to the TANDS hardware intrinsic.
+
+    Args:
+        lhs: Tile
+        rhs: Scalar value
+
+    Returns:
+        Tile wrapping the ands operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.ands(lhs.unwrap(), rhs_expr)
+    return Tile(expr=call_expr)
+
+
+def or_(lhs: Tile, rhs: Tile) -> Tile:
+    """Element-wise bitwise OR of two tiles.
+
+    Computes lhs | rhs element-wise. Maps to the TOR hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+
+    Returns:
+        Tile wrapping the or operation
+    """
+    call_expr = _ir_ops.or_(lhs.unwrap(), rhs.unwrap())
+    return Tile(expr=call_expr)
+
+
+def ors(lhs: Tile, rhs: int | Expr | Scalar) -> Tile:
+    """Element-wise bitwise OR of tile and scalar.
+
+    Computes lhs | rhs element-wise. Maps to the TORS hardware intrinsic.
+
+    Args:
+        lhs: Tile
+        rhs: Scalar value
+
+    Returns:
+        Tile wrapping the ors operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.ors(lhs.unwrap(), rhs_expr)
+    return Tile(expr=call_expr)
+
+
+def xor(lhs: Tile, rhs: Tile, tmp: Tile) -> Tile:
+    """Element-wise bitwise XOR of two tiles.
+
+    Computes lhs ^ rhs element-wise. Maps to the TXOR hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+        tmp: Temporary tile required by the hardware
+
+    Returns:
+        Tile wrapping the xor operation
+    """
+    call_expr = _ir_ops.xor(lhs.unwrap(), rhs.unwrap(), tmp.unwrap())
+    return Tile(expr=call_expr)
+
+
+def xors(lhs: Tile, rhs: int | Expr | Scalar, tmp: Tile) -> Tile:
+    """Element-wise bitwise XOR of tile and scalar.
+
+    Computes lhs ^ rhs element-wise. Maps to the TXORS hardware intrinsic.
+
+    Args:
+        lhs: Tile
+        rhs: Scalar value
+        tmp: Temporary tile required by the hardware
+
+    Returns:
+        Tile wrapping the xors operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.xors(lhs.unwrap(), rhs_expr, tmp.unwrap())
+    return Tile(expr=call_expr)
+
+
+def shl(lhs: Tile, rhs: Tile) -> Tile:
+    """Element-wise bitwise left shift of two tiles.
+
+    Computes lhs << rhs element-wise. Maps to the TSHL hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+
+    Returns:
+        Tile wrapping the shl operation
+    """
+    call_expr = _ir_ops.shl(lhs.unwrap(), rhs.unwrap())
+    return Tile(expr=call_expr)
+
+
+def shls(lhs: Tile, rhs: int | Expr | Scalar) -> Tile:
+    """Element-wise bitwise left shift of tile and scalar.
+
+    Computes lhs << rhs element-wise. Maps to the TSHLS hardware intrinsic.
+
+    Note:
+        The scalar shift amount must be zero or positive; negative values are
+        not supported by the hardware and will be rejected by codegen.
+
+    Args:
+        lhs: Tile
+        rhs: Scalar shift amount; must be >= 0
+
+    Returns:
+        Tile wrapping the shls operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.shls(lhs.unwrap(), rhs_expr)
+    return Tile(expr=call_expr)
+
+
+def shr(lhs: Tile, rhs: Tile) -> Tile:
+    """Element-wise bitwise right shift of two tiles.
+
+    Computes lhs >> rhs element-wise. Maps to the TSHR hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+
+    Returns:
+        Tile wrapping the shr operation
+    """
+    call_expr = _ir_ops.shr(lhs.unwrap(), rhs.unwrap())
+    return Tile(expr=call_expr)
+
+
+def shrs(lhs: Tile, rhs: int | Expr | Scalar) -> Tile:
+    """Element-wise bitwise right shift of tile and scalar.
+
+    Computes lhs >> rhs element-wise. Maps to the TSHRS hardware intrinsic.
+
+    Note:
+        The scalar shift amount must be zero or positive; negative values are
+        not supported by the hardware and will be rejected by codegen.
+
+    Args:
+        lhs: Tile
+        rhs: Scalar shift amount; must be >= 0
+
+    Returns:
+        Tile wrapping the shrs operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.shrs(lhs.unwrap(), rhs_expr)
+    return Tile(expr=call_expr)
+
+
+def maxs(lhs: Tile, rhs: int | float | Expr | Scalar) -> Tile:
+    """Element-wise maximum of tile and scalar.
+
+    Computes max(lhs, rhs) element-wise. Maps to the TMAXS hardware intrinsic.
+
+    Args:
+        lhs: Tile
+        rhs: Scalar value
+
+    Returns:
+        Tile wrapping the maxs operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.maxs(lhs.unwrap(), rhs_expr)
+    return Tile(expr=call_expr)
+
+
+def mins(lhs: Tile, rhs: int | float | Expr | Scalar) -> Tile:
+    """Element-wise minimum of tile and scalar.
+
+    Computes min(lhs, rhs) element-wise. Maps to the TMINS hardware intrinsic.
+
+    Args:
+        lhs: Tile
+        rhs: Scalar value
+
+    Returns:
+        Tile wrapping the mins operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.mins(lhs.unwrap(), rhs_expr)
+    return Tile(expr=call_expr)
+
+
+def prelu(tile: Tile, slope: Tile, tmp: Tile) -> Tile:
+    """Element-wise parametric ReLU of a tile.
+
+    Computes prelu(tile, slope) element-wise. Maps to the TPRELU hardware intrinsic.
+
+    Args:
+        tile: Input tile
+        slope: Slope tile used for negative values
+        tmp: Temporary tile required by the hardware
+
+    Returns:
+        Tile wrapping the prelu operation
+    """
+    call_expr = _ir_ops.prelu(tile.unwrap(), slope.unwrap(), tmp.unwrap())
+    return Tile(expr=call_expr)
+
+
+def not_(tile: Tile) -> Tile:
+    """Element-wise bitwise NOT of a tile.
+
+    Computes ~tile element-wise. Maps to the TNOT hardware intrinsic.
+
+    Args:
+        tile: Input tile
+
+    Returns:
+        Tile wrapping the not operation
+    """
+    call_expr = _ir_ops.not_(tile.unwrap())
+    return Tile(expr=call_expr)
+
+
+def addc(lhs: Tile, rhs: Tile, rhs2: Tile) -> Tile:
+    """Element-wise addition of three tiles.
+
+    Computes lhs + rhs + rhs2 element-wise. Maps to the TADDC hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+        rhs2: Third tile
+
+    Returns:
+        Tile wrapping the addc operation
+    """
+    call_expr = _ir_ops.addc(lhs.unwrap(), rhs.unwrap(), rhs2.unwrap())
+    return Tile(expr=call_expr)
+
+
+def subc(lhs: Tile, rhs: Tile, rhs2: Tile) -> Tile:
+    """Element-wise subtraction of three tiles.
+
+    Computes lhs - rhs - rhs2 element-wise. Maps to the TSUBC hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+        rhs2: Third tile
+
+    Returns:
+        Tile wrapping the subc operation
+    """
+    call_expr = _ir_ops.subc(lhs.unwrap(), rhs.unwrap(), rhs2.unwrap())
+    return Tile(expr=call_expr)
+
+
+def addsc(lhs: Tile, rhs: int | float | Expr | Scalar, rhs2: Tile) -> Tile:
+    """Element-wise addition of tile, scalar, and tile.
+
+    Computes lhs + rhs + rhs2 element-wise. Maps to the TADDSC hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Scalar value
+        rhs2: Third tile
+
+    Returns:
+        Tile wrapping the addsc operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.addsc(lhs.unwrap(), rhs_expr, rhs2.unwrap())
+    return Tile(expr=call_expr)
+
+
+def subsc(lhs: Tile, rhs: int | float | Expr | Scalar, rhs2: Tile) -> Tile:
+    """Element-wise subtraction of tile, scalar, and tile.
+
+    Computes lhs - rhs - rhs2 element-wise. Maps to the TSUBSC hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Scalar value
+        rhs2: Third tile
+
+    Returns:
+        Tile wrapping the subsc operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.subsc(lhs.unwrap(), rhs_expr, rhs2.unwrap())
+    return Tile(expr=call_expr)
+
+
+def lrelu(tile: Tile, slope: int | float | Expr | Scalar) -> Tile:
+    """Element-wise leaky ReLU with scalar slope.
+
+    Computes max(tile, slope * tile) element-wise. Maps to the TLRELU hardware intrinsic.
+
+    Args:
+        tile: Input tile
+        slope: Scalar slope for negative values
+
+    Returns:
+        Tile wrapping the lrelu operation
+    """
+    slope_expr = slope.unwrap() if isinstance(slope, Scalar) else slope
+    call_expr = _ir_ops.lrelu(tile.unwrap(), slope_expr)
+    return Tile(expr=call_expr)
+
+
+def sel(mask: Tile, lhs: Tile, rhs: Tile) -> Tile:
+    """Per-element selection between two tiles using a predicate mask tile.
+
+    For each element (i, j): dst[i,j] = lhs[i,j] if mask[i,j] is true, else rhs[i,j].
+    Maps to the TSEL hardware intrinsic. The mask encoding is target-defined.
+
+    Args:
+        mask: Predicate mask tile; encoding is target-defined
+        lhs: Source tile 0, selected where mask is true
+        rhs: Source tile 1, selected where mask is false
+
+    Returns:
+        Tile wrapping the sel operation
+    """
+    call_expr = _ir_ops.sel(mask.unwrap(), lhs.unwrap(), rhs.unwrap())
+    return Tile(expr=call_expr)
+
+
+def sels(lhs: Tile, rhs: Tile, select_mode: int | float | Expr | Scalar) -> Tile:
+    """Select between two tiles based on a scalar mode.
+
+    Maps to the TSELS hardware intrinsic. The interpretation of select_mode values
+    is target-dependent and enforced by codegen.
+
+    Args:
+        lhs: Source tile 0
+        rhs: Source tile 1
+        select_mode: Scalar select mode
+
+    Returns:
+        Tile wrapping the sels operation
+    """
+    select_mode_expr = select_mode.unwrap() if isinstance(select_mode, Scalar) else select_mode
+    call_expr = _ir_ops.sels(lhs.unwrap(), rhs.unwrap(), select_mode_expr)
     return Tile(expr=call_expr)

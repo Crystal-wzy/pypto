@@ -1512,6 +1512,7 @@ class ASTParser:
         "divs",
         "sum",
         "row_min",
+        "row_expand",
         "row_expand_add",
         "row_expand_sub",
         "row_expand_mul",
@@ -1521,6 +1522,10 @@ class ASTParser:
         "col_expand_div",
         "col_expand_sub",
         "expands",
+        "matmul_bias",
+        "gemv",
+        "gemv_acc",
+        "gemv_bias",
         "abs",
         "create_tile",
     }

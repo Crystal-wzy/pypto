@@ -366,6 +366,405 @@ def sub(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("block.sub", [lhs, rhs], {}, actual_span)
 
 
+def rem(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """Element-wise remainder (modulo) of two tiles.
+
+    Computes lhs % rhs element-wise. Maps to the TREM hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile (TileType)
+        rhs: Right-hand side tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise remainder
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.rem", [lhs, rhs], {}, actual_span)
+
+
+def rems(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+    """Element-wise remainder (modulo) of tile and scalar.
+
+    Computes lhs % rhs element-wise. Maps to the TREMS hardware intrinsic.
+
+    Args:
+        lhs: Tile (TileType)
+        rhs: Scalar (int/float/Expr with ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise remainder with scalar
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
+        if not isinstance(rhs, Expr)
+        else rhs
+    )
+    return _ir_core.create_op_call("block.rems", [lhs, rhs_expr], {}, actual_span)
+
+
+def shl(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise left shift of two tiles.
+
+    Computes lhs << rhs element-wise. Maps to the TSHL hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile (TileType)
+        rhs: Right-hand side tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise left shift
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.shl", [lhs, rhs], {}, actual_span)
+
+
+def shls(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise left shift of tile and scalar.
+
+    Computes lhs << rhs element-wise. Maps to the TSHLS hardware intrinsic.
+
+    Note:
+        The scalar shift amount must be zero or positive; negative values are
+        not supported by the hardware and will be rejected by codegen.
+
+    Args:
+        lhs: Tile (TileType)
+        rhs: Scalar shift amount (int/Expr with INT32 ScalarType); must be >= 0
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise left shift with scalar
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32) if not isinstance(rhs, Expr) else rhs
+    )
+    return _ir_core.create_op_call("block.shls", [lhs, rhs_expr], {}, actual_span)
+
+
+def shr(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise right shift of two tiles.
+
+    Computes lhs >> rhs element-wise. Maps to the TSHR hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile (TileType)
+        rhs: Right-hand side tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise right shift
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.shr", [lhs, rhs], {}, actual_span)
+
+
+def shrs(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise right shift of tile and scalar.
+
+    Computes lhs >> rhs element-wise. Maps to the TSHRS hardware intrinsic.
+
+    Note:
+        The scalar shift amount must be zero or positive; negative values are
+        not supported by the hardware and will be rejected by codegen.
+
+    Args:
+        lhs: Tile (TileType)
+        rhs: Scalar shift amount (int/Expr with INT32 ScalarType); must be >= 0
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise right shift with scalar
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32) if not isinstance(rhs, Expr) else rhs
+    )
+    return _ir_core.create_op_call("block.shrs", [lhs, rhs_expr], {}, actual_span)
+
+
+def and_(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise AND of two tiles.
+
+    Computes lhs & rhs element-wise. Maps to the TAND hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile (TileType)
+        rhs: Right-hand side tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise AND
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.and", [lhs, rhs], {}, actual_span)
+
+
+def ands(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise AND of tile and scalar.
+
+    Computes lhs & rhs element-wise. Maps to the TANDS hardware intrinsic.
+
+    Args:
+        lhs: Tile (TileType)
+        rhs: Scalar (int/Expr with INT32 ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise AND with scalar
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32) if not isinstance(rhs, Expr) else rhs
+    )
+    return _ir_core.create_op_call("block.ands", [lhs, rhs_expr], {}, actual_span)
+
+
+def or_(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise OR of two tiles.
+
+    Computes lhs | rhs element-wise. Maps to the TOR hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile (TileType)
+        rhs: Right-hand side tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise OR
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.or", [lhs, rhs], {}, actual_span)
+
+
+def ors(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise OR of tile and scalar.
+
+    Computes lhs | rhs element-wise. Maps to the TORS hardware intrinsic.
+
+    Args:
+        lhs: Tile (TileType)
+        rhs: Scalar (int/Expr with INT32 ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise OR with scalar
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32) if not isinstance(rhs, Expr) else rhs
+    )
+    return _ir_core.create_op_call("block.ors", [lhs, rhs_expr], {}, actual_span)
+
+
+def xor(lhs: Expr, rhs: Expr, tmp: Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise XOR of two tiles.
+
+    Computes lhs ^ rhs element-wise. Maps to the TXOR hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile (TileType)
+        rhs: Right-hand side tile (TileType)
+        tmp: Temporary tile (TileType) required by the hardware
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise XOR
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.xor", [lhs, rhs, tmp], {}, actual_span)
+
+
+def xors(lhs: Expr, rhs: int | Expr, tmp: Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise XOR of tile and scalar.
+
+    Computes lhs ^ rhs element-wise. Maps to the TXORS hardware intrinsic.
+
+    Args:
+        lhs: Tile (TileType)
+        rhs: Scalar (int/Expr with INT32 ScalarType)
+        tmp: Temporary tile (TileType) required by the hardware
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise XOR with scalar
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32) if not isinstance(rhs, Expr) else rhs
+    )
+    return _ir_core.create_op_call("block.xors", [lhs, rhs_expr, tmp], {}, actual_span)
+
+
+def prelu(tile: Expr, slope: Expr, tmp: Expr, span: Span | None = None) -> Call:
+    """Element-wise parametric ReLU of a tile.
+
+    Computes prelu(tile, slope) element-wise. Maps to the TPRELU hardware intrinsic.
+
+    Args:
+        tile: Input tile (TileType)
+        slope: Slope tile (TileType) used for negative values
+        tmp: Temporary tile (TileType) required by the hardware
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise parametric ReLU
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.prelu", [tile, slope, tmp], {}, actual_span)
+
+
+def addc(lhs: Expr, rhs: Expr, rhs2: Expr, span: Span | None = None) -> Call:
+    """Element-wise addition of three tiles.
+
+    Computes lhs + rhs + rhs2 element-wise. Maps to the TADDC hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile (TileType)
+        rhs: Right-hand side tile (TileType)
+        rhs2: Third tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise ternary addition
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.addc", [lhs, rhs, rhs2], {}, actual_span)
+
+
+def subc(lhs: Expr, rhs: Expr, rhs2: Expr, span: Span | None = None) -> Call:
+    """Element-wise subtraction of three tiles.
+
+    Computes lhs - rhs - rhs2 element-wise. Maps to the TSUBC hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile (TileType)
+        rhs: Right-hand side tile (TileType)
+        rhs2: Third tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise ternary subtraction
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.subc", [lhs, rhs, rhs2], {}, actual_span)
+
+
+def addsc(lhs: Expr, rhs: int | float | Expr, rhs2: Expr, span: Span | None = None) -> Call:
+    """Element-wise addition of tile, scalar, and tile.
+
+    Computes lhs + rhs + rhs2 element-wise. Maps to the TADDSC hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile (TileType)
+        rhs: Scalar (int/float/Expr with ScalarType)
+        rhs2: Third tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise tile-scalar-tile addition
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
+        if not isinstance(rhs, Expr)
+        else rhs
+    )
+    return _ir_core.create_op_call("block.addsc", [lhs, rhs_expr, rhs2], {}, actual_span)
+
+
+def subsc(lhs: Expr, rhs: int | float | Expr, rhs2: Expr, span: Span | None = None) -> Call:
+    """Element-wise subtraction of tile, scalar, and tile.
+
+    Computes lhs - rhs - rhs2 element-wise. Maps to the TSUBSC hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile (TileType)
+        rhs: Scalar (int/float/Expr with ScalarType)
+        rhs2: Third tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise tile-scalar-tile subtraction
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
+        if not isinstance(rhs, Expr)
+        else rhs
+    )
+    return _ir_core.create_op_call("block.subsc", [lhs, rhs_expr, rhs2], {}, actual_span)
+
+
+def lrelu(tile: Expr, slope: int | float | Expr, span: Span | None = None) -> Call:
+    """Element-wise leaky ReLU of a tile with scalar slope.
+
+    Computes max(x, slope * x) element-wise. Maps to the TLRELU hardware intrinsic.
+
+    Args:
+        tile: Input tile (TileType)
+        slope: Scalar slope for negative values (int/float/Expr with ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise leaky ReLU
+    """
+    actual_span = _get_span_or_capture(span)
+    slope_expr = (
+        _normalize_expr(slope, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        if not isinstance(slope, Expr)
+        else slope
+    )
+    return _ir_core.create_op_call("block.lrelu", [tile, slope_expr], {}, actual_span)
+
+
+def sel(mask: Expr, lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """Per-element selection between two tiles using a predicate mask tile.
+
+    For each element (i, j): dst[i,j] = lhs[i,j] if mask[i,j] is true, else rhs[i,j].
+    Maps to the TSEL hardware intrinsic. The mask encoding is target-defined.
+
+    Args:
+        mask: Predicate mask tile (TileType); encoding is target-defined
+        lhs: Source tile 0, selected where mask is true (TileType)
+        rhs: Source tile 1, selected where mask is false (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for per-element tile selection
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.sel", [mask, lhs, rhs], {}, actual_span)
+
+
+def sels(lhs: Expr, rhs: Expr, select_mode: int | float | Expr, span: Span | None = None) -> Call:
+    """Select between two tiles based on a scalar mode.
+
+    Maps to the TSELS hardware intrinsic. The interpretation of select_mode values
+    is target-dependent and enforced by codegen.
+
+    Args:
+        lhs: Source tile 0 (TileType)
+        rhs: Source tile 1 (TileType)
+        select_mode: Scalar select mode
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for tile select
+    """
+    actual_span = _get_span_or_capture(span)
+    select_mode_expr = (
+        _normalize_expr(select_mode, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
+        if not isinstance(select_mode, Expr)
+        else select_mode
+    )
+    return _ir_core.create_op_call("block.sels", [lhs, rhs, select_mode_expr], {}, actual_span)
+
+
 def muls(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     """Element-wise multiplication of tile and scalar.
 
@@ -379,7 +778,7 @@ def muls(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
@@ -399,7 +798,7 @@ def adds(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
@@ -419,7 +818,7 @@ def divs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
@@ -439,7 +838,7 @@ def subs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
@@ -487,7 +886,7 @@ def cmps(
     """
     actual_span = _get_span_or_capture(span)
     rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
         if not isinstance(rhs, Expr)
         else rhs
     )
@@ -643,6 +1042,22 @@ def relu(tile: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("block.relu", [tile], {}, actual_span)
 
 
+def not_(tile: Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise NOT of a tile.
+
+    Computes ~tile element-wise. Maps to the TNOT hardware intrinsic.
+
+    Args:
+        tile: Input tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise NOT
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.not", [tile], {}, actual_span)
+
+
 # ============================================================================
 # Matrix Operations
 # ============================================================================
@@ -683,9 +1098,88 @@ def matmul_acc(acc: Expr, lhs: Expr, rhs: Expr, span: Span | None = None) -> Cal
     return _ir_core.create_op_call("block.matmul_acc", [acc, lhs, rhs], {}, actual_span)
 
 
+def matmul_bias(lhs: Expr, rhs: Expr, bias: Expr, span: Span | None = None) -> Call:
+    """Matrix multiplication with bias add: C = lhs @ rhs + bias.
+
+    Args:
+        lhs: Left-hand side tile (TileType [M, K])
+        rhs: Right-hand side tile (TileType [K, N])
+        bias: Bias tile (TileType [1, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for matrix multiplication with bias
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.matmul_bias", [lhs, rhs, bias], {}, actual_span)
+
+
+def gemv(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """General Matrix-Vector multiplication: C[1,N] = A[1,K] @ B[K,N].
+
+    Args:
+        lhs: Row vector tile (TileType [1, K])
+        rhs: Right-hand side tile (TileType [K, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for GEMV
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.gemv", [lhs, rhs], {}, actual_span)
+
+
+def gemv_acc(acc: Expr, lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """GEMV with accumulation: C[1,N] += A[1,K] @ B[K,N].
+
+    Args:
+        acc: Accumulator tile (TileType [1, N])
+        lhs: Row vector tile (TileType [1, K])
+        rhs: Right-hand side tile (TileType [K, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for GEMV with accumulation
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.gemv_acc", [acc, lhs, rhs], {}, actual_span)
+
+
+def gemv_bias(lhs: Expr, rhs: Expr, bias: Expr, span: Span | None = None) -> Call:
+    """GEMV with bias add: C[1,N] = A[1,K] @ B[K,N] + bias[1,N].
+
+    Args:
+        lhs: Row vector tile (TileType [1, K])
+        rhs: Right-hand side tile (TileType [K, N])
+        bias: Bias tile (TileType [1, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for GEMV with bias
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.gemv_bias", [lhs, rhs, bias], {}, actual_span)
+
+
 # ============================================================================
 # Row Broadcast Operations
 # ============================================================================
+
+
+def row_expand(src: Expr, span: Span | None = None) -> Call:
+    """Broadcast the first element of each source row across the destination row.
+
+    For each element (i, j) in the valid region: dst[i, j] = src[i, 0].
+
+    Args:
+        src: Input tile (TileType [M, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise first-element broadcast
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("block.row_expand", [src], {}, actual_span)
 
 
 def row_expand_sub(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
@@ -883,6 +1377,50 @@ def minimum(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("block.minimum", [lhs, rhs], {}, actual_span)
+
+
+def maxs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+    """Element-wise maximum of tile and scalar.
+
+    Computes max(lhs, rhs) element-wise. Maps to the TMAXS hardware intrinsic.
+
+    Args:
+        lhs: Tile (TileType)
+        rhs: Scalar (int/float/Expr with ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise maximum with scalar
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
+        if not isinstance(rhs, Expr)
+        else rhs
+    )
+    return _ir_core.create_op_call("block.maxs", [lhs, rhs_expr], {}, actual_span)
+
+
+def mins(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+    """Element-wise minimum of tile and scalar.
+
+    Computes min(lhs, rhs) element-wise. Maps to the TMINS hardware intrinsic.
+
+    Args:
+        lhs: Tile (TileType)
+        rhs: Scalar (int/float/Expr with ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise minimum with scalar
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
+        if not isinstance(rhs, Expr)
+        else rhs
+    )
+    return _ir_core.create_op_call("block.mins", [lhs, rhs_expr], {}, actual_span)
 
 
 # ============================================================================

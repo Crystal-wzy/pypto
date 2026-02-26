@@ -139,6 +139,24 @@ TypePtr DeduceBlockExpandScalarType(const std::vector<ExprPtr>& args,
 // Registration Function for Block Row Broadcast Operations
 // ============================================================================
 
+REGISTER_OP("block.row_expand")
+    .set_op_category("BlockOp")
+    .set_description(
+        "Broadcast first element of each source row across the destination row: dst[i,j] = src[i,0]")
+    .add_argument("src", "Input tile (TileType, 2D [M, N])")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      CHECK(args.size() == 1) << "The operator block.row_expand requires exactly 1 argument, but got "
+                              << args.size();
+      auto tile_type = As<TileType>(args[0]->GetType());
+      CHECK(tile_type) << "The operator block.row_expand requires argument to be a TileType, but got "
+                       << args[0]->GetType()->TypeName();
+      CHECK(tile_type->shape_.size() >= 2)
+          << "The operator block.row_expand requires input tile"
+          << " to have at least 2 dimensions, but got " << tile_type->shape_.size() << " dimensions";
+      return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_);
+    });
+
 REGISTER_OP("block.row_expand_sub")
     .set_op_category("BlockOp")
     .set_description("Row-wise broadcast subtraction: tile - row_vec (broadcasted)")

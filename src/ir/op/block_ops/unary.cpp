@@ -170,5 +170,23 @@ REGISTER_OP("block.relu")
       return DeduceBlockUnaryType(args, kwargs, "block.relu");
     });
 
+REGISTER_OP("block.not")
+    .set_op_category("BlockOp")
+    .set_description("Element-wise bitwise NOT of a tile")
+    .add_argument("tile", "Input tile (TileType) with int16 or uint16 dtype")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      const std::string op_name = "block.not";
+      CHECK(args.size() == 1) << "The operator " << op_name << " requires exactly 1 argument, but got "
+                              << args.size();
+      auto tile_type = As<TileType>(args[0]->GetType());
+      CHECK(tile_type) << "The operator " << op_name << " requires argument to be a TileType, but got "
+                       << args[0]->GetType()->TypeName();
+      CHECK(tile_type->dtype_ == DataType::INT16 || tile_type->dtype_ == DataType::UINT16)
+          << "The operator " << op_name << " requires int16 or uint16 tile dtype, but got "
+          << tile_type->dtype_.ToString();
+      return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_);
+    });
+
 }  // namespace ir
 }  // namespace pypto

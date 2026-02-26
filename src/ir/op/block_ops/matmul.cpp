@@ -171,6 +171,70 @@ TypePtr DeduceBlockMatMulAccType(const std::vector<ExprPtr>& args,
   return std::make_shared<TileType>(output_shape, *result_dtype);
 }
 
+TypePtr DeduceBlockMatMulBiasType(const std::vector<ExprPtr>& args,
+                                  const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                  const std::string& op_name) {
+  CHECK(args.size() == 3) << "The operator " << op_name << " requires exactly 3 arguments, but got "
+                          << args.size();
+
+  auto lhs_type = As<TileType>(args[0]->GetType());
+  auto rhs_type = As<TileType>(args[1]->GetType());
+  auto bias_type = As<TileType>(args[2]->GetType());
+
+  CHECK(lhs_type) << "The operator " << op_name << " requires first argument (lhs) to be a TileType, but got "
+                  << args[0]->GetType()->TypeName();
+  CHECK(rhs_type) << "The operator " << op_name
+                  << " requires second argument (rhs) to be a TileType, but got "
+                  << args[1]->GetType()->TypeName();
+  CHECK(bias_type) << "The operator " << op_name
+                   << " requires third argument (bias) to be a TileType, but got "
+                   << args[2]->GetType()->TypeName();
+
+  const auto& lhs_shape = lhs_type->shape_;
+  const auto& rhs_shape = rhs_type->shape_;
+  const auto& bias_shape = bias_type->shape_;
+
+  CHECK(lhs_shape.size() == 2) << "The operator " << op_name << " requires lhs to be 2D, but got "
+                               << lhs_shape.size() << " dimensions";
+  CHECK(rhs_shape.size() == 2) << "The operator " << op_name << " requires rhs to be 2D, but got "
+                               << rhs_shape.size() << " dimensions";
+  CHECK(bias_shape.size() == 2) << "The operator " << op_name << " requires bias to be 2D, but got "
+                                << bias_shape.size() << " dimensions";
+
+  auto k_lhs_const = As<ConstInt>(lhs_shape[1]);
+  auto k_rhs_const = As<ConstInt>(rhs_shape[0]);
+  if (k_lhs_const && k_rhs_const) {
+    CHECK(k_lhs_const->value_ == k_rhs_const->value_)
+        << "The operator " << op_name
+        << " requires matching inner dimensions, but got lhs K=" << k_lhs_const->value_
+        << " and rhs K=" << k_rhs_const->value_;
+  }
+
+  std::vector<ExprPtr> output_shape = {lhs_shape[0], rhs_shape[1]};
+
+  // Hardware requires bias to be [1, N]
+  auto bias_row_const = As<ConstInt>(bias_shape[0]);
+  CHECK(bias_row_const && bias_row_const->value_ == 1)
+      << "The operator " << op_name << " requires bias to have shape [1, N], but got "
+      << FormatShape(bias_shape);
+  auto bias_n_const = As<ConstInt>(bias_shape[1]);
+  auto rhs_n_const = As<ConstInt>(rhs_shape[1]);
+  if (bias_n_const && rhs_n_const) {
+    CHECK(bias_n_const->value_ == rhs_n_const->value_)
+        << "The operator " << op_name
+        << " requires bias N dimension to match output N=" << rhs_n_const->value_
+        << ", but got bias N=" << bias_n_const->value_;
+  }
+
+  auto lhs_rhs_dtype = PromoteDataTypes(lhs_type->dtype_, rhs_type->dtype_);
+  CHECK(lhs_rhs_dtype) << "The operator " << op_name << " requires compatible lhs/rhs data types, but got "
+                       << lhs_type->dtype_.ToString() << " and " << rhs_type->dtype_.ToString();
+  auto result_dtype = PromoteDataTypes(*lhs_rhs_dtype, bias_type->dtype_);
+  CHECK(result_dtype) << "The operator " << op_name << " requires compatible bias data type, but got "
+                      << lhs_rhs_dtype->ToString() << " and " << bias_type->dtype_.ToString();
+  return std::make_shared<TileType>(output_shape, *result_dtype);
+}
+
 // ============================================================================
 // Registration Function for Block Matrix Multiplication Operations
 // ============================================================================
@@ -194,6 +258,49 @@ REGISTER_OP("block.matmul_acc")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceBlockMatMulAccType(args, kwargs, "block.matmul_acc");
+    });
+
+REGISTER_OP("block.matmul_bias")
+    .set_op_category("BlockOp")
+    .set_description("Matrix multiplication with bias add: C = lhs @ rhs + bias")
+    .add_argument("lhs", "Left-hand side tile (TileType, 2D)")
+    .add_argument("rhs", "Right-hand side tile (TileType, 2D)")
+    .add_argument("bias", "Bias tile (TileType, [1, N])")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceBlockMatMulBiasType(args, kwargs, "block.matmul_bias");
+    });
+
+REGISTER_OP("block.gemv")
+    .set_op_category("BlockOp")
+    .set_description("General Matrix-Vector multiplication: C[1,N] = A[1,K] @ B[K,N]")
+    .add_argument("lhs", "Row vector tile (TileType, 2D [1, K])")
+    .add_argument("rhs", "Right-hand side tile (TileType, 2D [K, N])")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceBlockMatMulType(args, kwargs, "block.gemv");
+    });
+
+REGISTER_OP("block.gemv_acc")
+    .set_op_category("BlockOp")
+    .set_description("GEMV with accumulation: C[1,N] += A[1,K] @ B[K,N]")
+    .add_argument("acc", "Accumulator tile (TileType, 2D [1, N])")
+    .add_argument("lhs", "Row vector tile (TileType, 2D [1, K])")
+    .add_argument("rhs", "Right-hand side tile (TileType, 2D [K, N])")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceBlockMatMulAccType(args, kwargs, "block.gemv_acc");
+    });
+
+REGISTER_OP("block.gemv_bias")
+    .set_op_category("BlockOp")
+    .set_description("GEMV with bias add: C[1,N] = A[1,K] @ B[K,N] + bias[1,N]")
+    .add_argument("lhs", "Row vector tile (TileType, 2D [1, K])")
+    .add_argument("rhs", "Right-hand side tile (TileType, 2D [K, N])")
+    .add_argument("bias", "Bias tile (TileType, [1, N])")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceBlockMatMulBiasType(args, kwargs, "block.gemv_bias");
     });
 
 }  // namespace ir
