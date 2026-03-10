@@ -50,7 +50,7 @@ class TestSingleParallelChunk:
 
         outer_for = stmts[0]
         assert outer_for.loop_origin == ir.LoopOrigin.ChunkOuter
-        assert outer_for.kind == ir.ForKind.Sequential
+        assert outer_for.kind == ir.ForKind.Parallel
 
         # Outer body = SeqStmts [InCore, yield]
         outer_body_stmts = list(outer_for.body.stmts)
@@ -89,13 +89,13 @@ class TestNestedParallelChunks:
         # i_out
         i_out = stmts[0]
         assert i_out.loop_origin == ir.LoopOrigin.ChunkOuter
-        assert i_out.kind == ir.ForKind.Sequential
+        assert i_out.kind == ir.ForKind.Parallel
 
         # j_out inside i_out body
         i_out_body = list(i_out.body.stmts)
         j_out = i_out_body[0]
         assert j_out.loop_origin == ir.LoopOrigin.ChunkOuter
-        assert j_out.kind == ir.ForKind.Sequential
+        assert j_out.kind == ir.ForKind.Parallel
 
         # InCore inside j_out body
         j_out_body = list(j_out.body.stmts)
@@ -179,10 +179,10 @@ class TestChunkWithRemainderInChain:
         func = list(After.functions.values())[0]
         stmts = list(func.body.stmts)  # type: ignore[attr-defined]
 
-        # i_out (ChunkOuter, Sequential)
+        # i_out (ChunkOuter, Parallel — preserves original kind from pl.parallel)
         i_out = stmts[0]
         assert i_out.loop_origin == ir.LoopOrigin.ChunkOuter
-        assert i_out.kind == ir.ForKind.Sequential
+        assert i_out.kind == ir.ForKind.Parallel
         assert len(i_out.iter_args) == 1
 
         # InCore { i_in → body with remainder }

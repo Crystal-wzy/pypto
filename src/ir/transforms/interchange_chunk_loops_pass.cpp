@@ -431,13 +431,13 @@ class InterchangeChunkLoopsMutator : public IRMutator {
     // Wrap in InCore
     current = std::make_shared<ScopeStmt>(ScopeKind::InCore, current, span);
 
-    // Build outers inside-out
+    // Build outers inside-out, preserving the original ForKind.
     for (int i = static_cast<int>(outers.size()) - 1; i >= 0; --i) {
       const auto& outer = outers[i];
       current = std::make_shared<ForStmt>(outer->loop_var_, outer->start_, outer->stop_, outer->step_,
                                           std::vector<IterArgPtr>{}, current, std::vector<VarPtr>{},
-                                          outer->span_, ForKind::Sequential, std::nullopt,
-                                          ChunkPolicy::LeadingFull, LoopOrigin::ChunkOuter);
+                                          outer->span_, outer->kind_, std::nullopt, ChunkPolicy::LeadingFull,
+                                          LoopOrigin::ChunkOuter);
     }
 
     return current;
@@ -540,8 +540,8 @@ class InterchangeChunkLoopsMutator : public IRMutator {
 
       current = std::make_shared<ForStmt>(
           orig_loop->loop_var_, orig_loop->start_, orig_loop->stop_, orig_loop->step_, new_iter_args[i],
-          current, new_return_vars[i], orig_loop->span_, is_inner ? orig_loop->kind_ : ForKind::Sequential,
-          std::nullopt, ChunkPolicy::LeadingFull, is_inner ? LoopOrigin::ChunkInner : LoopOrigin::ChunkOuter);
+          current, new_return_vars[i], orig_loop->span_, orig_loop->kind_, std::nullopt,
+          ChunkPolicy::LeadingFull, is_inner ? LoopOrigin::ChunkInner : LoopOrigin::ChunkOuter);
 
       // Insert InCore scope right after building all inners (at the boundary)
       if (!is_inner && i + 1 < static_cast<int>(total_loops) &&
