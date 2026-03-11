@@ -1111,8 +1111,7 @@ class TestPythonSyntaxPrinting:
         assert "pl.MemorySpace.Left" in printed
         assert "8192" in printed  # 0x2000 in decimal
         assert "512" in printed  # size
-        assert "tile_view=" in printed
-        assert "pl.TileView" in printed
+        assert "pl.TileView(" in printed
         # valid_shape matches tile shape [16, 16] — should be omitted
         assert "valid_shape=" not in printed
         assert "stride=" in printed
@@ -1250,7 +1249,6 @@ class TestPythonSyntaxPrinting:
         tensor_type = ir.TensorType(shape, DataType.FP32, memref=None, tensor_view=tensor_view)
 
         printed = ir.python_print_type(tensor_type)
-        assert "pl.TensorView" in printed
         assert "pl.TensorLayout.DN" in printed
 
     def test_tensor_type_with_memref_and_tensorview_print(self):
@@ -1277,8 +1275,6 @@ class TestPythonSyntaxPrinting:
         # MemRef prints as positional (no keyword), tensor_view as keyword
         assert "memref=" not in printed
         assert "pl.MemRef" in printed
-        assert "tensor_view=" in printed
-        assert "pl.TensorView" in printed
         assert "pl.TensorLayout.NZ" in printed
 
 
@@ -1380,7 +1376,7 @@ class TestIRBuilderHelpers:
         assert "memref=" not in printed
         assert "pl.MemRef" in printed
         assert "pl.MemorySpace.Right" in printed
-        assert "tile_view=pl.TileView" in printed
+        assert "pl.TileView(" in printed
 
 
 class TestTensorLayout:
@@ -1693,8 +1689,8 @@ class TestMemRefRoundTrip:
         printed = program.as_python()
         assert "pl.MemRef" in printed
         assert "pl.MemorySpace.DDR" in printed
-        # Layout should appear as tensor_view
-        assert "tensor_view=" in printed
+        # Layout should appear as TensorLayout
+        assert "pl.TensorLayout" in printed
 
     def test_roundtrip_tile_memref(self):
         """Parse → print → parse → assert_structural_equal for tile with memref."""

@@ -217,7 +217,7 @@ class TestNestedChunkChainsInitSubstitution:
 
         program = _prepare_for_interchange(Input)
         program = passes.interchange_chunk_loops()(program)
-        # This should not raise "Variable ... not found in symbol table"
+        # This should not raise Variable ... not found in symbol table
         program = passes.outline_incore_scopes()(program)
 
         incore_funcs = [f for f in program.functions.values() if f.func_type == ir.FunctionType.InCore]

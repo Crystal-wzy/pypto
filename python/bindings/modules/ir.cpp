@@ -403,6 +403,15 @@ void BindIR(nb::module_& m) {
       .def(nb::init<MemorySpace, ExprPtr, uint64_t, uint64_t, Span>(), nb::arg("memory_space"),
            nb::arg("addr"), nb::arg("size"), nb::arg("id"), nb::arg("span") = Span::unknown(),
            "Create a memory reference with memory_space, addr, size, id, and span")
+      .def(
+          "__init__",
+          [](MemRef* self, MemorySpace memory_space, int64_t addr, uint64_t size, uint64_t id, Span span) {
+            auto addr_expr = std::make_shared<ConstInt>(addr, DataType::INT64, Span::unknown());
+            new (self) MemRef(memory_space, addr_expr, size, id, span);
+          },
+          nb::arg("memory_space"), nb::arg("addr"), nb::arg("size"), nb::arg("id"),
+          nb::arg("span") = Span::unknown(),
+          "Create a memory reference with integer address (converted to ConstInt)")
       .def_rw("memory_space_", &MemRef::memory_space_, "Memory space (DDR, Vec, Mat, Left, Right, Acc)")
       .def_rw("addr_", &MemRef::addr_, "Starting address expression")
       .def_rw("size_", &MemRef::size_, "Size in bytes (64-bit unsigned)")

@@ -402,7 +402,13 @@ def _build_program_with_allocs(tile_specs, op_specs):
             var_map[var_name] = result_var
         elif op_name == "tile.load":
             result_var = var_map[var_name]
-            call = ir.Call(ir.get_op(op_name), [args[0], offsets, sizes], result_var.type, span)
+            call = ir.Call(
+                ir.get_op(op_name),
+                [args[0], offsets, sizes, sizes],
+                {"target_memory": ir.MemorySpace.Vec, "transpose": False},
+                result_var.type,
+                span,
+            )
         else:
             result_var = var_map[var_name]
             call = ir.Call(ir.get_op(op_name), args, result_var.type, span)

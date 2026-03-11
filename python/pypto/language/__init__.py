@@ -38,7 +38,17 @@ Typical usage:
 """
 
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import ForKind, FunctionType, MemorySpace, MemRef, PipeType, TensorLayout
+from pypto.pypto_core.ir import (
+    ForKind,
+    FunctionType,
+    MemorySpace,
+    MemRef,
+    PipeType,
+    TensorLayout,
+    TensorView,
+    TileLayout,
+    TileView,
+)
 
 from . import parser
 from .dsl_api import (
@@ -104,6 +114,8 @@ from .op.tile_ops import (
     relu,
     rem,
     rems,
+    row_min,
+    rsqrt,
     sel,
     sels,
     shl,
@@ -140,9 +152,7 @@ from .op.unified_ops import (
     row_expand_mul,
     row_expand_sub,
     row_max,
-    row_min,
     row_sum,
-    rsqrt,
     slice,
     sqrt,
     sub,
@@ -152,6 +162,14 @@ from .op.unified_ops import (
 from .parser.decorator import InlineFunction, function, inline, program
 from .parser.text_parser import loads, loads_program, parse, parse_program
 from .typing import DynVar, InOut, IntLike, Out, Scalar, Tensor, Tile, dynamic
+
+
+# Sentinel type for pl.MemRefType annotations in printed IR
+class MemRefType:
+    """Sentinel type used in printed IR annotations for tile.alloc results."""
+
+    pass
+
 
 # Re-export TensorLayout constants for convenience
 ND = TensorLayout.ND
@@ -263,6 +281,17 @@ __all__ = [
     "max",
     "cmp",
     "cmps",
+    "row_min",
+    "row_expand",
+    "row_expand_add",
+    "row_expand_sub",
+    "row_expand_mul",
+    "row_expand_div",
+    "col_expand",
+    "col_expand_mul",
+    "col_expand_div",
+    "col_expand_sub",
+    "expands",
     "rem",
     "rems",
     "and_",
@@ -310,6 +339,9 @@ __all__ = [
     "MemorySpace",
     "PipeType",
     "TensorLayout",
+    "TensorView",
+    "TileLayout",
+    "TileView",
     "ND",
     "DN",
     "NZ",

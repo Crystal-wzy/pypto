@@ -424,6 +424,15 @@ class IRBuilder:
                     f"but override is {builtins.type(type).__name__}"
                 )
             final_type = type
+            # Propagate the override type to the Call expression itself so the
+            # AssignStmt's RHS type matches the variable type. This is required
+            # for print→parse roundtrip structural equality: when a body annotation
+            # overrides an inferred or less-specific type, the stored Call node
+            # must carry the same type or structural_equal will see a mismatch.
+            if isinstance(value_expr, ir.Call):
+                value_expr = ir.Call(
+                    value_expr.op, value_expr.args, value_expr.kwargs, final_type, actual_span
+                )
         else:
             final_type = inferred_type
 

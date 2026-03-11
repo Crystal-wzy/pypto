@@ -20,6 +20,8 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memref.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
@@ -81,6 +83,15 @@ class LoopUnrollMutator : public IRMutator {
     if (sub_it != substitution_map_.end()) {
       return sub_it->second;
     }
+    // Cross-iteration chaining: replace vars whose name maps to a previous
+    // iteration's output. This also applies after the loop ends (e.g., for
+    // return statements referencing loop-carried variables). The map is keyed
+    // by variable name so that different Var objects with the same name (e.g.,
+    // param x and loop-body LHS x) are treated as the same logical variable.
+    auto name_it = name_to_prev_output_.find(op->name_);
+    if (name_it != name_to_prev_output_.end() && name_it->second.get() != op.get()) {
+      return name_it->second;
+    }
     // Check clone map (per-iteration fresh copies for def-use tracking)
     if (in_unroll_) {
       auto clone_it = var_clone_map_.find(op.get());
@@ -95,11 +106,27 @@ class LoopUnrollMutator : public IRMutator {
     if (!in_unroll_) {
       return IRMutator::VisitStmt_(op);
     }
-    // In unrolled regions, only rewrite the RHS. Preserve the original LHS
-    // expression node to avoid changing its kind (e.g., IterArg, MemRef).
-    // SSA conversion and other passes handle versioning of assignment targets.
+    // In unrolled regions:
+    // 1. Visit the RHS first using the current name_to_prev_output_ chain
+    //    (so this iteration's RHS reads from the previous iteration's output).
     auto new_value = VisitExpr(op->value_);
-    return std::make_shared<AssignStmt>(op->var_, new_value, op->span_);
+    // 2. Create a fresh Var for plain Var targets so each unrolled copy has
+    //    a distinct Var object. This makes the unrolled program structurally
+    //    equivalent to its print->parse roundtrip (which creates SSA-style
+    //    fresh Vars at each definition site).
+    //    Preserve IterArg/MemRef targets as-is since they carry extra fields
+    //    that SSA conversion and other passes handle.
+    VarPtr new_var;
+    if (As<IterArg>(op->var_) || As<MemRef>(op->var_)) {
+      // Preserve the original LHS expression node to avoid changing its kind.
+      new_var = op->var_;
+    } else {
+      new_var = std::make_shared<Var>(op->var_->name_, op->var_->GetType(), op->var_->span_);
+    }
+    // 3. Update the cross-iteration chain so subsequent stmts in this
+    //    iteration and all future iterations use new_var as the current value.
+    name_to_prev_output_[op->var_->name_] = new_var;
+    return std::make_shared<AssignStmt>(new_var, new_value, op->span_);
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
@@ -212,6 +239,10 @@ class LoopUnrollMutator : public IRMutator {
   bool in_unroll_ = false;
   std::unordered_map<const Var*, ExprPtr> substitution_map_;
   std::unordered_map<const Expr*, ExprPtr> var_clone_map_;
+  // Maps variable name -> most recent fresh Var created for that name.
+  // Accumulates across iterations and sequential loops so that each use of
+  // a loop-carried variable reads from the correct preceding assignment.
+  std::unordered_map<std::string, VarPtr> name_to_prev_output_;
 };
 
 /**

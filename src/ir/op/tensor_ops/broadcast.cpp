@@ -14,8 +14,7 @@
  * @brief Broadcast tensor operations
  *
  * This file implements broadcast operations for tensors that perform
- * element-wise operations with row or column vector broadcasting,
- * single-argument row/col expansion, and scalar expansion.
+ * element-wise operations with row or column vector broadcasting.
  */
 
 #include <any>
@@ -148,11 +147,9 @@ TypePtr DeduceTensorRowExpandSingleType(const std::vector<ExprPtr>& args,
                                         const std::string& op_name) {
   CHECK(args.size() == 1) << "The operator " << op_name << " requires exactly 1 argument, but got "
                           << args.size();
-
   auto tensor_type = As<TensorType>(args[0]->GetType());
   CHECK(tensor_type) << "The operator " << op_name << " requires first argument to be a TensorType, but got "
                      << args[0]->GetType()->TypeName();
-
   return std::make_shared<TensorType>(tensor_type->shape_, tensor_type->dtype_);
 }
 
@@ -161,15 +158,12 @@ TypePtr DeduceTensorExpandScalarType(const std::vector<ExprPtr>& args,
                                      const std::string& op_name) {
   CHECK(args.size() == 2) << "The operator " << op_name << " requires exactly 2 arguments, but got "
                           << args.size();
-
   auto tensor_type = As<TensorType>(args[0]->GetType());
   CHECK(tensor_type) << "The operator " << op_name << " requires first argument to be a TensorType, but got "
                      << args[0]->GetType()->TypeName();
-
   auto scalar_type = As<ScalarType>(args[1]->GetType());
   CHECK(scalar_type) << "The operator " << op_name << " requires second argument to be a ScalarType, but got "
                      << args[1]->GetType()->TypeName();
-
   return std::make_shared<TensorType>(tensor_type->shape_, tensor_type->dtype_);
 }
 
@@ -209,8 +203,8 @@ REGISTER_OP("tensor.col_expand_mul")
 
 REGISTER_OP("tensor.row_expand")
     .set_op_category("TensorOp")
-    .set_description("Row-wise broadcast: dst[i,j] = src[i,0]")
-    .add_argument("src", "Input tensor (TensorType [M, N])")
+    .set_description("Row-wise broadcast expansion: expand row vector to tensor shape")
+    .add_argument("input", "Input tensor (TensorType)")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorRowExpandSingleType(args, kwargs, "tensor.row_expand");
@@ -238,7 +232,7 @@ REGISTER_OP("tensor.row_expand_sub")
 
 REGISTER_OP("tensor.col_expand")
     .set_op_category("TensorOp")
-    .set_description("Column-wise expansion: expand col_vec [1,N] to target shape [M,N]")
+    .set_description("Column-wise broadcast expansion: expand col vector to tensor shape")
     .add_argument("tensor", "Input tensor (TensorType [M, N])")
     .add_argument("col_vec", "Column vector (TensorType [1, N])")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
@@ -269,8 +263,8 @@ REGISTER_OP("tensor.col_expand_div")
 REGISTER_OP("tensor.expands")
     .set_op_category("TensorOp")
     .set_description("Expand scalar to tensor shape")
-    .add_argument("target", "Target tensor defining output shape (TensorType)")
-    .add_argument("scalar", "Scalar to expand (ScalarType)")
+    .add_argument("target", "Target tensor (TensorType)")
+    .add_argument("scalar", "Scalar value (ScalarType)")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorExpandScalarType(args, kwargs, "tensor.expands");

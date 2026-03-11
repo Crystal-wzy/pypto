@@ -163,8 +163,9 @@ struct PassProperties {
  * a small set of lightweight properties exactly once each, throwing on errors.
  */
 enum class VerificationLevel {
-  None,   ///< No automatic verification (fastest)
-  Basic,  ///< Verify lightweight properties once per pipeline (default)
+  None,       ///< No automatic verification (fastest)
+  Basic,      ///< Verify lightweight properties once per pipeline (default)
+  Roundtrip,  ///< Basic verification + print-parse roundtrip check after each pass
 };
 
 /**

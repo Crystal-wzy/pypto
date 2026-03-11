@@ -563,6 +563,17 @@ class SSAConverter : public IRMutator {
     return std::make_shared<WhileStmt>(new_condition, new_iter_args, final_body, return_vars, op->span_);
   }
 
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    // Let base class visit the arguments (substituting vars in arg expressions)
+    auto base_result = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(base_result);
+    if (!call) return base_result;
+    // Also substitute vars in the Call's return type (e.g. TileView valid_shape)
+    auto new_type = SubstituteVarsInType(call->GetType());
+    if (new_type == call->GetType()) return base_result;
+    return std::make_shared<const Call>(call->op_, call->args_, call->kwargs_, new_type, call->span_);
+  }
+
  private:
   // Version counter per base variable name
   std::unordered_map<std::string, int> version_counter_;

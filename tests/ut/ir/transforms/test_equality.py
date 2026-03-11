@@ -1343,7 +1343,7 @@ class TestAssertStructuralEqualPath:
         assert "AssignStmt" not in path
 
     def test_path_opstmts_transparent(self):
-        """OpStmts is also transparent → double folding: body[0][1]"""
+        """OpStmts is transparent → SeqStmts([OpStmts([a,b])]) flattens to body[0], body[1]."""
         span = ir.Span.unknown()
         dtype = DataType.INT64
         x = ir.Var("x", ir.ScalarType(dtype), span)
@@ -1372,7 +1372,7 @@ class TestAssertStructuralEqualPath:
         path = _get_mismatch_path(prog1, prog2)
 
         assert "at:" in path
-        assert "['main'].body[0][1]" in path  # double transparent folding
+        assert "['main'].body[1]" in path  # flat transparent folding through SeqStmts→OpStmts
         assert "SeqStmts" not in path
         assert "OpStmts" not in path
         assert "AssignStmt" not in path

@@ -789,6 +789,14 @@ def test_operator_registration():
     assert ir.is_op_registered("tensor.row_expand_mul")
     assert ir.is_op_registered("tensor.row_expand_div")
     assert ir.is_op_registered("tensor.col_expand_mul")
+    assert ir.is_op_registered("tensor.row_min")
+    assert ir.is_op_registered("tensor.row_expand")
+    assert ir.is_op_registered("tensor.row_expand_add")
+    assert ir.is_op_registered("tensor.row_expand_sub")
+    assert ir.is_op_registered("tensor.col_expand")
+    assert ir.is_op_registered("tensor.col_expand_sub")
+    assert ir.is_op_registered("tensor.col_expand_div")
+    assert ir.is_op_registered("tensor.expands")
     assert ir.is_op_registered("tensor.dim")
     # Check transform operators
     assert ir.is_op_registered("tensor.reshape")
@@ -1036,6 +1044,8 @@ class TestTensorScalarMemoryOps:
             tensor.read(tile_var, [idx])
 
 
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
 # =============================================================================
 # Tensor row_min tests
 # =============================================================================

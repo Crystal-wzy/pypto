@@ -12,7 +12,17 @@
 from collections.abc import Sequence
 
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import Expr, MemRef, TensorType, TensorView, TileType, TileView
+from pypto.pypto_core.ir import (
+    ConstInt,
+    Expr,
+    MemorySpace,
+    MemRef,
+    Span,
+    TensorType,
+    TensorView,
+    TileType,
+    TileView,
+)
 
 from .utils import _normalize_shape
 
@@ -59,8 +69,6 @@ def _tile_type_init_wrapper(
         tile_view: Optional tile view information
     """
     shape_exprs = _normalize_shape(shape)
-    if tile_view is not None and memref is None:
-        raise ValueError("tile_view requires memref to be specified")
     # Always pass all 4 arguments to native constructor (memref and tile_view can be None)
     _native_tile_type_init(self, shape_exprs, dtype, memref, tile_view)
 
@@ -70,6 +78,38 @@ TensorType.__init__ = _tensor_type_init_wrapper
 
 # Monkey-patch the native TileType.__init__ to support integer shapes
 TileType.__init__ = _tile_type_init_wrapper
+
+# Store the original native MemRef.__init__
+_native_memref_init = MemRef.__init__
+
+
+def _memref_init_wrapper(
+    self,
+    memory_space: MemorySpace,
+    addr: int | Expr,
+    size: int,
+    id: int,
+    span: Span | None = None,
+) -> None:
+    """Wrapped __init__ for MemRef that accepts int or Expr for addr.
+
+    Args:
+        memory_space: Memory space for this reference
+        addr: Starting address (int or Expr; int is converted to ConstInt)
+        size: Size in bytes
+        id: Unique identifier
+        span: Optional source span
+    """
+    if isinstance(addr, int):
+        addr = ConstInt(addr, DataType.INT64, Span.unknown())
+    if span is None:
+        _native_memref_init(self, memory_space, addr, size, id)
+    else:
+        _native_memref_init(self, memory_space, addr, size, id, span)
+
+
+# Monkey-patch MemRef.__init__ to support integer addresses
+MemRef.__init__ = _memref_init_wrapper
 
 
 __all__ = ["TensorType", "TileType"]

@@ -311,7 +311,7 @@ def unroll(
         chunk_policy: Chunk distribution policy (default: "leading_full")
 
     Returns:
-        RangeIterator yielding loop variable (Scalar)
+        RangeIterator yielding loop variable (int)
 
     Examples:
         >>> for i in pl.unroll(4):

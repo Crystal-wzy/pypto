@@ -84,7 +84,9 @@ void BindPass(nb::module_& m) {
   // Bind VerificationLevel enum
   nb::enum_<VerificationLevel>(passes, "VerificationLevel", "Controls automatic verification in PassPipeline")
       .value("NONE", VerificationLevel::None, "No automatic verification (fastest)")
-      .value("BASIC", VerificationLevel::Basic, "Verify lightweight properties once per pipeline (default)");
+      .value("BASIC", VerificationLevel::Basic, "Verify lightweight properties once per pipeline (default)")
+      .value("ROUNDTRIP", VerificationLevel::Roundtrip,
+             "Basic verification + print-parse roundtrip check after each pass");
 
   // Verification functions
   passes.def(

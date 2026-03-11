@@ -74,6 +74,43 @@ def create(
 create_tile = create
 
 
+def alloc(
+    memory_space: MemorySpace,
+    addr: "int | Expr",
+    size: "int | Expr",
+    id: "int | Expr",
+    span: Span | None = None,
+) -> Call:
+    """Allocate memory for a MemRef object.
+
+    Args:
+        memory_space: Memory space for the allocation
+        addr: Starting address (int or Expr)
+        size: Size in bytes
+        id: MemRef unique identifier
+        span: Optional source span for debugging
+
+    Returns:
+        Call expression that returns a MemRefType
+    """
+    actual_span = _get_span_or_capture(span)
+
+    def _to_const_int(val: "int | Expr", dtype: DataType = DataType.INT64) -> Expr:
+        if isinstance(val, int):
+            return ConstInt(val, dtype, actual_span)
+        return val
+
+    # memory_space can be a MemorySpace enum or already a ConstInt (from parse_expression)
+    if isinstance(memory_space, ConstInt):
+        ms_expr = memory_space
+    else:
+        ms_expr = ConstInt(memory_space.value, DataType.INDEX, actual_span)
+    addr_expr = _to_const_int(addr, DataType.INT64)
+    size_expr = _to_const_int(size, DataType.INDEX)
+    id_expr = _to_const_int(id, DataType.INDEX)
+    return _ir_core.create_op_call("tile.alloc", [ms_expr, addr_expr, size_expr, id_expr], {}, actual_span)
+
+
 def load(
     tensor: Expr,
     offsets: Sequence[int | Expr] | _ir_core.MakeTuple,
@@ -1619,7 +1656,7 @@ def reshape(tile: Expr, shape: Sequence[int | Expr] | _ir_core.MakeTuple, span: 
     return _ir_core.create_op_call("tile.reshape", args, {}, actual_span)
 
 
-def transpose(tile: Expr, axis1: int, axis2: int, span: Span | None = None) -> Call:
+def transpose(tile: Expr, axis1: int | ConstInt, axis2: int | ConstInt, span: Span | None = None) -> Call:
     """Transpose tile by swapping two axes.
 
     Args:
@@ -1632,8 +1669,8 @@ def transpose(tile: Expr, axis1: int, axis2: int, span: Span | None = None) -> C
         Call expression for tile transpose
     """
     actual_span = _get_span_or_capture(span)
-    axis1_expr = ConstInt(axis1, DataType.INDEX, actual_span)
-    axis2_expr = ConstInt(axis2, DataType.INDEX, actual_span)
+    axis1_expr = axis1 if isinstance(axis1, ConstInt) else ConstInt(axis1, DataType.INDEX, actual_span)
+    axis2_expr = axis2 if isinstance(axis2, ConstInt) else ConstInt(axis2, DataType.INDEX, actual_span)
 
     args = [tile, axis1_expr, axis2_expr]
 

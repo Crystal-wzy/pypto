@@ -480,7 +480,9 @@ class InterchangeChunkLoopsMutator : public IRMutator {
 
         ExprPtr init_value;
         if (loop_idx == 0) {
-          // Outermost: use original init values (apply substitutions for nested chains)
+          // Outermost: use original init values, applying any substitutions
+          // from previously processed chains (e.g., when this chain's init
+          // references the return_var of an earlier chain).
           init_value = VisitExpr(orig_ia->initValue_);
         } else {
           // Chain from previous loop's iter_arg

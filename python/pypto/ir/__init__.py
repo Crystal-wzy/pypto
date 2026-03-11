@@ -39,7 +39,7 @@ from .op_conversion import ConversionContext, op_conversion, register_op_convers
 from .pass_manager import OptimizationStrategy, PassManager
 
 # Import python_print utility
-from .printer import python_print
+from .printer import python_print, verify_roundtrip
 
 # Import TensorType and TileType with enhanced __init__ that supports integer shapes
 # This patches the native TensorType and TileType classes to accept integer shapes
@@ -74,6 +74,7 @@ __all__ = [
     "TensorType",
     "TileType",
     "python_print",
+    "verify_roundtrip",
     "compile",
     "PassManager",
     "OptimizationStrategy",

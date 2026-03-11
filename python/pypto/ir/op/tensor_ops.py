@@ -425,28 +425,28 @@ def row_sum(input: Expr, span: Span | None = None) -> Call:
 
 
 def row_min(input: Expr, span: Span | None = None) -> Call:
-    """Row-wise min reduction (reduces along last axis, keeps dim).
+    """Row-wise minimum reduction (reduces along last axis, keeps dim).
 
     Args:
         input: Input tensor
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for row-wise min reduction
+        Call expression for row-wise minimum reduction
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tensor.row_min", [input], {}, actual_span)
 
 
 def row_expand(input: Expr, span: Span | None = None) -> Call:
-    """Row-wise broadcast: dst[i, j] = src[i, 0].
+    """Row-wise broadcast expansion: expand row vector to tensor shape.
 
     Args:
-        input: Input tensor (TensorType [M, N])
+        input: Input tensor (TensorType)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for row-wise first-element broadcast
+        Call expression for row-wise broadcast expansion
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tensor.row_expand", [input], {}, actual_span)
@@ -489,10 +489,7 @@ def row_expand_div(tensor: Expr, row_vec: Expr, span: Span | None = None) -> Cal
 
 
 def row_expand_add(tensor: Expr, row_vec: Expr, span: Span | None = None) -> Call:
-    """Row-wise broadcast addition.
-
-    Adds a row vector to each row of the tensor.
-    tensor[i, :] + row_vec[i, 0] for all i.
+    """Row-wise broadcast addition: tensor + row_vec (broadcasted).
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -507,10 +504,7 @@ def row_expand_add(tensor: Expr, row_vec: Expr, span: Span | None = None) -> Cal
 
 
 def row_expand_sub(tensor: Expr, row_vec: Expr, span: Span | None = None) -> Call:
-    """Row-wise broadcast subtraction.
-
-    Subtracts a row vector from each row of the tensor.
-    tensor[i, :] - row_vec[i, 0] for all i.
+    """Row-wise broadcast subtraction: tensor - row_vec (broadcasted).
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -543,25 +537,22 @@ def col_expand_mul(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Cal
 
 
 def col_expand(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Call:
-    """Column-wise expansion: expand col_vec [1, N] to target shape [M, N].
+    """Column-wise broadcast expansion: expand col vector to tensor shape.
 
     Args:
-        tensor: Target tensor defining output shape (TensorType [M, N])
-        col_vec: Column vector to expand (TensorType [1, N])
+        tensor: Input tensor (TensorType [M, N])
+        col_vec: Column vector (TensorType [1, N])
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for column-wise expansion
+        Call expression for column-wise broadcast expansion
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tensor.col_expand", [tensor, col_vec], {}, actual_span)
 
 
 def col_expand_sub(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Call:
-    """Column-wise broadcast subtraction.
-
-    Subtracts a column vector from each column of the tensor.
-    tensor[:, j] - col_vec[0, j] for all j.
+    """Column-wise broadcast subtraction: tensor - col_vec (broadcasted).
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -576,10 +567,7 @@ def col_expand_sub(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Cal
 
 
 def col_expand_div(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Call:
-    """Column-wise broadcast division.
-
-    Divides each column of the tensor by the corresponding column vector value.
-    tensor[:, j] / col_vec[0, j] for all j.
+    """Column-wise broadcast division: tensor / col_vec (broadcasted).
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -594,22 +582,18 @@ def col_expand_div(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Cal
 
 
 def expands(target: Expr, scalar: int | float | Expr, span: Span | None = None) -> Call:
-    """Expand scalar to target tensor shape.
+    """Expand scalar to tensor shape.
 
     Args:
-        target: Target tensor defining output shape (TensorType)
-        scalar: Scalar value to expand (int/float/Expr with ScalarType)
+        target: Target tensor (TensorType)
+        scalar: Scalar value (ScalarType, or int/float that will be converted)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for scalar expansion
+        Call expression for scalar-to-tensor expansion
     """
     actual_span = _get_span_or_capture(span)
-    scalar_expr = (
-        _normalize_expr(scalar, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(scalar, Expr)
-        else scalar
-    )
+    scalar_expr = _normalize_expr(scalar, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.expands", [target, scalar_expr], {}, actual_span)
 
 
