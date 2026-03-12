@@ -19,7 +19,7 @@ from typing import Any
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import Call, ConstFloat, ConstInt, Expr, MemorySpace, Span
+from pypto.pypto_core.ir import Call, ConstFloat, ConstInt, Expr, MemorySpace, Span, TilePad
 
 from ..utils import _get_span_or_capture, _normalize_expr, _to_make_tuple, resolve_cast_mode
 
@@ -171,6 +171,29 @@ def store(
     return _ir_core.create_op_call("tile.store", [tile, offsets_tuple, output_tensor], {}, actual_span)
 
 
+def assemble(
+    target: Expr,
+    source: Expr,
+    offset: Sequence[int | Expr] | _ir_core.MakeTuple,
+    span: Span | None = None,
+) -> Call:
+    """Write source tile data into target tile at specified offset.
+
+    Args:
+        target: Target tile (TileType)
+        source: Source tile to write (TileType)
+        offset: Offset dimensions for where to write, or a MakeTuple
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression that returns a TileType with the same shape/dtype as target
+    """
+    actual_span = _get_span_or_capture(span)
+    offset_tuple = _to_make_tuple(offset, actual_span)
+
+    return _ir_core.create_op_call("tile.assemble", [target, source, offset_tuple], {}, actual_span)
+
+
 def move(
     tile: Expr,
     target_memory: MemorySpace,
@@ -245,18 +268,19 @@ def full(
     return _ir_core.create_op_call("tile.full", [shape_tuple, value_expr], kwargs, actual_span)
 
 
-def fillpad(tile: Expr, span: Span | None = None) -> Call:
-    """Fill tile with padding for remaining elements.
+def fillpad(tile: Expr, pad_value: TilePad = TilePad.zero, span: Span | None = None) -> Call:
+    """Fill remaining tile elements with specified padding value.
 
     Args:
         tile: Input tile (TileType)
+        pad_value: Padding mode (TilePad.zero, TilePad.max, or TilePad.min). Default is zero.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression that returns the filled and padded tile
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.fillpad", [tile], {}, actual_span)
+    return _ir_core.create_op_call("tile.fillpad", [tile], {"pad_value": pad_value}, actual_span)
 
 
 # ============================================================================

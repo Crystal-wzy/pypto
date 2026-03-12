@@ -35,12 +35,11 @@ Typical usage::
     print(result)  # PASS / FAIL: ...
 """
 
-import shutil
-import tempfile
 import time
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -68,9 +67,8 @@ class RunConfig:
         save_kernels: If ``True``, retain generated artefacts after execution.
             When ``False`` (default), a temporary directory is used and cleaned up.
         save_kernels_dir: Directory to save generated artefacts when *save_kernels*
-            is ``True``.  If ``None``, the harness auto-generates a timestamped
-            directory under ``build/tests/st/outputs/``; direct :func:`run` calls
-            create a temporary directory instead.
+            is ``True``.  If ``None``, a timestamped directory is created under
+            ``build_output/<program_name>_<timestamp>``.
         codegen_only: If ``True``, stop after code generation without executing
             on device.  Useful for validating compilation output.
     """
@@ -196,13 +194,12 @@ def run(
         config = RunConfig()
 
     start_time = time.time()
-    if config.save_kernels and config.save_kernels_dir:
-        use_temp = False
+    if config.save_kernels_dir:
         work_dir = Path(config.save_kernels_dir).resolve()
-        work_dir.mkdir(parents=True, exist_ok=True)
     else:
-        use_temp = True
-        work_dir = Path(tempfile.mkdtemp(prefix="pypto_run_"))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        work_dir = Path("build_output") / f"{program.name}_{timestamp}"
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         # 1. Set backend for code generation
@@ -233,9 +230,6 @@ def run(
             error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
             execution_time=time.time() - start_time,
         )
-    finally:
-        if use_temp and work_dir.exists():
-            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
