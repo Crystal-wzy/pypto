@@ -1343,7 +1343,7 @@ class TestAssertStructuralEqualPath:
         assert "AssignStmt" not in path
 
     def test_path_opstmts_transparent(self):
-        """OpStmts is also transparent → double folding: body[0][1]"""
+        """OpStmts is transparent → SeqStmts([OpStmts([a,b])]) flattens to body[0], body[1]."""
         span = ir.Span.unknown()
         dtype = DataType.INT64
         x = ir.Var("x", ir.ScalarType(dtype), span)
@@ -1372,7 +1372,7 @@ class TestAssertStructuralEqualPath:
         path = _get_mismatch_path(prog1, prog2)
 
         assert "at:" in path
-        assert "['main'].body[0][1]" in path  # double transparent folding
+        assert "['main'].body[1]" in path  # flat transparent folding through SeqStmts→OpStmts
         assert "SeqStmts" not in path
         assert "OpStmts" not in path
         assert "AssignStmt" not in path
@@ -1696,3 +1696,42 @@ class TestSubNodeComparison:
 
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
+
+
+class TestStructuralEqualNormalization:
+    """Normalization rules added to StructuralEqual for roundtrip support."""
+
+    def test_nested_seq_stmts_equal_flat(self):
+        span = ir.Span.unknown()
+        x = ir.Var("x", ir.ScalarType(DataType.INT64), span)
+        a = ir.AssignStmt(x, ir.ConstInt(1, DataType.INT64, span), span)
+        b = ir.AssignStmt(x, ir.ConstInt(2, DataType.INT64, span), span)
+        c = ir.AssignStmt(x, ir.ConstInt(3, DataType.INT64, span), span)
+
+        nested = ir.SeqStmts([ir.SeqStmts([a, b], span), c], span)
+        flat = ir.SeqStmts([a, b, c], span)
+
+        assert ir.structural_equal(nested, flat)
+
+    def test_trivial_tileview_equal_absent(self):
+        span = ir.Span.unknown()
+        trivial_view = ir.TileView()
+        trivial_view.valid_shape = [ir.ConstInt(64, DataType.INT64, span)]
+        memref = ir.MemRef(ir.MemorySpace.Vec, ir.ConstInt(0, DataType.INT64, span), 256, 0)
+
+        with_view = ir.TileType([64], DataType.FP32, memref=memref, tile_view=trivial_view)
+        without_view = ir.TileType([64], DataType.FP32)
+
+        assert ir.structural_equal(with_view, without_view)
+
+    def test_index_dtype_equals_int64(self):
+        span = ir.Span.unknown()
+        assert ir.structural_equal(
+            ir.ConstInt(0, DataType.INDEX, span),
+            ir.ConstInt(0, DataType.INT64, span),
+        )
+
+    def test_unknown_type_equals_memref_type(self):
+        span = ir.Span.unknown()
+        memref = ir.MemRef(ir.MemorySpace.Vec, ir.ConstInt(0, DataType.INT64, span), 256, 0)
+        assert ir.structural_equal(ir.UnknownType(), memref.type)

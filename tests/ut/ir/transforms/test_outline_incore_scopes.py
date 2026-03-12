@@ -656,3 +656,24 @@ class TestSplitIncoreOrchVerifier:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestScopeOutlinerIterArgConsistency:
+    def test_outlining_with_iter_args_produces_consistent_ir(self):
+        @pl.program
+        class Prog:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.incore():
+                    acc: pl.Tensor[[64], pl.FP32] = x
+                    for i in pl.range(4):
+                        acc = pl.add(acc, x)
+                return acc
+
+        prog = passes.convert_to_ssa()(Prog)
+        prog = passes.flatten_call_expr()(prog)
+        after = passes.outline_incore_scopes()(prog)
+
+        assert after is not None  # pass completes without error
+        src = python_print(after)
+        assert "@pl.function(type=pl.FunctionType.InCore)" in src

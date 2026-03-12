@@ -16,6 +16,7 @@
 #include <climits>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -25,6 +26,7 @@
 #include <vector>
 
 #include "pypto/core/logging.h"
+#include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -56,8 +58,102 @@ class VarSubstitutor : public IRMutator {
     return op;
   }
 
+  // IterArg has its own dispatch slot separate from Var. When an IterArg appears
+  // as an expression (e.g. as initValue of another IterArg), check the substitution
+  // map first so outer-scope IterArgs are replaced with fresh Var parameters.
+  // Also check the pointer-based iter_arg_map_ for ForStmt body substitutions.
+  ExprPtr VisitExpr_(const IterArgPtr& op) override {
+    // First check pointer-based mapping (for ForStmt iter_args)
+    auto ptr_it = iter_arg_map_.find(op);
+    if (ptr_it != iter_arg_map_.end()) {
+      return ptr_it->second;
+    }
+    // Then check name-based mapping
+    auto it = var_map_.find(op->name_);
+    if (it != var_map_.end()) {
+      return it->second;
+    }
+    return IRMutator::VisitExpr_(op);
+  }
+
+  // Override ForStmt handling to ensure iter_args and body references are consistent.
+  // When iter_args are mutated (e.g., their initValue changes), the body must use
+  // the new iter_arg objects, not the old ones.
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    // Visit loop control expressions
+    auto new_loop_var_expr = IRMutator::VisitExpr(op->loop_var_);
+    auto new_loop_var = As<Var>(new_loop_var_expr);
+    auto new_start = IRMutator::VisitExpr(op->start_);
+    auto new_stop = IRMutator::VisitExpr(op->stop_);
+    auto new_step = IRMutator::VisitExpr(op->step_);
+
+    // Visit iter_args and build mapping from old to new
+    std::vector<IterArgPtr> new_iter_args;
+    bool iter_args_changed = false;
+    new_iter_args.reserve(op->iter_args_.size());
+
+    for (const auto& iter_arg : op->iter_args_) {
+      auto new_iter_arg_expr = IRMutator::VisitExpr(iter_arg);
+      auto new_iter_arg = As<IterArg>(std::static_pointer_cast<const IRNode>(new_iter_arg_expr));
+      new_iter_args.push_back(new_iter_arg);
+
+      // If iter_arg changed, record the mapping so body can use the new one
+      if (new_iter_arg.get() != iter_arg.get()) {
+        iter_arg_map_[iter_arg] = new_iter_arg;
+        iter_args_changed = true;
+      }
+    }
+
+    // Visit body with iter_arg mapping active
+    auto new_body = IRMutator::VisitStmt(op->body_);
+    bool body_changed = (new_body.get() != op->body_.get());
+
+    // Clean up iter_arg mappings after visiting body
+    for (const auto& iter_arg : op->iter_args_) {
+      iter_arg_map_.erase(iter_arg);
+    }
+
+    // Visit return_vars
+    std::vector<VarPtr> new_return_vars;
+    bool return_vars_changed = false;
+    new_return_vars.reserve(op->return_vars_.size());
+    for (const auto& return_var : op->return_vars_) {
+      auto new_var_expr = IRMutator::VisitExpr(return_var);
+      auto new_var = As<Var>(new_var_expr);
+      new_return_vars.push_back(new_var);
+      if (new_var.get() != return_var.get()) {
+        return_vars_changed = true;
+      }
+    }
+
+    // Visit chunk_size if present
+    std::optional<ExprPtr> new_chunk_size = op->chunk_size_;
+    bool chunk_size_changed = false;
+    if (op->chunk_size_.has_value()) {
+      auto new_cs = IRMutator::VisitExpr(*op->chunk_size_);
+      if (new_cs.get() != (*op->chunk_size_).get()) {
+        new_chunk_size = new_cs;
+        chunk_size_changed = true;
+      }
+    }
+
+    if (new_loop_var.get() != op->loop_var_.get() || new_start.get() != op->start_.get() ||
+        new_stop.get() != op->stop_.get() || new_step.get() != op->step_.get() || iter_args_changed ||
+        body_changed || return_vars_changed || chunk_size_changed) {
+      return std::make_shared<const ForStmt>(
+          std::move(new_loop_var), std::move(new_start), std::move(new_stop), std::move(new_step),
+          std::move(new_iter_args), std::move(new_body), std::move(new_return_vars), op->span_, op->kind_,
+          std::move(new_chunk_size), op->chunk_policy_, op->loop_origin_);
+    } else {
+      return op;
+    }
+  }
+
  private:
   std::unordered_map<std::string, VarPtr> var_map_;
+  // Pointer-based mapping for IterArgs: when ForStmt's iter_args are mutated,
+  // we need to update references in the body to point to the new iter_arg objects.
+  std::unordered_map<IterArgPtr, IterArgPtr> iter_arg_map_;
 };
 
 /** @brief Visitor to collect all variable references in an IR subtree. */
@@ -277,6 +373,99 @@ class ScopeOutliner : public IRMutator {
   }
 
   /**
+   * @brief Check IterArg mappings for ForStmt consistency during recursive processing.
+   *
+   * When a ForStmts iter_args are mutated, references in the body must use the
+   * new iter_arg objects. This override checks the iter_arg_map_ before falling
+   * back to the base implementation.
+   */
+  ExprPtr VisitExpr_(const IterArgPtr& op) override {
+    // Check pointer-based mapping for ForStmt iter_args
+    auto ptr_it = iter_arg_map_.find(op);
+    if (ptr_it != iter_arg_map_.end()) {
+      return ptr_it->second;
+    }
+    return IRMutator::VisitExpr_(op);
+  }
+
+  /**
+   * @brief Override ForStmt handling to maintain IterArg consistency.
+   *
+   * When iter_args are mutated during recursive processing, the body must
+   * reference the new iter_arg objects, not the old ones. This maintains
+   * IR invariants that the printer and structural equality checks depend on.
+   */
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    // Visit loop control expressions
+    auto new_loop_var_expr = IRMutator::VisitExpr(op->loop_var_);
+    auto new_loop_var = As<Var>(new_loop_var_expr);
+    auto new_start = IRMutator::VisitExpr(op->start_);
+    auto new_stop = IRMutator::VisitExpr(op->stop_);
+    auto new_step = IRMutator::VisitExpr(op->step_);
+
+    // Visit iter_args and build mapping from old to new
+    std::vector<IterArgPtr> new_iter_args;
+    bool iter_args_changed = false;
+    new_iter_args.reserve(op->iter_args_.size());
+
+    for (const auto& iter_arg : op->iter_args_) {
+      auto new_iter_arg_expr = IRMutator::VisitExpr(iter_arg);
+      auto new_iter_arg = As<IterArg>(std::static_pointer_cast<const IRNode>(new_iter_arg_expr));
+      new_iter_args.push_back(new_iter_arg);
+
+      // If iter_arg changed, record mapping so body uses the new one
+      if (new_iter_arg.get() != iter_arg.get()) {
+        iter_arg_map_[iter_arg] = new_iter_arg;
+        iter_args_changed = true;
+      }
+    }
+
+    // Visit body with iter_arg mapping active
+    auto new_body = IRMutator::VisitStmt(op->body_);
+    bool body_changed = (new_body.get() != op->body_.get());
+
+    // Clean up iter_arg mappings after visiting body
+    for (const auto& iter_arg : op->iter_args_) {
+      iter_arg_map_.erase(iter_arg);
+    }
+
+    // Visit return_vars
+    std::vector<VarPtr> new_return_vars;
+    bool return_vars_changed = false;
+    new_return_vars.reserve(op->return_vars_.size());
+    for (const auto& return_var : op->return_vars_) {
+      auto new_var_expr = IRMutator::VisitExpr(return_var);
+      auto new_var = As<Var>(new_var_expr);
+      new_return_vars.push_back(new_var);
+      if (new_var.get() != return_var.get()) {
+        return_vars_changed = true;
+      }
+    }
+
+    // Visit chunk_size if present
+    std::optional<ExprPtr> new_chunk_size = op->chunk_size_;
+    bool chunk_size_changed = false;
+    if (op->chunk_size_.has_value()) {
+      auto new_cs = IRMutator::VisitExpr(*op->chunk_size_);
+      if (new_cs.get() != (*op->chunk_size_).get()) {
+        new_chunk_size = new_cs;
+        chunk_size_changed = true;
+      }
+    }
+
+    if (new_loop_var.get() != op->loop_var_.get() || new_start.get() != op->start_.get() ||
+        new_stop.get() != op->stop_.get() || new_step.get() != op->step_.get() || iter_args_changed ||
+        body_changed || return_vars_changed || chunk_size_changed) {
+      return std::make_shared<const ForStmt>(
+          std::move(new_loop_var), std::move(new_start), std::move(new_stop), std::move(new_step),
+          std::move(new_iter_args), std::move(new_body), std::move(new_return_vars), op->span_, op->kind_,
+          std::move(new_chunk_size), op->chunk_policy_, op->loop_origin_);
+    } else {
+      return op;
+    }
+  }
+
+  /**
    * @brief Process SeqStmts to analyze scope outputs using subsequent statements.
    *
    * For each target scope, collects variables referenced in all subsequent statements
@@ -406,6 +595,19 @@ class ScopeOutliner : public IRMutator {
     int saved_scope_counter = scope_counter_;
     auto saved_required_outputs = required_outputs_;
     auto saved_renames = store_target_renames_;
+    auto saved_var_types = var_types_;
+    auto saved_var_objects = var_objects_;
+
+    // Collect variables from the current scope body and update var_types_/var_objects_.
+    // This ensures nested scopes use the correct variable references from this scope.
+    VarCollector scope_body_collector;
+    scope_body_collector.VisitStmt(op->body_);
+    for (const auto& [name, type] : scope_body_collector.var_types) {
+      var_types_[name] = type;
+    }
+    for (const auto& [name, var] : scope_body_collector.var_objects) {
+      var_objects_[name] = var;
+    }
     func_name_ = outlined_func_name;
     scope_counter_ = 0;
     store_target_renames_.clear();
@@ -416,6 +618,8 @@ class ScopeOutliner : public IRMutator {
     scope_counter_ = saved_scope_counter;
     required_outputs_ = saved_required_outputs;
     store_target_renames_ = saved_renames;
+    var_types_ = saved_var_types;
+    var_objects_ = saved_var_objects;
 
     // Create fresh parameters for the outlined function
     std::vector<VarPtr> input_params;
@@ -651,6 +855,9 @@ class ScopeOutliner : public IRMutator {
   /// Accumulates across scopes intentionally (not saved/restored like func_name_
   /// etc.) so that subsequent scopes and statements see the renamed variables.
   std::unordered_map<std::string, VarPtr> store_target_renames_;
+  /// Pointer-based mapping for IterArgs: when ForStmt iter_args are mutated during
+  /// recursive processing, body references must use the new iter_arg objects.
+  std::unordered_map<IterArgPtr, IterArgPtr> iter_arg_map_;
   ScopeKind target_scope_kind_;
   FunctionType outlined_func_type_;
   std::string name_suffix_;

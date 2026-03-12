@@ -217,7 +217,7 @@ class TestNestedChunkChainsInitSubstitution:
 
         program = _prepare_for_interchange(Input)
         program = passes.interchange_chunk_loops()(program)
-        # This should not raise "Variable ... not found in symbol table"
+        # This should not raise Variable ... not found in symbol table
         program = passes.outline_incore_scopes()(program)
 
         incore_funcs = [f for f in program.functions.values() if f.func_type == ir.FunctionType.InCore]
@@ -750,3 +750,24 @@ class TestEndToEndNoComputeLeaks:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestInterchangeInitValuePropagation:
+    def test_iter_arg_init_value_substituted_after_interchange(self):
+        @pl.program
+        class Input:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.auto_incore():
+                    for i in pl.parallel(0, 8, 1, chunk=4):
+                        for j in pl.parallel(0, 8, 1, chunk=4):
+                            x = pl.add(x, 1.0)
+                return x
+
+        prog = passes.unroll_loops()(Input)
+        prog = passes.convert_to_ssa()(prog)
+        prog = passes.flatten_call_expr()(prog)
+        prog = passes.split_chunked_loops()(prog)
+        after = passes.interchange_chunk_loops()(prog)
+
+        assert after is not None  # pass completes without error
