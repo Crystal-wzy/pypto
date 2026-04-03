@@ -11,6 +11,7 @@
 
 import pytest
 from pypto.runtime.golden_writer import (
+    _extract_callable_expr,
     _extract_closure_constants,
     _extract_compute_golden,
     generate_golden_source,
@@ -150,6 +151,110 @@ class TestGoldenWriterScalar:
         namespace["compute_golden"](tensors)
 
         assert torch.equal(tensors["out"], torch.full((4,), 2.5, dtype=torch.float32))
+
+
+def _make_arange_tensor():
+    """Named helper used as init_value in callable extraction tests."""
+    return torch.arange(0, 4, dtype=torch.float32)
+
+
+class TestCallableInitValue:
+    """Tests for callable init_value via source extraction."""
+
+    def test_named_function_emitted_as_preamble(self):
+        """Named function init_value is extracted and emitted before generate_inputs."""
+        specs = [
+            TensorSpec("a", [4], torch.float32, init_value=_make_arange_tensor),
+            TensorSpec("out", [4], torch.float32, is_output=True),
+        ]
+        src = generate_golden_source(specs, _dummy_golden, 1e-5, 1e-5)
+
+        assert "def _make_arange_tensor():" in src
+        assert "a = torch.as_tensor(_make_arange_tensor(), dtype=torch.float32)" in src
+        assert src.index("def _make_arange_tensor") < src.index("def generate_inputs")
+
+    def test_named_function_golden_executes(self):
+        """Generated golden.py with named-function init_value is executable."""
+        specs = [
+            TensorSpec("a", [4], torch.float32, init_value=_make_arange_tensor),
+            TensorSpec("out", [4], torch.float32, is_output=True),
+        ]
+        src = generate_golden_source(specs, _dummy_golden, 1e-5, 1e-5)
+
+        namespace: dict[str, object] = {}
+        exec(src, namespace)  # noqa: S102 - Test verifies generated source executes correctly.
+
+        result = namespace["generate_inputs"](None)
+        a_tensor = result[0][1]
+        assert torch.equal(a_tensor, torch.arange(0, 4, dtype=torch.float32))
+
+    def test_lambda_falls_through_to_known_factory(self):
+        """Lambda wrapping a known factory falls through to factory path."""
+        # Lambda __name__ is '<lambda>' — not a valid identifier, so
+        # _extract_callable_expr returns None.  torch.randn itself is the
+        # init_value here; a lambda would hit the error path.
+        specs = [
+            TensorSpec("a", [4], torch.float32, init_value=torch.randn),
+            TensorSpec("out", [4], torch.float32, is_output=True),
+        ]
+        src = generate_golden_source(specs, _dummy_golden, 1e-5, 1e-5)
+
+        assert "torch.randn" in src
+
+    def test_extract_callable_expr_rejects_lambda(self):
+        """_extract_callable_expr returns None for lambdas (invalid __name__)."""
+        fn = lambda: torch.zeros(4)  # noqa: E731
+        preambles: dict[str, str] = {}
+        result = _extract_callable_expr(fn, preambles)
+
+        assert result is None
+        assert len(preambles) == 0
+
+    def test_extract_callable_expr_accepts_named_function(self):
+        """_extract_callable_expr succeeds for named functions."""
+        preambles: dict[str, str] = {}
+        result = _extract_callable_expr(_make_arange_tensor, preambles)
+
+        assert result == "_make_arange_tensor()"
+        assert len(preambles) == 1
+        assert "def _make_arange_tensor" in preambles["_make_arange_tensor"]
+
+    def test_large_tensor_literal_raises(self):
+        """Tensor init_value with >100 elements raises ValueError."""
+        large_tensor = torch.arange(0, 200, dtype=torch.float32)
+        specs = [
+            TensorSpec("a", [200], torch.float32, init_value=large_tensor),
+            TensorSpec("out", [200], torch.float32, is_output=True),
+        ]
+        with pytest.raises(ValueError, match="too large to inline"):
+            generate_golden_source(specs, _dummy_golden, 1e-5, 1e-5)
+
+    def test_unsupported_callable_raises(self):
+        """Callable that is not extractable and not a known factory raises ValueError."""
+        specs = [
+            TensorSpec("a", [4], torch.float32, init_value=abs),
+            TensorSpec("out", [4], torch.float32, is_output=True),
+        ]
+        with pytest.raises(ValueError, match="not supported"):
+            generate_golden_source(specs, _dummy_golden, 1e-5, 1e-5)
+
+    def test_multiple_callable_init_values(self):
+        """Multiple tensors with callable init_values each get their own preamble."""
+
+        def make_ones():
+            return torch.ones(4, dtype=torch.float32)
+
+        specs = [
+            TensorSpec("a", [4], torch.float32, init_value=_make_arange_tensor),
+            TensorSpec("b", [4], torch.float32, init_value=make_ones),
+            TensorSpec("out", [4], torch.float32, is_output=True),
+        ]
+        src = generate_golden_source(specs, _dummy_golden, 1e-5, 1e-5)
+
+        assert "def _make_arange_tensor" in src
+        assert "def make_ones" in src
+        assert "a = torch.as_tensor(_make_arange_tensor(), dtype=torch.float32)" in src
+        assert "b = torch.as_tensor(make_ones(), dtype=torch.float32)" in src
 
 
 class TestExtractClosureConstants:

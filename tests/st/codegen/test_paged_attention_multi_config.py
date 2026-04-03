@@ -507,12 +507,15 @@ class PagedAttentionMultiConfigTestCase(PTOTestCase):
             [B, H, 1, D, BS, max_blocks, scale_bits, self.q_tile, self.n_unroll],
             dtype=torch.int64,
         )
-        block_table = torch.randint(
-            0,
-            max(B * max_blocks, 1),
-            size=(B, max_blocks),
-            dtype=torch.int32,
-        ).flatten()
+
+        def make_block_table():
+            return torch.randint(
+                0,
+                max(B * max_blocks, 1),
+                size=(B, max_blocks),
+                dtype=torch.int32,
+            ).flatten()
+
         context_lens = torch.full((B,), self.context_len, dtype=torch.int32)
 
         query_rows = B * H
@@ -527,7 +530,7 @@ class PagedAttentionMultiConfigTestCase(PTOTestCase):
             TensorSpec("query", [query_rows, D], DataType.BF16, init_value=torch.randn),
             TensorSpec("key_cache", [key_cache_rows, D], DataType.BF16, init_value=torch.randn),
             TensorSpec("value_cache", [key_cache_rows, D], DataType.BF16, init_value=torch.randn),
-            TensorSpec("block_table", [block_table_flat_size], DataType.INT32, init_value=block_table),
+            TensorSpec("block_table", [block_table_flat_size], DataType.INT32, init_value=make_block_table),
             TensorSpec("context_lens", [B], DataType.INT32, init_value=context_lens),
             TensorSpec("out", [query_rows, D], DataType.FP32, is_output=True),
             TensorSpec("config", [9], DataType.INT64, init_value=config),

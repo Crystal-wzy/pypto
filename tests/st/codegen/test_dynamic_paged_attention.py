@@ -102,9 +102,8 @@ class DynamicPagedAttentionTestCase(PTOTestCase):
 
         # Build a random page table: each request gets max_blocks physical block indices
         # sampled from [0, B*max_blocks).  Flattened to 1-D to match orchestration input.
-        block_table = torch.randint(
-            0, max(B * max_blocks, 1), size=(B, max_blocks), dtype=torch.int32
-        ).flatten()
+        def make_block_table():
+            return torch.randint(0, max(B * max_blocks, 1), size=(B, max_blocks), dtype=torch.int32).flatten()
 
         # context_lens can be a scalar (all requests have equal length) or a per-request list
         if isinstance(self.context_len, list):
@@ -120,7 +119,7 @@ class DynamicPagedAttentionTestCase(PTOTestCase):
             TensorSpec("query", [B * H, D], DataType.BF16, init_value=torch.randn),
             TensorSpec("key_cache", [total_pool_rows, D], DataType.BF16, init_value=torch.randn),
             TensorSpec("value_cache", [total_pool_rows, D], DataType.BF16, init_value=torch.randn),
-            TensorSpec("block_table", [B * max_blocks], DataType.INT32, init_value=block_table),
+            TensorSpec("block_table", [B * max_blocks], DataType.INT32, init_value=make_block_table),
             TensorSpec("context_lens", [B], DataType.INT32, init_value=context_lens),
             TensorSpec("out", [B * H, D], DataType.FP32, is_output=True),
         ]

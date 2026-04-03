@@ -69,37 +69,46 @@ class TestLlamaMini(PTOTestCase):
 
     def define_tensors(self) -> list[TensorSpec]:
         # Small weights to prevent overflow through deep computation chain.
-        def small_rand(*shape: int) -> torch.Tensor:
-            return torch.rand(shape) * 0.04 - 0.02
+        def make_small_weight():
+            return torch.rand(64, 64) * 0.04 - 0.02
 
         # Causal mask: 0 on lower triangle, -1e9 on upper triangle
-        causal_mask = torch.zeros(16, 16).masked_fill(torch.triu(torch.ones(16, 16), diagonal=1).bool(), -1e9)
+        def make_causal_mask():
+            return torch.zeros(16, 16).masked_fill(torch.triu(torch.ones(16, 16), diagonal=1).bool(), -1e9)
 
         # Precompute RoPE cos/sin embeddings.
         # theta_i = 1 / (10000 ^ (2i / head_dim)) for i in [0, head_dim/2)
         head_dim = 64
-        positions = torch.arange(16).float().unsqueeze(1)  # [16, 1]
-        freqs = torch.arange(32).float()
-        theta = 1.0 / (10000.0 ** (2 * freqs / head_dim))  # [32]
-        angles = positions * theta.unsqueeze(0)  # [16, 32]
-        cos_emb = torch.cos(angles)
-        sin_emb = torch.sin(angles)
+
+        def make_cos_emb():
+            positions = torch.arange(16).float().unsqueeze(1)  # [16, 1]
+            freqs = torch.arange(32).float()
+            theta = 1.0 / (10000.0 ** (2 * freqs / head_dim))  # [32]
+            angles = positions * theta.unsqueeze(0)  # [16, 32]
+            return torch.cos(angles)
+
+        def make_sin_emb():
+            positions = torch.arange(16).float().unsqueeze(1)  # [16, 1]
+            freqs = torch.arange(32).float()
+            theta = 1.0 / (10000.0 ** (2 * freqs / head_dim))  # [32]
+            angles = positions * theta.unsqueeze(0)  # [16, 32]
+            return torch.sin(angles)
 
         return [
             TensorSpec("hidden", [16, 64], DataType.FP32, init_value=torch.randn),
-            TensorSpec("causal_mask", [16, 16], DataType.FP32, init_value=causal_mask),
-            TensorSpec("cos_emb", [16, 32], DataType.FP32, init_value=cos_emb),
-            TensorSpec("sin_emb", [16, 32], DataType.FP32, init_value=sin_emb),
+            TensorSpec("causal_mask", [16, 16], DataType.FP32, init_value=make_causal_mask),
+            TensorSpec("cos_emb", [16, 32], DataType.FP32, init_value=make_cos_emb),
+            TensorSpec("sin_emb", [16, 32], DataType.FP32, init_value=make_sin_emb),
             # Attention and projection weights [hidden, hidden] = [64, 64]
-            TensorSpec("wq", [64, 64], DataType.FP32, init_value=small_rand(64, 64)),
-            TensorSpec("wk", [64, 64], DataType.FP32, init_value=small_rand(64, 64)),
-            TensorSpec("wv", [64, 64], DataType.FP32, init_value=small_rand(64, 64)),
-            TensorSpec("w_dense", [64, 64], DataType.FP32, init_value=small_rand(64, 64)),
-            TensorSpec("w_gate", [64, 64], DataType.FP32, init_value=small_rand(64, 64)),
-            TensorSpec("w_up", [64, 64], DataType.FP32, init_value=small_rand(64, 64)),
-            TensorSpec("w_down", [64, 64], DataType.FP32, init_value=small_rand(64, 64)),
+            TensorSpec("wq", [64, 64], DataType.FP32, init_value=make_small_weight),
+            TensorSpec("wk", [64, 64], DataType.FP32, init_value=make_small_weight),
+            TensorSpec("wv", [64, 64], DataType.FP32, init_value=make_small_weight),
+            TensorSpec("w_dense", [64, 64], DataType.FP32, init_value=make_small_weight),
+            TensorSpec("w_gate", [64, 64], DataType.FP32, init_value=make_small_weight),
+            TensorSpec("w_up", [64, 64], DataType.FP32, init_value=make_small_weight),
+            TensorSpec("w_down", [64, 64], DataType.FP32, init_value=make_small_weight),
             # LM head weight [hidden_size, vocab_size] = [64, 64]
-            TensorSpec("w_lm", [64, 64], DataType.FP32, init_value=small_rand(64, 64)),
+            TensorSpec("w_lm", [64, 64], DataType.FP32, init_value=make_small_weight),
             # Output: logits [S, vocab] = [16, 64]
             TensorSpec("output", [16, 64], DataType.FP32, is_output=True),
         ]
