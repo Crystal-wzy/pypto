@@ -14,7 +14,6 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -29,6 +28,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 
 namespace pypto {
 namespace ir {
@@ -72,14 +72,8 @@ static bool ContainsInCoreScope(const StmtPtr& stmt) {
   }
 }
 
-/// Returns true if op_name is a compute tensor op, not a host-side memory op.
 static bool IsComputeTensorOp(const std::string& op_name) {
-  if (op_name.compare(0, 7, "tensor.") != 0) return false;
-  static const std::unordered_set<std::string> kHostSideOps = {
-      "tensor.create",   "tensor.read", "tensor.write",   "tensor.slice",
-      "tensor.assemble", "tensor.dim",  "tensor.reshape", "tensor.transpose",
-  };
-  return kHostSideOps.count(op_name) == 0;
+  return transform_utils::IsComputeTensorOp(op_name);
 }
 
 class ComputeTensorOpDetector : public IRVisitor {

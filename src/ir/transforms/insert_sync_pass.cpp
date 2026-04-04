@@ -34,9 +34,9 @@
 #include "pypto/ir/pipe.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
-#include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -117,21 +117,8 @@ struct Position {
   return parent;
 }
 
-class MemRefCollector : public IRVisitor {
- public:
-  std::set<MemRefPtr> memrefs;
-  void VisitVarLike_(const VarPtr& var) override {
-    if (auto shaped_type = As<ShapedType>(var->GetType())) {
-      if (shaped_type->memref_.has_value()) memrefs.insert(*shaped_type->memref_);
-    }
-    IRVisitor::VisitVarLike_(var);
-  }
-};
-
 std::set<MemRefPtr> GetExprMemRefs(const ExprPtr& expr) {
-  MemRefCollector collector;
-  collector.VisitExpr(expr);
-  return collector.memrefs;
+  return memref_collectors::CollectShapedTypeMemRefs(expr);
 }
 
 PipeType GetPipeForCall(const CallPtr& call) {
