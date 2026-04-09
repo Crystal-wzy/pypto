@@ -44,9 +44,9 @@ from pypto.pypto_core.ir import (
     FunctionType,
     Level,
     MemorySpace,
-    MemRef,
     PadValue,
     PipeType,
+    PtrType,
     Role,
     SplitMode,
     TensorLayout,
@@ -167,10 +167,13 @@ from .op.unified_ops import (
 )
 from .parser.decorator import InlineFunction, function, inline, program
 from .parser.text_parser import loads, loads_program, parse, parse_program
-from .typing import DynVar, InOut, IntLike, Out, Scalar, Tensor, Tile, Tuple, dynamic
+from .typing import DynVar, InOut, IntLike, MemRef, Out, Scalar, Tensor, Tile, Tuple, dynamic
 
 # Short alias for MemorySpace (pl.Mem.Vec instead of pl.MemorySpace.Vec)
 Mem = MemorySpace
+
+# Alias for PtrType — used in printed IR as type annotation for alloc LHS
+Ptr = PtrType
 
 # Re-export TensorLayout constants for convenience
 ND = TensorLayout.ND
@@ -337,6 +340,8 @@ __all__ = [
     "Mem",
     "MemRefType",
     "MemorySpace",
+    "Ptr",
+    "PtrType",
     "PipeType",
     "TensorLayout",
     "TensorView",
