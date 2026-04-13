@@ -490,5 +490,64 @@ REGISTER_OP("tile.concat")
       return DeduceTileConcatType(args, kwargs);
     });
 
+TypePtr DeduceTileSetValidShapeType(const std::vector<ExprPtr>& args,
+                                    const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 3)
+      << "tile.set_validshape requires exactly 3 arguments (tile, valid_rows, valid_cols), but got "
+      << args.size();
+
+  auto tile_type = As<TileType>(args[0]->GetType());
+  CHECK(tile_type) << "tile.set_validshape requires first argument to be a TileType, but got "
+                   << args[0]->GetType()->TypeName();
+  CHECK(tile_type->shape_.size() == 2)
+      << "tile.set_validshape requires a 2D tile, but got rank " << tile_type->shape_.size();
+
+  auto vr_type = As<ScalarType>(args[1]->GetType());
+  CHECK(vr_type) << "tile.set_validshape valid_rows must be ScalarType, but got "
+                 << args[1]->GetType()->TypeName();
+  CHECK(IsIndexLikeDtype(vr_type->dtype_))
+      << "tile.set_validshape valid_rows must have dtype INT64, UINT64, or INDEX, but got "
+      << vr_type->dtype_.ToString();
+
+  auto vc_type = As<ScalarType>(args[2]->GetType());
+  CHECK(vc_type) << "tile.set_validshape valid_cols must be ScalarType, but got "
+                 << args[2]->GetType()->TypeName();
+  CHECK(IsIndexLikeDtype(vc_type->dtype_))
+      << "tile.set_validshape valid_cols must have dtype INT64, UINT64, or INDEX, but got "
+      << vc_type->dtype_.ToString();
+
+  auto check_const_bound = [&](const char* name, const ExprPtr& valid, const ExprPtr& bound) {
+    if (auto c = As<ConstInt>(valid)) {
+      CHECK(c->value_ >= 0) << "tile.set_validshape " << name << " must be >= 0, got " << c->value_;
+      if (auto b = As<ConstInt>(bound)) {
+        CHECK(c->value_ <= b->value_)
+            << "tile.set_validshape " << name << " (" << c->value_ << ") exceeds tile bound " << b->value_;
+      }
+    }
+  };
+  check_const_bound("valid_rows", args[1], tile_type->shape_[0]);
+  check_const_bound("valid_cols", args[2], tile_type->shape_[1]);
+
+  TileView tile_view;
+  if (tile_type->tile_view_.has_value()) {
+    tile_view = *tile_type->tile_view_;
+  }
+  tile_view.valid_shape = {args[1], args[2]};
+
+  return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt, tile_view);
+}
+
+REGISTER_OP("tile.set_validshape")
+    .set_op_category("TileOp")
+    .set_description("Update valid-shape metadata of a tile without data movement")
+    .add_argument("tile", "Input tile (TileType, 2D)")
+    .add_argument("valid_rows", "Number of valid rows (ScalarType INDEX/INT64/UINT64)")
+    .add_argument("valid_cols", "Number of valid columns (ScalarType INDEX/INT64/UINT64)")
+    .set_output_memory_inherit_input()
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileSetValidShapeType(args, kwargs);
+    });
+
 }  // namespace ir
 }  // namespace pypto
