@@ -1799,57 +1799,101 @@ class SplitMode(enum.Enum):
     """Split horizontally (width halved)."""
 
 class ScopeStmt(Stmt):
-    """Scope statement: marks a region with specific execution context."""
+    """Scope statement: marks a region with specific execution context (abstract base).
+
+    Abstract — instantiate one of the concrete subclasses below.
+    """
 
     scope_kind: Final[ScopeKind]
-    """The kind of scope."""
-
-    level: Final[Level | None]
-    """Hierarchy level (None for non-Hierarchy scopes)."""
-
-    role: Final[Role | None]
-    """Function role (None for non-Hierarchy scopes)."""
-
-    split: Final[SplitMode | None]
-    """Split mode for cross-core transfer (None for no split)."""
+    """The kind of scope (discriminator)."""
 
     name_hint: Final[str]
     """User-provided scope name hint (empty string = auto-generate)."""
 
-    core_num: Final[int | None]
-    """SPMD block count (None for single block)."""
-
-    sync_start: Final[bool | None]
-    """Require sync-start for SPMD dispatch (None or False for default)."""
-
     body: Final[Stmt]
     """The nested statements."""
 
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        """ScopeStmt is abstract — construct an InCoreScopeStmt, AutoInCoreScopeStmt,
+        ClusterScopeStmt, HierarchyScopeStmt, or SpmdScopeStmt instead."""
+
+class InCoreScopeStmt(ScopeStmt):
+    """InCore scope: AICore sub-graph region."""
+
+    split: Final[SplitMode | None]
+    """Split mode for cross-core transfer (None or SplitMode.None for no split)."""
+
     def __init__(
         self,
-        scope_kind: ScopeKind,
-        body: Stmt,
-        span: Span,
-        level: Level | None = None,
-        role: Role | None = None,
         split: SplitMode | None = None,
         name_hint: str = "",
-        core_num: int | None = None,
-        sync_start: bool | None = None,
+        *,
+        body: Stmt,
+        span: Span,
     ) -> None:
-        """Create a scope statement.
+        """Create an InCore scope statement."""
 
-        Args:
-            scope_kind: The kind of scope (e.g., ScopeKind.InCore, ScopeKind.Hierarchy)
-            body: The nested statements
-            span: Source location
-            level: Hierarchy level (for Hierarchy scopes)
-            role: Function role (for Hierarchy scopes)
-            split: Split mode for cross-core transfer (for AutoInCore scopes)
-            name_hint: User-provided scope name hint (empty = auto-generate)
-            core_num: SPMD block count (for Spmd scopes)
-            sync_start: Require sync-start for SPMD dispatch
-        """
+class AutoInCoreScopeStmt(ScopeStmt):
+    """AutoInCore scope: InCore region with automatic chunking."""
+
+    split: Final[SplitMode | None]
+    """Split mode for cross-core transfer (None or SplitMode.None for no split)."""
+
+    def __init__(
+        self,
+        split: SplitMode | None = None,
+        name_hint: str = "",
+        *,
+        body: Stmt,
+        span: Span,
+    ) -> None:
+        """Create an AutoInCore scope statement."""
+
+class ClusterScopeStmt(ScopeStmt):
+    """Cluster scope: co-scheduled AIC + AIV group."""
+
+    def __init__(self, name_hint: str = "", *, body: Stmt, span: Span) -> None:
+        """Create a Cluster scope statement."""
+
+class HierarchyScopeStmt(ScopeStmt):
+    """Hierarchy scope: distributed-hierarchy region."""
+
+    level: Final[Level]
+    """Hierarchy level (required)."""
+
+    role: Final[Role | None]
+    """Function role (Orchestrator or Worker; None for unspecified)."""
+
+    def __init__(
+        self,
+        level: Level,
+        role: Role | None = None,
+        name_hint: str = "",
+        *,
+        body: Stmt,
+        span: Span,
+    ) -> None:
+        """Create a Hierarchy scope statement."""
+
+class SpmdScopeStmt(ScopeStmt):
+    """SPMD dispatch scope."""
+
+    core_num: Final[int]
+    """SPMD block count (required, >0)."""
+
+    sync_start: Final[bool]
+    """Require sync-start for SPMD dispatch."""
+
+    def __init__(
+        self,
+        core_num: int,
+        sync_start: bool = False,
+        name_hint: str = "",
+        *,
+        body: Stmt,
+        span: Span,
+    ) -> None:
+        """Create an SPMD scope statement."""
 
 class SeqStmts(Stmt):
     """Sequence of statements: a sequence of statements."""
@@ -3147,7 +3191,11 @@ class IRVisitor:
     def visit_if_stmt(self, op: IfStmt) -> None: ...
     def visit_for_stmt(self, op: ForStmt) -> None: ...
     def visit_while_stmt(self, op: WhileStmt) -> None: ...
-    def visit_scope_stmt(self, op: ScopeStmt) -> None: ...
+    def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> None: ...
+    def visit_auto_in_core_scope_stmt(self, op: AutoInCoreScopeStmt) -> None: ...
+    def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> None: ...
+    def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> None: ...
+    def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> None: ...
     def visit_seq_stmts(self, op: SeqStmts) -> None: ...
     def visit_yield_stmt(self, op: YieldStmt) -> None: ...
     def visit_return_stmt(self, op: ReturnStmt) -> None: ...
@@ -3220,7 +3268,11 @@ class IRMutator:
     def visit_if_stmt(self, op: IfStmt) -> Stmt: ...
     def visit_for_stmt(self, op: ForStmt) -> Stmt: ...
     def visit_while_stmt(self, op: WhileStmt) -> Stmt: ...
-    def visit_scope_stmt(self, op: ScopeStmt) -> Stmt: ...
+    def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> Stmt: ...
+    def visit_auto_in_core_scope_stmt(self, op: AutoInCoreScopeStmt) -> Stmt: ...
+    def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> Stmt: ...
+    def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> Stmt: ...
+    def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> Stmt: ...
     def visit_seq_stmts(self, op: SeqStmts) -> Stmt: ...
     def visit_yield_stmt(self, op: YieldStmt) -> Stmt: ...
     def visit_return_stmt(self, op: ReturnStmt) -> Stmt: ...
