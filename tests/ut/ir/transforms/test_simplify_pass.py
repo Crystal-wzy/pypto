@@ -582,5 +582,162 @@ class TestNoChange:
         ir.assert_structural_equal(after, before)
 
 
+# ============================================================================
+# Scalar constant propagation
+# ============================================================================
+
+
+class TestScalarConstantPropagation:
+    """Binding scalar assignments so downstream uses fold to the literal.
+
+    Only safe for Vars assigned exactly once (SSA invariant), enforced by the
+    MultiAssignCollector pre-pass so these tests work pre-SSA.
+    """
+
+    def test_propagates_into_subsequent_expr(self):
+        """CHUNK_K = 512 should fold into CHUNK_K + 1 → 513."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self):
+                CHUNK_K: pl.Scalar[pl.INDEX] = 512
+                _y: pl.Scalar[pl.INDEX] = CHUNK_K + 1
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self):
+                CHUNK_K: pl.Scalar[pl.INDEX] = 512  # noqa: F841
+                _y: pl.Scalar[pl.INDEX] = 513
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_propagates_into_for_bounds(self):
+        """CHUNK_K bound to 512 should fold into pl.range(0, 1024, CHUNK_K)."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self):
+                CHUNK_K: pl.Scalar[pl.INDEX] = 512
+                for _i in pl.range(0, 1024, CHUNK_K):
+                    pass
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self):
+                CHUNK_K: pl.Scalar[pl.INDEX] = 512  # noqa: F841
+                for _i in pl.range(0, 1024, 512):
+                    pass
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_propagates_into_tensor_shape_annotation(self):
+        """Var bound to 4 should fold into both the LHS type annotation and
+        the RHS tensor-op call arguments."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self):
+                N: pl.Scalar[pl.INDEX] = 4
+                _t: pl.Tensor[[N, 8], pl.FP32] = pl.tensor.create([N, 8], dtype=pl.FP32)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self):
+                N: pl.Scalar[pl.INDEX] = 4  # noqa: F841
+                _t: pl.Tensor[[4, 8], pl.FP32] = pl.tensor.create([4, 8], dtype=pl.FP32)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_folds_nested_arithmetic_in_call_args(self):
+        """`K + 0` buried inside a tensor-op argument should fold to `K` even
+        though Analyzer::Simplify does not recurse into Call/MakeTuple."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, k: pl.Scalar[pl.INDEX]):
+                _t: pl.Tensor[[1, 8], pl.FP32] = pl.tensor.create([1 * 1, k + 0 - k + 8], dtype=pl.FP32)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, k: pl.Scalar[pl.INDEX]):  # noqa: ARG002
+                _t: pl.Tensor[[1, 8], pl.FP32] = pl.tensor.create([1, 8], dtype=pl.FP32)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_not_propagated_when_assigned_in_branch(self):
+        """A scalar assigned inside a conditional branch must NOT be bound —
+        the assignment doesn't dominate uses outside the branch, so folding
+        the literal would be incorrect on paths where the branch didn't run.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, cond: pl.Scalar[pl.BOOL]):
+                k: pl.Scalar[pl.INDEX] = 7
+                if cond:
+                    k = 5
+                _y: pl.Scalar[pl.INDEX] = k + 1
+
+        # Expected: no folding of `k` — the binding inside the branch isn't
+        # safe to propagate past the merge point. `k + 1` stays symbolic.
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Before)
+
+    def test_not_propagated_when_reassigned(self):
+        """A Var reassigned inside the function must NOT be bound to its
+        initial value — pre-SSA safety via MultiAssignCollector.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INDEX]):
+                i: pl.Scalar[pl.INDEX] = 0
+                while i < n:
+                    i = i + 1
+
+        # Expected: identical to Before (no folding of `i` to 0 because `i` is
+        # reassigned inside the loop).
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Before)
+
+    def test_propagates_into_iter_arg_type(self):
+        """Var bound to 4 should fold into a loop-carried iter_arg's type."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self):
+                N: pl.Scalar[pl.INDEX] = 4
+                acc: pl.Tensor[[N, 8], pl.FP32] = pl.tensor.create([N, 8], dtype=pl.FP32)
+                for _i, (acc_iter,) in pl.range(4, init_values=(acc,)):
+                    acc_iter = pl.tensor.add(acc_iter, acc_iter)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self):
+                N: pl.Scalar[pl.INDEX] = 4  # noqa: F841
+                acc: pl.Tensor[[4, 8], pl.FP32] = pl.tensor.create([4, 8], dtype=pl.FP32)
+                for _i, (acc_iter,) in pl.range(4, init_values=(acc,)):
+                    acc_iter = pl.tensor.add(acc_iter, acc_iter)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
