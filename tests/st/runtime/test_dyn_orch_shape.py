@@ -69,6 +69,8 @@ B = pl.dynamic("B")  # batch
 
 _DYN_SHAPES = [(16, 16)]
 _MIXED_SHAPES = [(128, 16)]
+# Asymmetric shapes — used to actually exercise transpose semantics (rows != cols).
+_ASYM_SHAPES = [(16, 32)]
 
 # (batch, num_heads, head_dim, block_size, context_len, max_model_len)
 _PA_CONFIGS = [(2, 16, 128, 128, 256, 1024)]
@@ -212,6 +214,81 @@ class DynOrchReshapeAddTestCase(PTOTestCase):
     def compute_expected(self, tensors, params=None):
         rows, cols = self._rows, self._cols
         tensors["c"][:] = (tensors["a_flat"] + tensors["b_flat"]).reshape(rows, cols)
+
+
+class DynOrchTransposeAddTestCase(PTOTestCase):
+    """Test add kernel where the orchestration uses ``pl.transpose`` on dynamic 2D inputs.
+
+    Validates that ``tensor.transpose`` is supported in Orchestration functions and lowers
+    to the runtime ``Tensor::transpose`` interface (issue #1071).  The orchestration takes
+    ``[rows, cols]`` tensors, swaps axes 0/1 via ``pl.transpose`` (zero-copy metadata
+    swap of shape/raw_shape/offset), and forwards the resulting ``[cols, rows]`` views to
+    a 2D InCore add kernel.
+
+    Because ``Tensor::transpose`` only swaps metadata and the kernel performs an
+    element-wise add (which is layout-agnostic at the byte level), the bit pattern of
+    ``c`` equals the bit pattern of ``a + b`` re-laid out to ``[cols, rows]``.
+    """
+
+    __test__ = False
+
+    def __init__(
+        self,
+        shape: tuple[int, int],
+        *,
+        backend_type: BackendType | None = None,
+        config: RunConfig | None = None,
+    ):
+        super().__init__(config, backend_type=backend_type)
+        self._rows, self._cols = shape
+
+    def get_name(self) -> str:
+        return f"dyn_orch_transpose_add_{self._rows}x{self._cols}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [self._rows, self._cols], DataType.FP32, init_value=2.0),
+            TensorSpec("b", [self._rows, self._cols], DataType.FP32, init_value=3.0),
+            TensorSpec("c", [self._cols, self._rows], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        rows = self._rows
+        cols = self._cols
+
+        @pl.program
+        class DynOrchTransposeAddProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def add_kernel(
+                self,
+                a: pl.Tensor[[M, N], pl.FP32],
+                b: pl.Tensor[[M, N], pl.FP32],
+                c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                """Add two dynamic-shape 2D tiles element-wise."""
+                a_tile = pl.load(a, [0, 0], [cols, rows], target_memory=pl.MemorySpace.Vec)
+                b_tile = pl.load(b, [0, 0], [cols, rows])
+                result = pl.add(a_tile, b_tile)
+                out = pl.store(result, [0, 0], c)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[M, N], pl.FP32],
+                b: pl.Tensor[[M, N], pl.FP32],
+                c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                a_t: pl.Tensor[[cols, rows], pl.FP32] = pl.transpose(a, axis1=0, axis2=1)
+                b_t: pl.Tensor[[cols, rows], pl.FP32] = pl.transpose(b, axis1=0, axis2=1)
+                c_out = self.add_kernel(a_t, b_t, c)
+                return c_out
+
+        return DynOrchTransposeAddProgram
+
+    def compute_expected(self, tensors, params=None):
+        rows, cols = self._rows, self._cols
+        tensors["c"][:] = (tensors["a"] + tensors["b"]).reshape(-1).reshape(cols, rows)
 
 
 class DynOrchValidShapeAddTestCase(PTOTestCase):
@@ -685,6 +762,19 @@ class TestDynOrchShapeOperations:
         Validates ``pl.reshape`` (issue #1068) inside an Orchestration function.
         """
         result = test_runner.run(DynOrchReshapeAddTestCase(shape, backend_type=backend))
+        assert result.passed, f"Test failed for shape {shape}: {result.error}"
+
+    @pytest.mark.parametrize("backend", PLATFORMS)
+    @pytest.mark.parametrize("shape", _ASYM_SHAPES)
+    def test_dyn_orch_transpose_add(self, test_runner, shape, backend):
+        """Test add where the orchestration transposes dynamic 2D inputs before dispatch.
+
+        Validates ``pl.transpose`` (issue #1071) inside an Orchestration function lowers
+        to the runtime ``Tensor::transpose`` zero-copy metadata swap.  Uses an asymmetric
+        shape (rows != cols) so the ``[rows, cols] -> [cols, rows]`` view transformation
+        is actually exercised end-to-end (a buggy no-op transpose would not pass this).
+        """
+        result = test_runner.run(DynOrchTransposeAddTestCase(shape, backend_type=backend))
         assert result.passed, f"Test failed for shape {shape}: {result.error}"
 
     @pytest.mark.parametrize("backend", PLATFORMS)
