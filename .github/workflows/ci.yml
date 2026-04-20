@@ -137,12 +137,12 @@ jobs:
         run: pip install -v ./runtime
 
       - name: Test system tests
-        run: pytest tests/st -v --device=$DEVICE_ID --forked --precompile-workers=128 --pto-isa-commit=ed0b4643
+        run: pytest tests/st -v --device=$DEVICE_ID --forked --precompile-workers=128 --pto-isa-commit=6eecebc5
 
       - name: Test swimlane output
         run: |
           pytest tests/st/runtime/test_perf_swimlane.py \
-            -v --device=$DEVICE_ID --platform=a2a3 --runtime-profiling --forked --pto-isa-commit=ed0b4643
+            -v --device=$DEVICE_ID --platform=a2a3 --runtime-profiling --forked --pto-isa-commit=6eecebc5
 
   system-tests-a5sim:
     runs-on: ubuntu-latest
@@ -189,46 +189,6 @@ jobs:
 
       - name: Test A5 cross-core system tests (simulator)
         run: pytest tests/st/runtime/test_cross_core.py -v --forked --platform=a5sim --pto-isa-commit=6eecebc5
-
-  system-tests-a2a3sim-cross-core:
-    runs-on: ubuntu-latest
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.26
-      PTOAS_SHA256: 5abf99f9729997e171bee08bdb25662a7a24b62921c5ecfc05790a56a6e1b076
-    container:
-      image: ghcr.io/hw-native-sys/pypto/github-ci:latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Install project and dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -v .[dev]
-
-      - name: Cache ptoas binary
-        id: cache-ptoas
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/ptoas-bin
-          key: ptoas-x86_64-${{ env.PTOAS_VERSION }}-${{ env.PTOAS_SHA256 }}
-
-      - name: Install ptoas
-        if: steps.cache-ptoas.outputs.cache-hit != 'true'
-        run: |
-          curl --fail --location --retry 3 --retry-all-errors \
-            https://github.com/zhangstevenunity/PTOAS/releases/download/${{ env.PTOAS_VERSION }}/ptoas-bin-x86_64.tar.gz \
-             -o /tmp/ptoas-bin-x86_64.tar.gz
-          echo "${{ env.PTOAS_SHA256 }}  /tmp/ptoas-bin-x86_64.tar.gz" | sha256sum -c -
-          mkdir -p $GITHUB_WORKSPACE/ptoas-bin
-          tar -xzf /tmp/ptoas-bin-x86_64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
-          chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
-          chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
-
-      - name: Install simpler
-        run: pip install -v ./runtime
 
       - name: Test A2A3 cross-core system tests (simulator)
         run: pytest tests/st/runtime/test_cross_core.py -v --forked --platform=a2a3sim --pto-isa-commit=6eecebc5
