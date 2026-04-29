@@ -2178,6 +2178,119 @@ class TestTileAssembleOp:
             tile.assemble(target_var, source_var, [0, 0])
 
 
+class TestTileExtractOp:
+    """Tests for tile.extract operator (ISA TEXTRACT Variant 1)."""
+
+    @staticmethod
+    def _make_src_var(
+        rows: int = 64,
+        cols: int = 256,
+        dtype: DataType = DataType.FP16,
+        memory_space: ir.MemorySpace | None = None,
+    ) -> ir.Var:
+        span = ir.Span.unknown()
+        r = ir.ConstInt(rows, DataType.INT32, span)
+        c = ir.ConstInt(cols, DataType.INT32, span)
+        tile_type = ir.TileType([r, c], dtype, memory_space=memory_space)
+        return ir.Var("src", tile_type, span)
+
+    def test_tile_extract_basic(self):
+        """tile.extract returns a TileType with the requested shape and src dtype."""
+        src_var = self._make_src_var()
+
+        call = tile.extract(src_var, 0, 0, shape=[64, 64], target_memory=ir.MemorySpace.Left)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "tile.extract"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == DataType.FP16
+        assert len(result_type.shape) == 2
+        rows, cols = result_type.shape
+        assert isinstance(rows, ir.ConstInt) and rows.value == 64
+        assert isinstance(cols, ir.ConstInt) and cols.value == 64
+
+    def test_tile_extract_acc_to_mat(self):
+        """Acc source → Mat target: src lives in Acc, dtype preserved."""
+        src_var = self._make_src_var(64, 64, DataType.FP32, memory_space=ir.MemorySpace.Acc)
+        src_tile_type = src_var.type
+        assert isinstance(src_tile_type, ir.TileType)
+        assert src_tile_type.memory_space == ir.MemorySpace.Acc
+
+        call = tile.extract(src_var, 0, 0, shape=[32, 32], target_memory=ir.MemorySpace.Mat)
+
+        assert call.op.name == "tile.extract"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == DataType.FP32
+        rows, cols = result_type.shape
+        assert isinstance(rows, ir.ConstInt) and rows.value == 32
+        assert isinstance(cols, ir.ConstInt) and cols.value == 32
+
+    def test_tile_extract_dynamic_offset(self):
+        """Runtime symbolic offsets are accepted (no compile-time bounds check fires)."""
+        span = ir.Span.unknown()
+        src_var = self._make_src_var()
+        row = ir.Var("row", ir.ScalarType(DataType.INDEX), span)
+        col = ir.Var("col", ir.ScalarType(DataType.INDEX), span)
+
+        call = tile.extract(src_var, row, col, shape=[16, 16], target_memory=ir.MemorySpace.Left)
+
+        assert call.op.name == "tile.extract"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        rows, cols = result_type.shape
+        assert isinstance(rows, ir.ConstInt) and rows.value == 16
+        assert isinstance(cols, ir.ConstInt) and cols.value == 16
+
+    def test_tile_extract_shape_exceeds_src_static(self):
+        """Static shape larger than src is rejected at deduction time."""
+        src_var = self._make_src_var(64, 64)
+
+        with pytest.raises(ValueError, match="exceeds src"):
+            tile.extract(src_var, 0, 0, shape=[128, 128], target_memory=ir.MemorySpace.Left)
+
+    def test_tile_extract_offset_plus_shape_exceeds_src_static(self):
+        """Constant offset + shape that walks past src is rejected at deduction."""
+        src_var = self._make_src_var(64, 64)
+
+        # offset 60 + shape 16 = 76 > 64 rows
+        with pytest.raises(ValueError, match="exceeds src row"):
+            tile.extract(src_var, 60, 0, shape=[16, 16], target_memory=ir.MemorySpace.Left)
+
+    def test_tile_extract_negative_offset_static(self):
+        """Constant negative offset is rejected at deduction."""
+        src_var = self._make_src_var(64, 64)
+
+        with pytest.raises(ValueError, match="must be >= 0"):
+            tile.extract(src_var, -1, 0, shape=[16, 16], target_memory=ir.MemorySpace.Left)
+
+    def test_tile_extract_rejects_non_index_offset(self):
+        """index_row/col must be INT64/UINT64/INDEX."""
+        span = ir.Span.unknown()
+        src_var = self._make_src_var()
+        bad = ir.Var("bad", ir.ScalarType(DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="INT64/UINT64/INDEX"):
+            tile.extract(src_var, bad, 0, shape=[16, 16], target_memory=ir.MemorySpace.Left)
+
+    def test_tile_extract_rejects_dynamic_shape(self):
+        """shape elements must be compile-time ConstInt for storage allocation."""
+        span = ir.Span.unknown()
+        src_var = self._make_src_var()
+        dyn = ir.Var("dyn", ir.ScalarType(DataType.INDEX), span)
+
+        with pytest.raises(ValueError, match="compile-time ConstInt"):
+            tile.extract(src_var, 0, 0, shape=[dyn, 16], target_memory=ir.MemorySpace.Left)
+
+    def test_tile_extract_rejects_non_2d_shape(self):
+        """shape must be 2D."""
+        src_var = self._make_src_var()
+
+        with pytest.raises(ValueError, match="2D"):
+            tile.extract(src_var, 0, 0, shape=[16, 16, 16], target_memory=ir.MemorySpace.Left)
+
+
 class TestTileScatterUpdateOps:
     """Test suite for tile.scatter_update operation."""
 
