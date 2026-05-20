@@ -25,10 +25,8 @@ Typical usage::
 """
 
 import importlib.util
-import os
 import subprocess
 import sys
-import time
 from ctypes import _SimpleCData
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -85,8 +83,12 @@ class RunConfig:
         pto_isa_commit: If set, pin the pto-isa clone to this specific git
             commit (hash or tag).  ``None`` means use the latest remote HEAD.
         enable_l2_swimlane: Capture per-task L2 perf records into
-            ``<work_dir>/dfx_outputs/l2_perf_records.json``. After the run
-            ``swimlane_converter`` produces ``merged_swimlane_*.json``.
+            ``<work_dir>/dfx_outputs/l2_perf_records.json``. On onboard
+            platforms, ``swimlane_converter`` then produces
+            ``merged_swimlane_*.json`` alongside it. Simulator platforms
+            (``*sim``) only emit ``l2_perf_records.json`` — the merged
+            swimlane file is intentionally skipped because the simulator
+            does not yet ship the task metadata the converter needs.
             Mirrors runtime's ``--enable-l2-swimlane`` flag.
         enable_dump_tensor: Dump per-task tensor I/O into
             ``<work_dir>/dfx_outputs/tensor_dump/``. Inspect with
@@ -416,16 +418,9 @@ def _execute_on_device(
 
     # Execute
     dfx_dir: Path | None = None
-    pre_run_logs: set[Path] = set()
-    device_log_dir: Path | None = None
     if dfx.any():
         dfx_dir = work_dir / "dfx_outputs"
         dfx_dir.mkdir(parents=True, exist_ok=True)
-        # The pre-run log snapshot only feeds the swimlane converter; skip
-        # the device-log glob when swimlane capture is off so a
-        # tensor_dump-only / pmu-only / dep_gen-only run doesn't pay for it.
-        if dfx.enable_l2_swimlane:
-            pre_run_logs, device_log_dir = _snapshot_profiling_state(platform, device_id)
 
     execute_on_device(
         chip_callable,
@@ -441,14 +436,7 @@ def _execute_on_device(
     )
 
     if dfx_dir is not None:
-        _collect_dfx_artifacts(
-            dfx_dir,
-            platform,
-            device_id,
-            pre_run_logs,
-            device_log_dir,
-            dfx,
-        )
+        _collect_dfx_artifacts(dfx_dir, platform, dfx)
 
     # Validate
     validate_golden(
@@ -464,32 +452,9 @@ def _execute_on_device(
 # ---------------------------------------------------------------------------
 
 
-def _snapshot_profiling_state(platform: str, device_id: int) -> tuple[set[Path], Path | None]:
-    """Snapshot device logs before a profiled execution.
-
-    The runtime now writes ``l2_perf_records.json`` directly under the
-    ``CallConfig.output_prefix`` we provide (Simpler PR #693), so there is no
-    need to diff a shared ``outputs/`` directory anymore.
-
-    Returns:
-        ``(pre_run_logs, device_log_dir)``
-    """
-    pre_run_logs: set[Path] = set()
-    device_log_dir: Path | None = None
-    if not platform.endswith("sim"):
-        device_log_dir = _get_device_log_dir(device_id)
-        if device_log_dir.exists():
-            pre_run_logs = set(device_log_dir.glob("*.log"))
-
-    return pre_run_logs, device_log_dir
-
-
 def _collect_dfx_artifacts(
     dfx_dir: Path,
     platform: str,
-    device_id: int,
-    pre_run_logs: set[Path],
-    device_log_dir: Path | None,
     dfx: "_DfxOpts",
 ) -> None:
     """Dispatch post-run DFX converters per enabled flag.
@@ -501,17 +466,19 @@ def _collect_dfx_artifacts(
     the swimlane converter looking for ``l2_perf_records.json``.
     """
     if dfx.enable_l2_swimlane and (dfx_dir / "l2_perf_records.json").exists():
-        # Onboard runs pair the perf records with the matching device log;
-        # the simulator emits ``l2_perf_records.json`` directly with no
-        # log to pair against.
+        # Swimlane conversion is onboard-only — the simulator produces
+        # ``l2_perf_records.json`` but does not yet ship the matching
+        # task metadata the converter expects.
         if not platform.endswith("sim"):
             _generate_swimlane(
                 dfx_dir.parent,
-                device_id,
-                device_log_dir,
-                pre_run_logs,
                 dfx_dir,
                 dfx_dir / "l2_perf_records.json",
+            )
+        else:
+            print(
+                "Skipping swimlane conversion on simulator: "
+                "merged_swimlane_*.json is only generated for onboard runs."
             )
 
     if dfx.enable_dep_gen and (dfx_dir / "deps.json").exists():
@@ -559,39 +526,8 @@ def _convert_deps_to_graph(deps_json: Path, out_html: Path) -> None:
         print(f"Deps graph written to: {out_html}")
 
 
-def _get_device_log_dir(device_id: int) -> Path:
-    """Return the CANN device log directory for *device_id*."""
-    ascend_work_path = os.environ.get("ASCEND_WORK_PATH")
-    if ascend_work_path:
-        root = Path(ascend_work_path).expanduser() / "log" / "debug"
-        if root.exists():
-            return root / f"device-{device_id}"
-    return Path.home() / "ascend" / "log" / "debug" / f"device-{device_id}"
-
-
-def _wait_for_new_device_log(
-    log_dir: Path, pre_run_logs: set[Path], timeout: float = 15, interval: float = 0.5
-) -> Path | None:
-    """Wait for a new ``*.log`` file in *log_dir* that wasn't present before the run.
-
-    CANN dlog writes device logs asynchronously, so the file may appear
-    a few seconds after execution completes.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if log_dir.exists():
-            new_logs = set(log_dir.glob("*.log")) - pre_run_logs
-            if new_logs:
-                return max(new_logs, key=lambda p: p.stat().st_mtime)
-        time.sleep(interval)
-    return None
-
-
 def _generate_swimlane(
     work_dir: Path,
-    device_id: int,
-    device_log_dir: Path | None,
-    pre_run_logs: set[Path],
     swimlane_dir: Path,
     perf_file: Path | None,
 ) -> None:
@@ -601,9 +537,6 @@ def _generate_swimlane(
 
     Args:
         work_dir: Directory containing ``kernel_config.py``.
-        device_id: Hardware device index (fallback when no device log found).
-        device_log_dir: CANN device log directory snapshotted before the run.
-        pre_run_logs: Set of log files that existed before the run.
         swimlane_dir: Directory where swimlane JSON files are written.
         perf_file: Path to the ``l2_perf_records_*.json`` file produced by
             CodeRunner and already moved into *swimlane_dir*.  When ``None``,
@@ -636,15 +569,6 @@ def _generate_swimlane(
         "-k",
         str(kernel_config_path),
     ]
-
-    if device_log_dir is not None:
-        device_log_file = _wait_for_new_device_log(device_log_dir, pre_run_logs)
-        if device_log_file:
-            cmd += ["--device-log", str(device_log_file)]
-        else:
-            cmd += ["-d", str(device_id)]
-    else:
-        cmd += ["-d", str(device_id)]
 
     try:
         subprocess.run(cmd, check=True)
@@ -837,16 +761,9 @@ def execute_compiled(  # noqa: PLR0913
 
     # Snapshot DFX state before execution
     dfx_dir: Path | None = None
-    pre_run_logs: set[Path] = set()
-    device_log_dir: Path | None = None
     if dfx.any():
         dfx_dir = work_dir / "dfx_outputs"
         dfx_dir.mkdir(parents=True, exist_ok=True)
-        # The pre-run log snapshot only feeds the swimlane converter; skip
-        # the device-log glob when swimlane capture is off so a
-        # tensor_dump-only / pmu-only / dep_gen-only run doesn't pay for it.
-        if dfx.enable_l2_swimlane:
-            pre_run_logs, device_log_dir = _snapshot_profiling_state(platform, device_id)
 
     execute_on_device(
         chip_callable,
@@ -866,4 +783,4 @@ def execute_compiled(  # noqa: PLR0913
 
     # Collect DFX artefacts after execution (no-op when dfx_dir is None)
     if dfx_dir is not None:
-        _collect_dfx_artifacts(dfx_dir, platform, device_id, pre_run_logs, device_log_dir, dfx)
+        _collect_dfx_artifacts(dfx_dir, platform, dfx)
