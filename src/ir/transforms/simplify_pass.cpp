@@ -796,14 +796,22 @@ FunctionPtr TransformSimplify(const FunctionPtr& func,
   SimplifyMutator mutator(analyzer.get(), std::move(collector.multi_assigned));
   auto new_body = mutator.VisitStmt(func->body_);
 
-  // Final step: conservative scalar DCE prunes scalar bindings whose only
-  // uses were folded out by the mutator above. Call-backed assignments are
-  // preserved because the IR has no purity annotations yet — a Call may
-  // have observable side effects we cannot reason about. ``protected_vars``
-  // additionally shields scalars whose only consumer lives outside this
-  // function (e.g. the ``core_num`` attr of a dispatched Spmd function).
+  // Final step: drop dead IfStmt phi return_vars + matching yield slots, with
+  // conservative scalar DCE on either side so both cascade directions resolve
+  // in one Simplify invocation. The pre-prune scalar DCE removes dead scalar
+  // bindings that were the phi's only consumer (so the now-dead phi becomes
+  // visible to the phi-prune step); the post-prune scalar DCE removes the
+  // branch-body scalar assigns orphaned by phi pruning (fixes #1603 —
+  // outlining was capturing dead phi as a spurious Scalar[INDEX] return).
+  // Call-backed assignments are preserved because the IR has no purity
+  // annotations yet — a Call may have observable side effects we cannot reason
+  // about. ``protected_vars`` additionally shields scalars whose only consumer
+  // lives outside this function (e.g. the ``core_num`` attr of a dispatched
+  // Spmd function).
   auto flat = transform_utils::FlattenToStmts(new_body);
-  auto pruned = dce::EliminateDeadScalarAssignments(flat, protected_vars);
+  auto pre_pruned = dce::EliminateDeadScalarAssignments(flat, protected_vars);
+  auto phi_pruned = dce::EliminateDeadIfReturnVars(pre_pruned);
+  auto pruned = dce::EliminateDeadScalarAssignments(phi_pruned, protected_vars);
   bool dce_changed = pruned.size() != flat.size() ||
                      !std::equal(pruned.begin(), pruned.end(), flat.begin(),
                                  [](const StmtPtr& a, const StmtPtr& b) { return a.get() == b.get(); });
