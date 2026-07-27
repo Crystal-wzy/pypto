@@ -290,7 +290,7 @@ def assemble(
     return _ir_core.create_op_call("tile.assemble", [target, source, offset_tuple], {}, actual_span)
 
 
-def gather_row(
+def gather_row(  # noqa: PLR0913
     dst: Expr,
     src: Expr,
     dst_offset: Sequence[int | Expr] | _ir_core.MakeTuple,
@@ -298,6 +298,8 @@ def gather_row(
     shapes: Sequence[int | Expr] | _ir_core.MakeTuple,
     transpose: bool = False,
     span: Span | None = None,
+    *,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
 ) -> Call:
     """Load one GM row directly into a sub-region of an on-chip (Mat/Vec) tile.
 
@@ -311,7 +313,10 @@ def gather_row(
         src: Source tensor in GM (TensorType).
         dst_offset: ``[row, col]`` offset within ``dst``, or a MakeTuple.
         src_offset: ``[row, col]`` offset within the GM ``src``, or a MakeTuple.
-        shapes: GM row window shape ``[r, c]``, or a MakeTuple.
+        shapes: GM row window shape ``[r, c]``, or a MakeTuple. Must be
+            compile-time constant.
+        valid_shape: Runtime transfer extent within ``shapes``, or a MakeTuple.
+            May hold runtime ``Scalar[INDEX]`` values. Defaults to ``shapes``.
         transpose: Place the GM row ``[r, c]`` as an L1 column ``[c, r]``.
         span: Optional source span for debugging (auto-captured if not provided).
 
@@ -322,9 +327,10 @@ def gather_row(
     dst_off = _to_make_tuple(dst_offset, actual_span)
     src_off = _to_make_tuple(src_offset, actual_span)
     shapes_tuple = _to_make_tuple(shapes, actual_span)
-    return _ir_core.create_op_call(
-        "tile.gather_row", [dst, src, dst_off, src_off, shapes_tuple], {"transpose": transpose}, actual_span
-    )
+    args: list[Any] = [dst, src, dst_off, src_off, shapes_tuple]
+    if valid_shape is not None:
+        args.append(_to_make_tuple(valid_shape, actual_span))
+    return _ir_core.create_op_call("tile.gather_row", args, {"transpose": transpose}, actual_span)
 
 
 def scatter_update(
