@@ -47,7 +47,7 @@ from .compiled_program import (
 # the program can be reconstructed (``from_dir``) without the live post-pass IR.
 # Bump ``_META_SCHEMA`` on any incompatible format change.
 _DISTRIBUTED_META_FILENAME = "distributed_meta.json"
-_META_SCHEMA = 1
+_META_SCHEMA = 2
 
 if TYPE_CHECKING:
     from pypto.runtime.distributed_runner import DistributedWorker
@@ -59,14 +59,12 @@ class DistributedConfig:
     """Configuration for L3 distributed execution.
 
     ``aicpu_thread_num=4`` matches the ``tensormap_and_ringbuffer`` runtime's
-    3-scheduler-plus-1-dispatcher layout; ``block_dim=None`` lets the L2
-    simpler runtime pick its own default.
+    3-scheduler-plus-1-dispatcher layout.
     """
 
     device_ids: list[int] = field(default_factory=lambda: [0])
     num_sub_workers: int = 0
     runtime: str = "tensormap_and_ringbuffer"
-    block_dim: int | None = None
     aicpu_thread_num: int = 4
 
 
@@ -157,7 +155,6 @@ class DistributedCompiledProgram:
                 "device_ids": list(dc.device_ids),
                 "num_sub_workers": dc.num_sub_workers,
                 "runtime": dc.runtime,
-                "block_dim": dc.block_dim,
                 "aicpu_thread_num": dc.aicpu_thread_num,
             },
         }
@@ -310,8 +307,7 @@ class DistributedCompiledProgram:
         runtime-diagnostic DFX flags (``enable_dump_args`` / ``enable_pmu`` /
         ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_l2_swimlane``) are
         written per dispatch under ``<output_dir>/dfx_outputs/rank{r}/d{k}/``
-        (``rank_local/d{k}`` for a comm-less dispatch, which has no real rank;
-        ``d{k}`` is the card's k-th dispatch, so multiple dispatches to one card
+        (``d{k}`` is the card's k-th dispatch, so multiple dispatches to one card
         keep separate artifacts; swimlane co-enables dep_gen and emits
         ``merged_swimlane_*.json`` per dispatch, onboard only). Other compile-side
         fields are not consumed on the dispatch path.
