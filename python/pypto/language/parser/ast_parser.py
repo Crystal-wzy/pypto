@@ -13,7 +13,7 @@ import ast
 import copy
 import keyword as _keyword_mod
 import warnings
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
@@ -138,6 +138,36 @@ def _is_pl_call(node: object, attr_name: str) -> TypeGuard[ast.Call]:
         and isinstance(func.value, ast.Name)
         and func.value.id == "pl"
     )
+
+
+def _is_self_method_call(node: object) -> TypeGuard[ast.Call]:
+    """Return True when ``node`` is the AST for a ``self.<method>(...)`` call.
+
+    This is how the DSL spells a cross-function kernel call, so it is the marker
+    that distinguishes a *dispatch* body from work written inline.
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "self"
+
+
+def _spmd_body_calls(body: "list[ast.stmt]", predicate: "Callable[[ast.Call], bool]") -> "Iterator[ast.Call]":
+    """Yield each call in ``body`` satisfying ``predicate``.
+
+    ``ast.walk`` recurses the whole body subtree, so a call nested inside a
+    ``pl.range`` loop, an argument expression, or a nested ``with`` still counts.
+    Shared by the SPMD body classifiers so they cannot drift apart.
+    """
+    for body_stmt in body:
+        for node in ast.walk(body_stmt):
+            if isinstance(node, ast.Call) and predicate(node):
+                yield node
+
+
+def _spmd_body_has_call(body: "list[ast.stmt]", predicate: "Callable[[ast.Call], bool]") -> bool:
+    """Return True when any call in ``body`` satisfies ``predicate``."""
+    return next(_spmd_body_calls(body, predicate), None) is not None
 
 
 def _is_const_int(value: object) -> bool:
@@ -3916,13 +3946,12 @@ class ASTParser:
 
     @staticmethod
     def _spmd_body_reads_block_idx(body: "list[ast.stmt]") -> bool:
-        """True if any statement in an inline SPMD body calls ``get_block_idx()``.
+        """True if any statement in an SPMD body calls ``get_block_idx()``.
 
-        An inline (auto-outlined) ``pl.spmd`` body distinguishes blocks solely via
-        the per-block index; without it every block executes identical work — almost
-        always a bug, and the reason the body is being outlined into a per-block
-        kernel at all. The single-call direct-dispatch shape is exempt (the callee
-        reads the index internally), so this is only consulted for inline bodies.
+        This is what marks a body as *inline* — it does the per-block work itself
+        and so must be outlined into a per-block kernel. A body that instead
+        dispatches to a kernel reads the index inside the callee and is classified
+        by :meth:`_spmd_body_dispatches_kernel`; see :meth:`_emit_spmd_body`.
 
         Matched at the AST layer (no IR ``Op`` exists yet) by the trailing call name,
         so every valid spelling of the API counts regardless of receiver:
@@ -3931,18 +3960,76 @@ class ASTParser:
         ``get_block_idx()`` imported directly. Matching by name only is deliberately
         lenient: ``get_block_idx`` is unique to this API (no other DSL object exposes
         it), and being lenient here is far safer than rejecting a real body that
-        distinguishes blocks. ``ast.walk`` recurses the whole body subtree, so a
-        nested use (inside a ``pl.range`` loop or an expression argument) is found.
+        distinguishes blocks.
         """
-        for body_stmt in body:
-            for node in ast.walk(body_stmt):
-                if isinstance(node, ast.Call):
-                    func = node.func
-                    if (isinstance(func, ast.Attribute) and func.attr == "get_block_idx") or (
-                        isinstance(func, ast.Name) and func.id == "get_block_idx"
-                    ):
-                        return True
-        return False
+        return _spmd_body_has_call(
+            body,
+            lambda node: (isinstance(node.func, ast.Attribute) and node.func.attr == "get_block_idx")
+            or (isinstance(node.func, ast.Name) and node.func.id == "get_block_idx"),
+        )
+
+    def _explicit_incore_carrier(self, body: "list[ast.stmt]") -> "_AtKwargState | None":
+        """The parsed ``pl.at`` state if ``body`` is a lone ``with pl.at(<CORE_GROUP>, ...):``.
+
+        That nested scope *is* the ``InCoreScopeStmt`` carrier, so
+        :meth:`_emit_spmd_body` must parse it as an ordinary nested scope rather
+        than synthesising a second one around it (which would violate the
+        ``NoNestedInCore`` structural property).
+
+        This is the shape the printer emits for ``Spmd(InCore(...))`` whenever
+        neither the ``as tid`` nor the ``for``-form branch applies — see
+        ``IRPythonPrinter::VisitStmt_(SpmdScopeStmtPtr)``'s plain-with
+        fallthrough. Matching it here is what makes that output re-parseable.
+
+        The level is resolved through :meth:`_parse_at_kwargs`, so the positional
+        form (``pl.at(pl.Level.CORE_GROUP)``) counts too and the enum name is
+        validated against ``LEVEL_MAP`` rather than string-matched. An
+        ``as tid`` capture on the carrier is irrelevant here — it rides on the
+        nested scope either way. Only ``CORE_GROUP`` qualifies: every other level
+        builds a ``HierarchyScopeStmt``, which is not an InCore carrier (see
+        :meth:`_parse_at_scope`).
+
+        Returns the parsed :class:`_AtKwargState` (never ``None`` for a match) so
+        the caller can see whether the carrier itself carries an ``optimizations=``
+        entry; ``None`` when ``body`` is not a carrier.
+        """
+        if len(body) != 1 or not isinstance(body[0], ast.With):
+            return None
+        items = body[0].items
+        if len(items) != 1 or not _is_pl_call(items[0].context_expr, "at"):
+            return None
+        state = self._parse_at_kwargs(items[0].context_expr)
+        return state if state.level == ir.Level.CORE_GROUP else None
+
+    def _spmd_body_kernel_dispatch_count(self, body: "list[ast.stmt]") -> int:
+        """Number of cross-function kernel dispatches in an SPMD body.
+
+        A body with at least one dispatch is a *dispatch* body: the per-block work
+        lives in the callee, which reads the block index internally, so the body
+        itself need not mention ``get_block_idx``.
+
+        The count matters because an unwrapped dispatch body is lowered by
+        ``FindFirstInnerCall`` (``wrapper_call_utils.cpp``), which stops at the
+        first call — orchestration codegen would emit a launch for that callee only
+        and silently drop the rest. Hoisted temporaries and tuple projections are
+        not dispatches, so the shapes ``FlattenCallExpr`` and the multi-output
+        desugar produce still count as exactly one.
+
+        Both call spellings :meth:`parse_call` accepts count: the ``self.<kernel>``
+        cross-function call, and a bare name resolving through ``closure_vars`` to
+        an external ``@pl.function`` / ``@pl.inline``.
+        """
+        from .decorator import InlineFunction  # noqa: PLC0415 (circular import)
+
+        def is_dispatch(node: ast.Call) -> bool:
+            if _is_self_method_call(node):
+                return True
+            if isinstance(node.func, ast.Name):
+                resolved = self.expr_evaluator.closure_vars.get(node.func.id)
+                return isinstance(resolved, (ir.Function, InlineFunction))
+            return False
+
+        return sum(1 for _ in _spmd_body_calls(body, is_dispatch))
 
     def _emit_spmd_body(  # noqa: PLR0913 — args map 1:1 to the SpmdScopeStmt fields
         self,
@@ -3961,39 +4048,93 @@ class ASTParser:
         The two forms differ only in ``scope_attrs`` (the ``as tid`` form adds
         ``task_id_var`` / ``manual_dep_edges``); the body dispatch is identical:
 
-        * single call + no split and no slot count → ``SpmdScopeStmt(body=Call)``
-          with no inner InCore wrapper — the historical direct-dispatch shape (the
-          callee is a pre-defined kernel that reads the block index internally).
-          This is also the shape ``OutlineIncoreScopes`` leaves behind once an
-          inline body is outlined, so the IR round-trips identically across passes.
-        * inline multi-statement body, or single-call carrying any
+        The body shape decides whether an inner ``InCoreScopeStmt`` carrier is
+        synthesised. The test is semantic — does the body do per-block work
+        itself, or dispatch it? — not a statement count: a dispatch body may
+        legally hold several statements once ``FlattenCallExpr`` has hoisted a
+        nested call arg, or the multi-output tuple desugar has split an assign
+        into a temp plus projections.
+
+        * an explicit ``with pl.at(<CORE_GROUP level>, ...):`` body → that nested
+          scope already *is* the carrier; parse it as an ordinary nested scope
+          (see :meth:`_is_explicit_incore_carrier`). This is the form the printer
+          emits, so recognising it here is what makes ``Spmd(InCore(...))``
+          round-trip.
+        * dispatch body (does not read the per-block index), no split and no slot
+          count → ``SpmdScopeStmt(body=<stmts>)`` with no inner InCore wrapper —
+          the callee is a pre-defined kernel that reads the block index
+          internally. This is also the shape ``OutlineIncoreScopes`` leaves behind
+          once an inline body is outlined, so the IR round-trips identically
+          across passes.
+        * inline body (reads the per-block index), or any body carrying an
           ``optimizations=`` entry → wrap in ``InCoreScopeStmt(split, <body>)`` for
           ``OutlineIncoreScopes`` to outline into a synthetic per-block kernel,
           exactly like ``for i in pl.spmd(n):``. Both entries lower onto the InCore
           scope (``split_`` and the ``slot_num`` attr), so either one forces the
-          wrapper. Such an inline body must read the per-block index (see below).
+          wrapper.
+
+        A body that neither reads the index nor dispatches a kernel does no
+        per-block differentiation at all and is rejected (see below). An explicit
+        carrier is exempt from that check: the user wrote the InCore scope
+        themselves, so the body is taken as deliberate.
         """
-        # A single body statement whose value is a Call — Assign/AnnAssign/Expr all
-        # expose a `.value`, so one membership test covers the three call-carrying
-        # statement kinds (`x = f()`, `x: T = f()`, and a bare `f()`).
-        body_stmt = stmt.body[0] if len(stmt.body) == 1 else None
-        is_single_call = isinstance(body_stmt, (ast.Assign, ast.AnnAssign, ast.Expr)) and isinstance(
-            body_stmt.value, ast.Call
-        )
-        # An inline (auto-outlined) body must read the per-block index — the
-        # single-call dispatch is exempt (its callee reads it internally). Unlike
-        # the for-form, the with-forms do not bind the index for you, so require an
-        # explicit ``pl.tile.get_block_idx()`` somewhere in the body.
-        if not is_single_call and not self._spmd_body_reads_block_idx(stmt.body):
-            raise ParserSyntaxError(
-                "inline `with pl.spmd(...)` body must read the per-block index via "
-                "`pl.tile.get_block_idx()`; without it every block runs identical work.",
-                span=span,
-                hint="Add `i = pl.tile.get_block_idx()` inside the scope, or use "
-                "`for i in pl.spmd(n):` to bind the block index automatically.",
-            )
-        if is_single_call and split_mode is None and split_slot_num is None:
-            # Historical no-InCore-wrapper shape. Any ``scope_attrs``
+        # ``split_slot_num`` is weighed alongside ``split_mode`` throughout: the
+        # slot count lands on the *InCore* scope (OutlineIncoreScopes reads
+        # ``slot_num`` off InCoreScopeStmt only), so either entry alone is enough
+        # to require a carrier — and enough to collide with one the body already
+        # provides. Before pl.cross_core_slot existed the two were coupled:
+        # slot_num could only arrive via pl.split(mode, slot_num=N), which always
+        # set a mode.
+        has_optimization_entry = split_mode is not None or split_slot_num is not None
+        carrier = self._explicit_incore_carrier(stmt.body)
+        if carrier is not None:
+            # The nested ``pl.at(CORE_GROUP)`` already is the carrier, and an
+            # ``optimizations=`` entry has to land on it. One on the
+            # ``pl.spmd(...)`` line as well is either a duplicate or would have to
+            # be pushed into a scope the user wrote by hand — reject both rather
+            # than silently picking one or dropping it.
+            if has_optimization_entry:
+                carrier_has_entry = carrier.split_mode is not None or carrier.split_slot_num is not None
+                where = (
+                    "is specified twice: on `pl.spmd(...)` and on the inner"
+                    if carrier_has_entry
+                    else "belongs on the InCore scope, but the body already provides one as the inner"
+                )
+                raise ParserSyntaxError(
+                    f"`optimizations=` {where} `pl.at(level=pl.Level.CORE_GROUP, ...)`",
+                    span=span,
+                    hint="Keep `optimizations=[...]` on the inner `pl.at(...)` carrier only.",
+                )
+            needs_incore = False
+        else:
+            is_inline_body = self._spmd_body_reads_block_idx(stmt.body)
+            dispatch_count = 0 if is_inline_body else self._spmd_body_kernel_dispatch_count(stmt.body)
+            if not is_inline_body and dispatch_count == 0:
+                raise ParserSyntaxError(
+                    "`with pl.spmd(...)` body neither reads the per-block index via "
+                    "`pl.tile.get_block_idx()` nor dispatches a `self.<kernel>(...)` call, "
+                    "so every block would run identical work.",
+                    span=span,
+                    hint="Add `i = pl.tile.get_block_idx()` inside the scope, dispatch a kernel "
+                    "that reads it, or use `for i in pl.spmd(n):` to bind the block index "
+                    "automatically.",
+                )
+            # An unwrapped dispatch body is lowered via FindFirstInnerCall, which
+            # stops at the first call — a second dispatch would be silently
+            # dropped by orchestration codegen rather than launched.
+            if dispatch_count > 1:
+                raise ParserSyntaxError(
+                    f"`with pl.spmd(...)` dispatch body launches {dispatch_count} kernels; "
+                    "only one kernel dispatch per SPMD scope is supported.",
+                    span=span,
+                    hint="Use one `pl.spmd(...)` scope per kernel, or make the body inline by "
+                    "reading `pl.tile.get_block_idx()` so the whole body is outlined into a "
+                    "single per-block kernel.",
+                )
+            needs_incore = is_inline_body or has_optimization_entry
+        if not needs_incore:
+            # Either the body already carries its own InCore, or it is a dispatch
+            # body whose per-block work lives in the callee. Any ``scope_attrs``
             # (allow_early_resolve, and for the ``as tid`` form task_id_var /
             # manual_dep_edges) ride on the SpmdScopeStmt.
             #
@@ -4058,10 +4199,10 @@ class ASTParser:
         captured — the body shape is identical (see :meth:`_emit_spmd_body`):
 
         * ``with pl.spmd(n):`` — no captured TaskId, no ``deps=``. Accepts either a
-          single kernel call (historical direct-dispatch shape) or an inline
-          multi-statement body auto-outlined into an InCore kernel (like
-          ``for i in pl.spmd(n):``, minus the auto-bound loop var — read the
-          per-block index inside via ``pl.tile.get_block_idx()``).
+          dispatch body calling a pre-defined kernel (direct dispatch) or an inline
+          body auto-outlined into an InCore kernel (like ``for i in pl.spmd(n):``,
+          minus the auto-bound loop var — read the per-block index inside via
+          ``pl.tile.get_block_idx()``).
         * ``with pl.spmd(n, deps=[...]) as tid:`` — same body shapes, and
           additionally captures the producer ``Scalar[TASK_ID]`` (mirrors
           ``with pl.at(...) as tid:``) so it can feed a ``deps=`` edge.
@@ -4071,9 +4212,9 @@ class ASTParser:
         ``task_id_var`` attr that makes the dispatch lower to an ``ir.Submit``.
         """
         with_hint = (
-            "Use 'with pl.spmd(4):' with a single call or an inline block that reads "
-            "'pl.tile.get_block_idx()', or 'with pl.spmd(4) as tid:' to also capture "
-            "the dispatch TaskId."
+            "Use 'with pl.spmd(4):' with a body that dispatches a 'self.<kernel>(...)' call "
+            "or reads 'pl.tile.get_block_idx()', or 'with pl.spmd(4) as tid:' to also "
+            "capture the dispatch TaskId."
         )
         # ``deps=`` is accepted ONLY with ``as tid`` — gate it by keyword presence,
         # not by the resolved list being non-empty. _parse_submit_deps_kwarg
@@ -4130,10 +4271,10 @@ class ASTParser:
             spmd_attrs.append(("predicate", predicate))
 
         # No ``as tid``: the plain with-form. ``deps=`` was already rejected above
-        # (allow_deps=False), so dep_vars is empty here. The shared helper keeps the
-        # historical single-call direct-dispatch shape and outlines an inline
-        # multi-statement body into a synthetic InCore kernel — identical to the
-        # ``as tid`` form, minus the captured TaskId.
+        # (allow_deps=False), so dep_vars is empty here. The shared helper leaves a
+        # dispatch body unwrapped and outlines an inline body into a synthetic
+        # InCore kernel — identical to the ``as tid`` form, minus the captured
+        # TaskId.
         self._emit_spmd_body(
             stmt,
             span,
@@ -4168,13 +4309,15 @@ class ASTParser:
         plain with-form so the IR is identical to the post-``OutlineIncoreScopes``
         shape (a single Call) and round-trips through print -> reparse:
 
-        * single call, no split → ``SpmdScopeStmt(attrs, body=Call)`` (no InCore
-          wrapper) — the same shape ``OutlineIncoreScopes`` leaves behind once the
-          inline body is outlined, so reparse is stable across passes.
-        * inline multi-statement body, or single-call with split → wrap in
+        * dispatch body, no split → ``SpmdScopeStmt(attrs, body=<stmts>)`` (no
+          InCore wrapper) — the same shape ``OutlineIncoreScopes`` leaves behind
+          once the inline body is outlined, so reparse is stable across passes.
+        * inline body (reads the per-block index), or any body with split → wrap in
           ``InCoreScopeStmt(split, <body>)``, exactly like the for-form (minus the
           synthesised ``loop_var = tile.get_block_idx()``; the body reads the block
           index explicitly via ``pl.tile.get_block_idx()``).
+        * an explicit ``pl.at(<CORE_GROUP level>)`` body already carries its own
+          InCore, so it is parsed as an ordinary nested scope.
 
         The ``kAttrTaskIdVar`` on the outer Spmd scope makes ``OutlineClusterScopes``
         lower the dispatch to an ``ir.Submit`` whose trailing tuple element is the
