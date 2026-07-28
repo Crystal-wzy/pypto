@@ -330,9 +330,15 @@ TypePtr DeduceTileReshapeType(const std::vector<ExprPtr>& args,
                                       << " into shape with size " << new_product;
   }
 
-  // Return new TileType with reshaped dimensions and same dtype
+  // Return new TileType with reshaped dimensions and same dtype. Tensor and tile
+  // reshape share one no-widening mapping, so ConvertTensorToTileOps cannot
+  // rewrite a tensor.reshape into a tile.reshape that widens the region back.
   TileView tile_view;
-  tile_view.valid_shape = new_shape;
+  const TileView source_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
+  tile_view.valid_shape =
+      ComputeReshapeValidShape(GetValidShape(tile_type), tile_type->shape_, new_shape,
+                               source_view.blayout == TileLayout::row_major, args[0]->span_, "tile.reshape");
+  tile_view.pad = source_view.pad;
 
   tile_view.blayout = InferTileLayoutFromShape(new_shape);
 
