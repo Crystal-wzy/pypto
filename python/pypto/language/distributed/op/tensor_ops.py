@@ -307,8 +307,9 @@ def put(
     ``ConvertTensorToTileOps`` to a ``tile.create``-allocated VEC staging tile plus
     a ``pld.tile.put`` call so the staging tile flows through PyPTO's memory
     allocator (required at ``--pto-level=level3``); backend codegen then emits
-    ``CommRemoteOffset(ctx, peer) + addptr + make_tensor_view + partition_view +
-    TPUT`` against that pre-allocated tile. Both operands are GM/tensor-level
+    inline ``CommContext`` loads and offset arithmetic followed by ``addptr +
+    make_tensor_view + partition_view + TPUT`` against that pre-allocated tile.
+    Both operands are GM/tensor-level
     window views (the staging tile is internal), so this is a ``pld.tensor`` op,
     paired with the GM-to-GM TGET rather than the tile-producing
     ``pld.tile.remote_load``.
@@ -410,8 +411,9 @@ def get(
 
     Side-effect-only (the returned Call carries ``UnknownType``). Semantically
     equivalent to ``remote_load + store`` but represented as one tensor-level
-    bulk communication op. Lowers to ``CommRemoteOffset(ctx, peer) + addptr +
-    make_tensor_view + partition_view + a synthesised VEC staging tile + TGET``
+    bulk communication op. Lowers to inline ``CommContext`` loads and offset
+    arithmetic followed by ``addptr + make_tensor_view + partition_view + a
+    synthesised VEC staging tile + TGET``
     at codegen.
 
     With no offsets/shape this reads the full peer ``src`` slice into the full
@@ -559,11 +561,18 @@ def allreduce(
     ``1 + chunk_count``; the partial-valid rectangle path ends at ``2``.
     The skipped self row remains zero.
 
-    **Ring barrier protocol:** per-round ``AtomicAdd(0→1) → WaitGe(1)``
-    monotonic on a ``[2*(NR−1), NR]`` signal — each ring step writes
-    a fresh row, so active non-self cells end at non-zero values while the
-    skipped self column remains zero. The monotonic advance is per-row, not
-    per-cell reuse.
+    Ring mode first views a packed ND target as one linear stream, then
+    traverses each segment in physical subchunks of at most 16 KiB. FP32 uses
+    balanced logical segment boundaries. FP16 aligns every non-empty segment
+    start and remote tail span to 32 bytes while restoring the logical
+    ``valid_shape`` before reduction and store. This also covers ``SIZE < NR``
+    without changing the packed public layout or dropping elements.
+
+    **Ring barrier protocol:** each ring round owns one row of the
+    ``[2*(NR-1), NR]`` signal. Every subchunk advances that row twice:
+    a ready barrier before remote reads and a read-complete barrier before
+    store-back. The monotonic expected values are ``2*chunk_id+1`` and
+    ``2*chunk_id+2``. The skipped self column remains zero.
 
     **Do not reuse the same signal buffer for a back-to-back allreduce**
     — allocate a fresh signal buffer (``alloc_window_buffer`` + ``window``)
@@ -574,16 +583,16 @@ def allreduce(
 
     Args:
         target: Window-bound :class:`pld.DistributedTensor` holding per-rank
-            data. The C++ verifier refuses a plain :class:`pl.Tensor`.
+            FP16 or FP32 data. The C++ verifier refuses a plain
+            :class:`pl.Tensor` and unsupported dtypes.
         signal: Optional window-bound INT32 :class:`pld.DistributedTensor`.
             In InCore code this remains required. In host-orchestrator code,
             omitting it outside ``for`` and ``while`` loops lets the compiler
             synthesize a private signal of shape ``[pld.world_size(), 1]``.
             Allreduce calls in those loops are rejected for both signatures.
-        op: :class:`pld.ReduceOp` selecting the reduction operator
-            (keyword-only). Defaults to :attr:`pld.ReduceOp.Sum`. First-version
-            lowering accepts only ``Sum``; ``Max`` / ``Min`` / ``Prod`` are
-            reserved enum values and will be rejected at the C++ deducer.
+        op: :class:`pld.ReduceOp` selecting element-wise ``Sum``, ``Max``,
+            ``Min``, or ``Prod`` (keyword-only). Defaults to
+            :attr:`pld.ReduceOp.Sum`.
         mode: Algorithm selector (keyword-only). ``"mesh"`` (default) for
             direct all-to-all exchange; ``"ring"`` for the NCCL-style
             chunked reduce-scatter + allgather ring schedule. ``"ring"``

@@ -472,6 +472,12 @@ def test_cos_in_return_stmt_is_decomposed():
 _ALLREDUCE_SIZE = 16
 _ALLREDUCE_NRANKS = 2
 _ALLREDUCE_FP32_CHUNK = 4096
+_ALLREDUCE_REDUCE_CASES = [
+    (pld.ReduceOp.Sum, ir.get_op("tile.add").name),
+    (pld.ReduceOp.Max, ir.get_op("tile.maximum").name),
+    (pld.ReduceOp.Min, ir.get_op("tile.minimum").name),
+    (pld.ReduceOp.Prod, ir.get_op("tile.mul").name),
+]
 
 # Ops the chunked mesh decomposition must emit.
 _ALLREDUCE_REQUIRED_OPS = {
@@ -519,10 +525,14 @@ class _StmtKindCollector(ir.IRVisitor):
             self.visit_if_stmt(stmt)
 
 
-def _build_allreduce_before(size: int = _ALLREDUCE_SIZE):
+def _build_allreduce_before(
+    size: int = _ALLREDUCE_SIZE,
+    reduce_op: pld.ReduceOp = pld.ReduceOp.Sum,
+):
     """Build a minimal Before program that calls ``pld.tensor.allreduce``."""
     SIZE = size
     nr = _ALLREDUCE_NRANKS
+    REDUCE_OP = reduce_op
 
     @pl.program
     class Before:
@@ -536,7 +546,7 @@ def _build_allreduce_before(size: int = _ALLREDUCE_SIZE):
         ) -> pl.Tensor[[1, SIZE], pl.FP32]:
             local = pl.load(inp, [0, 0], [1, SIZE])
             data = pl.store(local, [0, 0], data)
-            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            data = pld.tensor.allreduce(data, signal, op=REDUCE_OP)
             acc = pl.load(data, [0, 0], [1, SIZE])
             return pl.store(acc, [0, 0], out)
 
@@ -672,7 +682,7 @@ def test_allreduce_eval_stmt_with_signal_is_decomposed():
     After = passes.lower_composite_ops()(EvalAllreduce)
     op_names = set(_collect_op_names(After))
 
-    assert "pld.tensor.allreduce" not in op_names
+    assert ir.get_op("pld.tensor.allreduce").name not in op_names
     missing = _ALLREDUCE_REQUIRED_OPS - op_names
     assert not missing, f"lowered IR missing expected ops: {missing}"
 
@@ -775,7 +785,7 @@ def test_allreduce_flattens_target_to_2d_view_for_mesh_lowering():
         for stmt in body.stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "tensor.view"
+        and stmt.value.op.name == ir.get_op("tensor.view").name
     )
     view_type = view_stmt.var.type
     assert isinstance(view_type, ir.DistributedTensorType)
@@ -816,7 +826,7 @@ def test_allreduce_mesh_lowering_preserves_partial_valid_shape():
         for stmt in func.body.stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "tensor.view"
+        and stmt.value.op.name == ir.get_op("tensor.view").name
     )
     view_type = view_stmt.var.type
     assert isinstance(view_stmt.value, ir.Call)
@@ -855,8 +865,11 @@ def test_allreduce_mesh_chunks_non_aligned_and_larger_than_ub(size):
     """Chunk bounds, widths, and offsets cover every logical element exactly."""
     Before = _build_allreduce_before(size)
     After = passes.lower_composite_ops()(Before)
-    expected_chunk = min(_ALLREDUCE_FP32_CHUNK, ((size + 7) // 8) * 8)
-    assert expected_chunk * 4 % 32 == 0
+    aligned_chunk = min(_ALLREDUCE_FP32_CHUNK, ((size + 7) // 8) * 8)
+    expected_step = aligned_chunk
+    expected_rows = 1
+    expected_cols = aligned_chunk
+    assert expected_rows * expected_cols * 4 % 32 == 0
 
     class CallCollector(ir.IRVisitor):
         def __init__(self) -> None:
@@ -876,9 +889,9 @@ def test_allreduce_mesh_chunks_non_aligned_and_larger_than_ub(size):
         and isinstance(call.args[0].type, ir.DistributedTensorType)
         and isinstance(call.args[2], ir.MakeTuple)
         and isinstance(call.args[2].elements[0], ir.ConstInt)
-        and call.args[2].elements[0].value == 1
+        and call.args[2].elements[0].value == expected_rows
         and isinstance(call.args[2].elements[1], ir.ConstInt)
-        and call.args[2].elements[1].value == expected_chunk
+        and call.args[2].elements[1].value == expected_cols
         and isinstance(call.args[3], ir.MakeTuple)
         and isinstance(call.args[3].elements[1], ir.Min)
     )
@@ -909,7 +922,7 @@ def test_allreduce_mesh_chunks_non_aligned_and_larger_than_ub(size):
 
     assert len(remote_load.args) == 5
     assert isinstance(chunk_loop.start, ir.ConstInt) and chunk_loop.start.value == 0
-    assert isinstance(chunk_loop.step, ir.ConstInt) and chunk_loop.step.value == expected_chunk
+    assert isinstance(chunk_loop.step, ir.ConstInt) and chunk_loop.step.value == expected_step
     assert isinstance(lowered_load.args[3], ir.MakeTuple)
     assert isinstance(remote_load.args[4], ir.MakeTuple)
     assert isinstance(lowered_load.args[3].elements[1], ir.Min)
@@ -1086,6 +1099,62 @@ def test_allreduce_mesh_lowering_rejects_strided_target_collapse():
         passes.lower_composite_ops()(Before)
 
 
+def test_allreduce_mesh_lowering_accepts_explicit_packed_nd_stride():
+    """An explicitly materialized packed ND stride is still flattenable."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(stride=[12, 4, 1], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(stride=[12, 4, 1], layout=pl.TensorLayout.ND),
+        ]:
+            return pld.tensor.allreduce(data, signal)
+
+    After = passes.lower_composite_ops()(Before)
+    op_names = _collect_op_names(After)
+    assert ir.get_op("pld.tensor.allreduce").name not in op_names
+    assert ir.get_op("tensor.view").name in op_names
+
+
+def test_allreduce_mesh_lowering_rejects_fully_valid_dn_target():
+    """A fully-valid DN view is not a row-major linear stream."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(stride=[12, 1, 3], layout=pl.TensorLayout.DN),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(stride=[12, 1, 3], layout=pl.TensorLayout.DN),
+        ]:
+            return pld.tensor.allreduce(data, signal)
+
+    with pytest.raises(Exception, match="only supports ND layout"):
+        passes.lower_composite_ops()(Before)
+
+
 def test_allreduce_mesh_lowering_rejects_partial_dn_target_collapse():
     """The row-major partial-valid collapse is not valid for DN addresses."""
 
@@ -1148,7 +1217,7 @@ def test_allreduce_flattened_mesh_lowering_reaches_pto_codegen(default_pass_mana
         for stmt in func.body.stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "tensor.view"
+        and stmt.value.op.name == ir.get_op("tensor.view").name
     )
     assert isinstance(view_stmt.value, ir.Call)
     assert len(view_stmt.value.args) == 3
@@ -1311,24 +1380,17 @@ def test_allreduce_deducer_rejects_plain_tensor():
                 return local
 
 
-def test_allreduce_deducer_rejects_unsupported_reduce_op():
-    """First-version lowering supports ``ReduceOp.Sum`` only — the deducer
-    must reject other variants so users get a clear error rather than
-    silently wrong codegen."""
-    SIZE = _ALLREDUCE_SIZE
+@pytest.mark.parametrize(("reduce_op", "expected_tile_op"), _ALLREDUCE_REDUCE_CASES)
+def test_allreduce_lowers_every_reduce_op(reduce_op, expected_tile_op):
+    Before = _build_allreduce_before(reduce_op=reduce_op)
+    After = passes.lower_composite_ops()(Before)
+    op_names = set(_collect_op_names(After))
 
-    with pytest.raises((ValueError, TypeError, ParserError)):
-
-        @pl.program
-        class BadOp:
-            @pl.function(type=pl.FunctionType.InCore)
-            def f(
-                self,
-                data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
-                signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
-            ) -> pl.Tensor[[1, SIZE], pl.FP32]:
-                data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Max)
-                return data
+    assert ir.get_op("pld.tensor.allreduce").name not in op_names
+    assert expected_tile_op in op_names
+    for _, other_tile_op in _ALLREDUCE_REDUCE_CASES:
+        if other_tile_op != expected_tile_op:
+            assert other_tile_op not in op_names
 
 
 # ============================================================================
@@ -1648,37 +1710,49 @@ _RING_ALLREDUCE_NRANKS = 2
 
 # Ops the ring decomposition must emit.
 _RING_ALLREDUCE_REQUIRED_OPS = {
-    "pld.system.get_comm_ctx",
-    "pld.system.nranks",
-    "pld.system.rank",
-    "pld.system.notify",  # per-round barrier (2(P−1) rounds)
-    "pld.system.wait",  # per-round barrier
-    "pld.tile.remote_load",  # per-ring-step chunk receive
-    "tile.add",  # reduce-scatter accumulation
-    "tile.load",  # reduce-scatter local accumulation
-    "tile.store",  # reduce-scatter + allgather chunk writes
+    ir.get_op(name).name
+    for name in (
+        "pld.system.get_comm_ctx",
+        "pld.system.nranks",
+        "pld.system.rank",
+        "pld.system.notify",  # per-round barrier (2(P−1) rounds)
+        "pld.system.wait",  # per-round barrier
+        "pld.tile.remote_load",  # per-ring-step chunk receive
+        "tile.add",  # reduce-scatter accumulation
+        "tile.load",  # reduce-scatter local accumulation
+        "tile.fillpad_inplace",  # promote ragged subchunks for fixed-shape arithmetic
+        "tile.set_validshape",  # narrow the tail again before storing
+        "tile.store",  # reduce-scatter + allgather chunk writes
+    )
 }
 
 
-def _build_ring_allreduce_before():
+def _build_ring_allreduce_before(
+    size: int = _RING_ALLREDUCE_SIZE,
+    n_ranks: int = _RING_ALLREDUCE_NRANKS,
+    reduce_op: pld.ReduceOp = pld.ReduceOp.Sum,
+    dtype=pl.FP32,
+):
     """Build a minimal Before program that calls allreduce(mode="ring")."""
-    SIZE = _RING_ALLREDUCE_SIZE
-    nr = _RING_ALLREDUCE_NRANKS
+    SIZE = size
+    nr = n_ranks
     total_rounds = 2 * (nr - 1)
+    REDUCE_OP = reduce_op
+    DTYPE = dtype
 
     @pl.program
     class Before:
         @pl.function(type=pl.FunctionType.InCore)
         def reduce_step(
             self,
-            inp: pl.Tensor[[1, SIZE], pl.FP32],
-            out: pl.Out[pl.Tensor[[1, SIZE], pl.FP32]],
-            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            inp: pl.Tensor[[1, SIZE], DTYPE],
+            out: pl.Out[pl.Tensor[[1, SIZE], DTYPE]],
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], DTYPE]],
             signal: pl.InOut[pld.DistributedTensor[[total_rounds, nr], pl.INT32]],
-        ) -> pl.Tensor[[1, SIZE], pl.FP32]:
+        ) -> pl.Tensor[[1, SIZE], DTYPE]:
             local = pl.load(inp, [0, 0], [1, SIZE])
             data = pl.store(local, [0, 0], data)
-            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            data = pld.tensor.allreduce(data, signal, op=REDUCE_OP, mode="ring")
             acc = pl.load(data, [0, 0], [1, SIZE])
             return pl.store(acc, [0, 0], out)
 
@@ -1692,29 +1766,396 @@ def test_ring_allreduce_is_decomposed_to_primitives():
     After = passes.lower_composite_ops()(Before)
     op_names = set(_collect_op_names(After))
 
-    assert "pld.tensor.allreduce" not in op_names, (
+    assert ir.get_op("pld.tensor.allreduce").name not in op_names, (
         "lower_composite_ops must remove the composite allreduce call entirely"
+    )
+    assert ir.get_op("tile.create").name not in op_names, (
+        "inactive ring segments must not leave allocation-only placeholders"
     )
     missing = _RING_ALLREDUCE_REQUIRED_OPS - op_names
     assert not missing, f"ring-lowered IR missing expected ops: {missing}"
 
 
 def test_ring_allreduce_emits_ring_control_flow():
-    """Ring lowering emits two phase loops plus notify/wait peer loops.
+    """Ring lowering emits phase, subchunk, and two-phase barrier loops.
 
-    For P=2 each inner notify/wait peer loop has one direct IfStmt body."""
+    For P=2 and one subchunk, each RS/AG phase has one outer loop, one
+    subchunk loop, four peer loops, one guarded data path, and one guarded
+    store."""
     Before = _build_ring_allreduce_before()
     After = passes.lower_composite_ops()(Before)
     collector = _StmtKindCollector()
     collector.visit_program(After)
 
-    # Each phase contains notify and wait peer loops: 2 + 2*2 = 6 loops.
-    assert collector.for_count == 6, (
-        f"expected 6 ForStmts for P=2 ring (2 phase + 4 peer loops), got {collector.for_count}"
+    assert collector.for_count == 12, f"expected 12 ForStmts for P=2 ring, got {collector.for_count}"
+    assert collector.if_count == 12, f"expected 12 IfStmts for P=2 ring, got {collector.if_count}"
+
+
+@pytest.mark.parametrize("size", [1, 3, 17, 8193, 65537])
+@pytest.mark.parametrize("n_ranks", [2, 4])
+def test_ring_allreduce_accepts_arbitrary_lengths(size, n_ranks):
+    """Non-divisible, shorter-than-rank, and larger-than-UB sizes lower safely."""
+    Before = _build_ring_allreduce_before(size=size, n_ranks=n_ranks)
+    After = passes.lower_composite_ops()(Before)
+    ssa_before = passes.convert_to_ssa()(Before)
+    ssa_lowered = passes.lower_composite_ops()(ssa_before)
+    flattened = passes.flatten_tile_nd_to_2d()(ssa_lowered)
+    assert "__FREE_VAR" not in ir.python_print(flattened)
+
+    class CallCollector(ir.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[ir.Call] = []
+
+        def visit_call(self, op: ir.Call) -> None:
+            self.calls.append(op)
+            super().visit_call(op)
+
+    collector = CallCollector()
+    collector.visit_program(After)
+    remote_loads = [
+        call for call in collector.calls if call.op.name == ir.get_op("pld.tile.remote_load").name
+    ]
+    loads = [call for call in collector.calls if call.op.name == ir.get_op("tile.load").name]
+    set_valid_shapes = [
+        call for call in collector.calls if call.op.name == ir.get_op("tile.set_validshape").name
+    ]
+
+    assert remote_loads
+    assert loads
+    assert set_valid_shapes
+    assert all(len(call.args) == 5 for call in remote_loads)
+
+    loops: list[ir.ForStmt] = []
+
+    def collect_loops(stmt: ir.Stmt) -> None:
+        if isinstance(stmt, ir.SeqStmts):
+            for child in stmt.stmts:
+                collect_loops(child)
+        elif isinstance(stmt, ir.ForStmt):
+            loops.append(stmt)
+            collect_loops(stmt.body)
+        elif isinstance(stmt, ir.IfStmt):
+            collect_loops(stmt.then_body)
+            if stmt.else_body is not None:
+                collect_loops(stmt.else_body)
+
+    func = After.get_function("reduce_step")
+    assert func is not None
+    collect_loops(func.body)
+
+    max_segment = (size + n_ranks - 1) // n_ranks
+    expected_chunk = min(4096, ((max_segment + 7) // 8) * 8)
+    subchunk_loops = [
+        loop
+        for loop in loops
+        if ("rs_col" in loop.loop_var.name_hint or "ag_col" in loop.loop_var.name_hint)
+        and isinstance(loop.step, ir.ConstInt)
+        and loop.step.value == expected_chunk
+    ]
+    assert len(subchunk_loops) == 2
+    for loop in subchunk_loops:
+        assert isinstance(loop.start, ir.ConstInt) and loop.start.value == 0
+        assert isinstance(loop.stop, ir.ConstInt) and loop.stop.value == max_segment
+
+    chunk_shapes = [call.args[3] for call in remote_loads]
+    for shape in chunk_shapes:
+        assert isinstance(shape, ir.MakeTuple)
+        chunk_rows = shape.elements[0]
+        chunk_cols = shape.elements[1]
+        assert isinstance(chunk_rows, ir.ConstInt)
+        assert isinstance(chunk_cols, ir.ConstInt)
+        chunk_bytes = chunk_rows.value * chunk_cols.value * 4
+        assert chunk_bytes <= 16 * 1024
+        assert chunk_bytes % 32 == 0
+
+
+@pytest.mark.parametrize("size", [1, 17, 33, 8193, 65537])
+@pytest.mark.parametrize("n_ranks", [2, 4])
+def test_ring_allreduce_fp16_uses_aligned_ring_schedule(size, n_ranks):
+    """FP16 stays on the ring path and marks every remote tail as padded."""
+    Before = _build_ring_allreduce_before(
+        size=size,
+        n_ranks=n_ranks,
+        dtype=pl.FP16,
     )
-    assert collector.if_count == 4, (
-        f"expected 4 IfStmts (RS notify+wait + AG notify+wait), got {collector.if_count}"
+    After = passes.lower_composite_ops()(Before)
+
+    class CallCollector(ir.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[ir.Call] = []
+
+        def visit_call(self, op: ir.Call) -> None:
+            self.calls.append(op)
+            super().visit_call(op)
+
+    collector = CallCollector()
+    collector.visit_program(After)
+    remote_loads = [
+        call for call in collector.calls if call.op.name == ir.get_op("pld.tile.remote_load").name
+    ]
+    assert remote_loads
+    assert all(call.kwargs.get("allow_physical_tail_padding") is True for call in remote_loads)
+    assert all(len(call.args) == 5 for call in remote_loads)
+
+    stmt_collector = _StmtKindCollector()
+    stmt_collector.visit_program(After)
+    assert stmt_collector.for_count == 12, (
+        f"FP16 mode=ring must use the ring schedule, got {stmt_collector.for_count} loops"
     )
+
+    max_segment = min(size, (size + n_ranks - 1) // n_ranks + 15)
+    expected_chunk = min(8192, ((max_segment + 15) // 16) * 16)
+    chunk_shapes = [call.args[3] for call in remote_loads]
+    for shape in chunk_shapes:
+        assert isinstance(shape, ir.MakeTuple)
+        chunk_cols = shape.elements[1]
+        assert isinstance(chunk_cols, ir.ConstInt)
+        assert chunk_cols.value == expected_chunk
+        assert chunk_cols.value * 2 <= 16 * 1024
+        assert chunk_cols.value % 16 == 0
+
+
+def test_ring_allreduce_fp16_lowered_ir_round_trips():
+    """The compiler-only aligned remote tail survives print and reparse."""
+    Before = _build_ring_allreduce_before(size=17, n_ranks=2, dtype=pl.FP16)
+    After = passes.lower_composite_ops()(Before)
+
+    text = ir.python_print(After)
+    assert "pld.tile._remote_load_with_physical_tail_padding(" in text
+    assert "allow_physical_tail_padding=" not in text
+    reparsed = pl.parse_program(text)
+    ir.assert_structural_equal(After, reparsed)
+
+
+def test_ring_allreduce_flattens_packed_nd_target():
+    """Ring mode reinterprets packed ND storage as one linear stream."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[2, 3, 17], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2, 2], pl.INT32]],
+        ) -> pld.DistributedTensor[[2, 3, 17], pl.FP32]:
+            return pld.tensor.allreduce(data, signal, mode="ring")
+
+    After = passes.lower_composite_ops()(Before)
+    func = After.get_function("reduce_step")
+    assert func is not None
+    assert isinstance(func.body, ir.SeqStmts)
+
+    view_stmt = next(
+        stmt
+        for stmt in func.body.stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == ir.get_op("tensor.view").name
+    )
+    assert isinstance(view_stmt.var.type, ir.DistributedTensorType)
+    assert view_stmt.var.type.shape == [1, 102]
+
+
+def test_ring_allreduce_preserves_contiguous_partial_valid_prefix(
+    default_pass_manager,
+    ascend_backend,
+):
+    """A row-major prefix stays valid through the default PTO pipeline."""
+    from pypto import codegen  # noqa: PLC0415
+    from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(valid_shape=[1, 3, 4], stride=[], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 2], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(valid_shape=[1, 3, 4], stride=[], layout=pl.TensorLayout.ND),
+        ]:
+            return pld.tensor.allreduce(data, signal, mode="ring")
+
+    After = passes.lower_composite_ops()(Before)
+    func = After.get_function("reduce_step")
+    assert func is not None
+    assert isinstance(func.body, ir.SeqStmts)
+    assert ir.get_op("tensor.slice").name not in _collect_op_names(After)
+    view_stmt = next(
+        stmt
+        for stmt in func.body.stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == ir.get_op("tensor.view").name
+    )
+    view_type = view_stmt.var.type
+    assert isinstance(view_type, ir.DistributedTensorType)
+    assert view_type.shape == [1, 24]
+    assert view_type.tensor_view is not None
+    assert view_type.tensor_view.valid_shape == [1, 12]
+    before_func = Before.get_function("reduce_step")
+    assert before_func is not None
+    before_type = before_func.params[0].type
+    assert isinstance(before_type, ir.DistributedTensorType)
+    assert view_type.window_buffer == before_type.window_buffer
+
+    ctx = _core_passes.PassContext(
+        [_core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)]
+    )
+    with ctx:
+        optimized = default_pass_manager.run_passes(Before)
+    optimized_func = optimized.get_function("reduce_step")
+    assert optimized_func is not None
+    mlir = codegen.PTOCodegen().generate(ir.Program([optimized_func], optimized_func.name, optimized.span))
+    assert "pto.tload" in mlir
+    assert "pto.tstore" in mlir
+
+
+def test_ring_allreduce_rejects_noncontiguous_partial_valid_box():
+    """A rectangular valid box with row gaps is not one linear prefix."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(valid_shape=[1, 3, 2], stride=[], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 2], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(valid_shape=[1, 3, 2], stride=[], layout=pl.TensorLayout.ND),
+        ]:
+            return pld.tensor.allreduce(data, signal, mode="ring")
+
+    with pytest.raises(Exception, match="contiguous row-major prefix"):
+        passes.lower_composite_ops()(Before)
+
+
+def test_ring_allreduce_rejects_strided_target():
+    """Linear ring addressing must not discard explicit row gaps."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(stride=[100, 10, 1], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 2], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(stride=[100, 10, 1], layout=pl.TensorLayout.ND),
+        ]:
+            return pld.tensor.allreduce(data, signal, mode="ring")
+
+    with pytest.raises(Exception, match="requires a packed source"):
+        passes.lower_composite_ops()(Before)
+
+
+def test_ring_allreduce_rejects_dn_target():
+    """A DN view cannot be flattened with row-major ring offsets."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(stride=[12, 1, 3], layout=pl.TensorLayout.DN),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 2], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(stride=[12, 1, 3], layout=pl.TensorLayout.DN),
+        ]:
+            return pld.tensor.allreduce(data, signal, mode="ring")
+
+    with pytest.raises(Exception, match="only supports ND layout"):
+        passes.lower_composite_ops()(Before)
+
+
+def test_ring_allreduce_dynamic_nd_reaches_pto_codegen(default_pass_manager, ascend_backend):
+    """The default pipeline binds a dynamic packed ND ring extent."""
+    from pypto import codegen  # noqa: PLC0415
+    from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
+
+    n = pl.dynamic("RING_ALLREDUCE_DYNAMIC_N")
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[2, 3, n], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2, 2], pl.INT32]],
+        ) -> pld.DistributedTensor[[2, 3, n], pl.FP32]:
+            return pld.tensor.allreduce(data, signal, mode="ring")
+
+    ctx = _core_passes.PassContext(
+        [_core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)]
+    )
+    with ctx:
+        optimized = default_pass_manager.run_passes(Before)
+    func = optimized.get_function("reduce_step")
+    assert func is not None
+    mlir = codegen.PTOCodegen().generate(ir.Program([func], func.name, optimized.span))
+
+    assert "scf.for" in mlir
+    assert "pto.tload" in mlir
+    assert "pto.tstore" in mlir
+    assert "pto.partition_view" in mlir
+
+
+def test_ring_allreduce_fp16_ragged_tail_reaches_pto_codegen(
+    default_pass_manager,
+    ascend_backend,
+):
+    """The default pipeline preserves an aligned physical FP16 ring tail."""
+    from pypto import codegen  # noqa: PLC0415
+    from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
+
+    Before = _build_ring_allreduce_before(size=17, n_ranks=2, dtype=pl.FP16)
+    ctx = _core_passes.PassContext(
+        [_core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)]
+    )
+    with ctx:
+        optimized = default_pass_manager.run_passes(Before)
+    func = optimized.get_function("reduce_step")
+    assert func is not None
+    mlir = codegen.PTOCodegen().generate(ir.Program([func], func.name, optimized.span))
+
+    assert "scf.for" in mlir
+    assert "pto.tload" in mlir
+    assert "pto.tstore" in mlir
+    assert "f16" in mlir
 
 
 def test_ring_allreduce_lowering_is_idempotent():
@@ -1757,7 +2198,7 @@ def test_ring_allreduce_mesh_default_unchanged():
     After = passes.lower_composite_ops()(Before)
     op_names = set(_collect_op_names(After))
 
-    assert "pld.tensor.allreduce" not in op_names
+    assert ir.get_op("pld.tensor.allreduce").name not in op_names
     missing = _ALLREDUCE_REQUIRED_OPS - op_names
     assert not missing, f"mesh-lowered IR missing expected ops: {missing}"
 
@@ -1768,24 +2209,17 @@ def test_ring_allreduce_mesh_default_unchanged():
     assert collector.for_count == 6, f"mesh allreduce must produce 6 ForStmts, got {collector.for_count}"
 
 
-def test_ring_allreduce_deducer_rejects_unsupported_reduce_op():
-    """Ring mode inherits the kSum-only restriction from mesh."""
-    SIZE = _RING_ALLREDUCE_SIZE
-    nr = _RING_ALLREDUCE_NRANKS
-    total_rounds = 2 * (nr - 1)
+@pytest.mark.parametrize(("reduce_op", "expected_tile_op"), _ALLREDUCE_REDUCE_CASES)
+def test_ring_allreduce_lowers_every_reduce_op(reduce_op, expected_tile_op):
+    Before = _build_ring_allreduce_before(reduce_op=reduce_op)
+    After = passes.lower_composite_ops()(Before)
+    op_names = set(_collect_op_names(After))
 
-    with pytest.raises((ValueError, TypeError, ParserError)):
-
-        @pl.program
-        class BadRingOp:
-            @pl.function(type=pl.FunctionType.InCore)
-            def f(
-                self,
-                data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
-                signal: pl.InOut[pld.DistributedTensor[[total_rounds, nr], pl.INT32]],
-            ) -> pl.Tensor[[1, SIZE], pl.FP32]:
-                data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Max, mode="ring")
-                return data
+    assert ir.get_op("pld.tensor.allreduce").name not in op_names
+    assert expected_tile_op in op_names
+    for _, other_tile_op in _ALLREDUCE_REDUCE_CASES:
+        if other_tile_op != expected_tile_op:
+            assert other_tile_op not in op_names
 
 
 if __name__ == "__main__":
