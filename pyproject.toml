@@ -45,6 +45,10 @@ dev = [
     "ruff==0.14.8",
     "clang-tidy==21.1.0",
 ]
+# The documentation site toolchain is NOT an extra: it lives in
+# `docs/requirements.txt`, so the docs CI job installs it with a plain
+# `pip install -r` instead of `pip install -e ".[docs]"`, which would trigger a
+# full C++ build the site does not need.
 
 [project.urls]
 Homepage = "https://github.com/hw-native-sys/pypto"
