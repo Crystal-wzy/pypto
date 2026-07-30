@@ -468,6 +468,23 @@ Pass LegalizeTileCast();
  * opt-in.  Chained Mat-scratch producers remain output-stationary to avoid the
  * allocator offset-packing limitation tracked by issue #1908.
  *
+ * The pass also recognizes a user-authored, static pipeline (stage >= 2, trip
+ * count divisible by the stage count) containing exactly one already-L0
+ * ``tile.matmul``.  Its selected moving operand must be produced by a direct
+ * per-iteration Mat-to-L0 transfer, while the other operand is loop-invariant.
+ * Its Acc result must have one canonical loop-carried drain: direct-to-GM
+ * ``tile.store`` needs at least four iterations; Acc-to-Mat ``tile.assemble``
+ * needs at least eight iterations and an aligned Acc tile occupying at least
+ * one quarter of L0C.  When the
+ * conservative whole-function Acc footprint (including the physical stage
+ * multiplicity of other pipelined Acc producers) plus one slot per profitable
+ * loop fits in L0C, it enables the existing two-accumulator drain-overlap
+ * schedule automatically under the PyPTO memory planner.  Deeper operand
+ * pipelines are scheduled in depth-two compute/drain chunks and still rotate
+ * only two L0C slots.  Explicit loop policies, nested control flow, multiple
+ * cube matmuls or Acc values, non-canonical drain/yield chains, additional
+ * stores, and insufficient L0C capacity stay unchanged.
+ *
  * Eligible calls require static 2D operands with B in Mat and A in Mat or Vec.
  * When the chooser returns the full ``(M, N, K)`` shape, no tiling rewrite is
  * needed, although a chained result may still be remapped to Mat by the
