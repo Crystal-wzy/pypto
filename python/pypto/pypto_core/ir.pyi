@@ -1058,6 +1058,13 @@ class MemRef(Var):
     size_: int
     """Size in bytes (64-bit unsigned)."""
 
+    is_pinned_: bool
+    """True for an author-declared allocation, false for a compiler allocation."""
+
+    @overload
+    def __init__(self, span: Span = ...) -> None: ...
+    @overload
+    def __init__(self, name: str, span: Span = ...) -> None: ...
     @overload
     def __init__(self, base: Var, byte_offset: int, size: int, span: Span = ...) -> None: ...
     @overload

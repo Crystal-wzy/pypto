@@ -2830,6 +2830,16 @@ void IRPythonPrinter::PrintShapeDims(std::ostringstream& oss, const std::vector<
 // Helper methods for MemRef and TileView printing
 std::string IRPythonPrinter::PrintMemRef(const MemRef& memref) {
   std::ostringstream oss;
+
+  // An author-declared allocation prints in the one-argument form: it carries no
+  // size or address to print, since InitMemRef derives both. Printing it with the
+  // invented pair would make it indistinguishable from a compiler allocation on
+  // reparse.
+  if (memref.is_pinned_) {
+    oss << prefix_ << ".MemRef(\"" << GetVarName(memref.base_.get()) << "\")";
+    return oss.str();
+  }
+
   oss << prefix_ << ".MemRef(";
 
   // Base Ptrs defined in the function body (by alloc statements) are printed as

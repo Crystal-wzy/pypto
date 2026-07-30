@@ -69,6 +69,71 @@ tensor: pl.Tensor[[64, 128], pl.FP32, pl.MemRef(addr_expr, 8192, 0)]
 tile: pl.Tile[[16, 16], pl.FP16, pl.MemRef(addr_expr, 512, 0), pl.Mem.Left]
 ```
 
+### Declared Allocations (one-argument MemRef)
+
+A one-argument `pl.MemRef("name")` declares an allocation of your own, taking it out of
+the compiler's opportunistic reuse. Tiles referencing it share it; nothing else is ever
+packed in. Use it when the packer coalesces tiles you want to stay independent —
+sharing storage adds a WAR dependency that serializes them.
+
+It is the same IR node as the three-argument form; the arity says whether you are
+describing an existing allocation or declaring one. Declaring gives only a name: the
+size comes from the largest tile bound to it and the address from the allocator.
+
+Declare it once, then reference it by variable. An unnamed declaration takes the name
+of the variable it is bound to, so the name is written once:
+
+```python
+ping = pl.MemRef()
+pong = pl.MemRef()
+
+# Two tiles explicitly share one allocation; a third is kept private.
+t0: pl.Tile[[64, 64], pl.FP32, ping, pl.Mem.Vec] = pl.load(a, [0, 0], [64, 64])
+t1: pl.Tile[[64, 64], pl.FP32, pong, pl.Mem.Vec] = pl.exp(t0)
+t2: pl.Tile[[64, 64], pl.FP32, ping, pl.Mem.Vec] = pl.exp(t1)
+```
+
+Prefer that form: a misspelled reference is a Python `NameError`, whereas a misspelled
+string in the inline `pl.MemRef("pign")` form silently declares a second allocation. The
+inline form stays valid — it is what the IR printer emits, so a dumped program reparses
+without a surrounding Python scope, and `pl.MemRef("other")` also names a declaration
+explicitly when the variable name is not the one you want in the IR.
+
+Since the variable supplies the name, variable and allocation must correspond one to one.
+Reaching one declaration through two names (`alias = ping`) and two declarations claiming
+one name are both **rejected** — either would silently merge or split an allocation.
+
+Whether a MemRef is a declaration is recorded explicitly on the IR node
+(`MemRef.is_pinned_`), not inferred from its size or from which pass is running.
+`InitMemRef` consumes the declaration: from there on the allocation carries
+`pinned=True` and the MemRef is an ordinary one, so re-parsing a post-allocation dump
+cannot turn compiler allocations into declared ones.
+
+A declared name lives in its own namespace — it never resolves to a Python variable that
+happens to share it. The memory space **is** required (a `TileType` always pairs a
+MemRef with a space), and all tiles bound to one allocation must agree on it. Tiles left
+unannotated keep the default automatic reuse.
+
+Declarations do not clone per pipeline stage, so one inside a `pl.pipeline(stage=2)`
+body is **rejected**: the cloned stages would make the tile co-live with itself on one
+allocation. Declaring slots and asking the compiler to multi-buffer are alternatives,
+not layers. To manage a level yourself, drive it with `pl.range` and declare one
+allocation per slot; leave the levels you want the compiler to manage unannotated.
+
+```python
+l0b_ping, l0b_pong = pl.MemRef(), pl.MemRef()
+
+# Outer level compiler-managed, inner level author-managed ping-pong.
+for stack, (out_outer,) in pl.pipeline(STACKS, stage=2, init_values=(out,)):
+    b_l1: pl.Tile[[K, N], pl.BF16, pl.Mem.Mat] = pl.load(b, [stack * K, 0], [K, N])
+    for col, (out_inner,) in pl.range(0, N, 2 * STEP, init_values=[out_outer]):
+        ping: pl.Tile[[K, STEP], pl.BF16, l0b_ping, pl.Mem.Right] = ...
+        pong: pl.Tile[[K, STEP], pl.BF16, l0b_pong, pl.Mem.Right] = ...
+```
+
+See [InitMemRef](../passes/29-init_memref.md#declared-allocations) and
+[MemoryReuse](../passes/31-memory_reuse.md#declared-allocations).
+
 ### Tile Views (TileView)
 
 ```python

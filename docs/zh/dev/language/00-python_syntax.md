@@ -69,6 +69,62 @@ tensor: pl.Tensor[[64, 128], pl.FP32, pl.MemRef(addr_expr, 8192, 0)]
 tile: pl.Tile[[16, 16], pl.FP16, pl.MemRef(addr_expr, 512, 0), pl.Mem.Left]
 ```
 
+### 声明式分配（单参数 MemRef）
+
+单参数形式 `pl.MemRef("name")` 声明一块属于你自己的分配，把它从编译器的机会主义复用中收回。
+引用它的 tile 共享这块分配，其他 tile 绝不会被塞进去。当 packer 合并了你希望保持独立的 tile
+时使用它——共用存储会引入一条 WAR 依赖，使二者串行。
+
+它与三参数形式是同一个 IR 节点；参数个数区分"描述一块已有分配"还是"声明一块新的"。声明时只
+给名字：大小取自绑定到它的最大 tile，地址由分配器决定。
+
+先声明一次，再用变量引用。不带名字的声明会取所绑定变量的名字，这样名字只写一遍：
+
+```python
+ping = pl.MemRef()
+pong = pl.MemRef()
+
+# 两个 tile 显式共用一块分配；第三个保持独占。
+t0: pl.Tile[[64, 64], pl.FP32, ping, pl.Mem.Vec] = pl.load(a, [0, 0], [64, 64])
+t1: pl.Tile[[64, 64], pl.FP32, pong, pl.Mem.Vec] = pl.exp(t0)
+t2: pl.Tile[[64, 64], pl.FP32, ping, pl.Mem.Vec] = pl.exp(t1)
+```
+
+推荐这种写法：引用拼错会直接得到 Python 的 `NameError`，而内联的 `pl.MemRef("pign")` 形式
+里字符串拼错只会静默地多声明一块分配。内联形式仍然有效——IR 打印器输出的就是它，这样 dump
+出来的程序不依赖外层 Python 作用域即可重新解析；`pl.MemRef("other")` 也可用于显式命名，适用
+于变量名不是你想写进 IR 的那个名字时。
+
+既然名字由变量提供，变量与分配就必须一一对应。用两个名字引用同一个声明（`alias = ping`）、
+以及两个声明抢占同一个名字，都会被**拒绝**——两者都会静默地合并或拆分分配。
+
+一个 MemRef 是否为声明式分配，由 IR 节点上的显式字段（`MemRef.is_pinned_`）记录，既不靠大小
+推断，也不靠"当前跑到哪个 pass"。`InitMemRef` 会消费掉这个声明：此后分配点带上 `pinned=True`，
+MemRef 变回普通 MemRef，所以重新解析一份分配后的 dump 不会把编译器分配误当成声明式分配。
+
+声明的名字自成命名空间——不会解析到恰好同名的 Python 变量。内存空间**必须**写（`TileType`
+始终要求 MemRef 与空间成对出现），且绑定到同一块分配的 tile 必须一致。未加注解的 tile 保持
+默认的自动复用。
+
+声明式分配不会随流水级复制，因此在 `pl.pipeline(stage=2)` 体内声明会被**拒绝**：复制出的各级
+会让同一个 tile 在同一块分配上与自身同时存活。声明槽位与"交给编译器做多缓冲"是二选一，不能
+叠加。要自己管理某一层，就用 `pl.range` 驱动它并为每个槽位声明一块分配；希望编译器管理的层次
+则不加注解。
+
+```python
+l0b_ping, l0b_pong = pl.MemRef(), pl.MemRef()
+
+# 外层交给编译器，内层由作者自己做 ping-pong。
+for stack, (out_outer,) in pl.pipeline(STACKS, stage=2, init_values=(out,)):
+    b_l1: pl.Tile[[K, N], pl.BF16, pl.Mem.Mat] = pl.load(b, [stack * K, 0], [K, N])
+    for col, (out_inner,) in pl.range(0, N, 2 * STEP, init_values=[out_outer]):
+        ping: pl.Tile[[K, STEP], pl.BF16, l0b_ping, pl.Mem.Right] = ...
+        pong: pl.Tile[[K, STEP], pl.BF16, l0b_pong, pl.Mem.Right] = ...
+```
+
+参见 [InitMemRef](../passes/29-init_memref.md#声明式分配) 与
+[MemoryReuse](../passes/31-memory_reuse.md#声明式分配)。
+
 ### Tile 视图 (TileView)
 
 ```python

@@ -56,6 +56,19 @@ bool IsBufferAliasingViewOp(const std::string& op_name) {
   return entry.OutputMemoryInheritsInput() && entry.IsInplaceSafe();
 }
 
+bool OutputInheritsSourceBuffer(const std::string& op_name) {
+  auto& registry = OpRegistry::GetInstance();
+  if (!registry.IsRegistered(op_name)) return false;
+  const auto& entry = registry.GetEntry(op_name);
+  // Inheriting the input's memory *space* is not the same as landing in its
+  // buffer: tile.transpose inherits the space but permutes into a fresh one
+  // (pto.ttrans, registered not_inplace_safe()). IsBufferAliasingViewOp already
+  // draws that line, so reuse it rather than testing OutputMemoryInheritsInput()
+  // directly — otherwise a transpose output, which does own its buffer, could
+  // not be bound to a declared allocation.
+  return IsBufferAliasingViewOp(op_name) || entry.GetOutputReusesInputArg().has_value();
+}
+
 bool IsBuiltinOp(const std::string& op_name) {
   return op_name.rfind("tile.", 0) == 0 || op_name.rfind("tensor.", 0) == 0 ||
          op_name.rfind("system.", 0) == 0 || op_name.rfind("array.", 0) == 0;

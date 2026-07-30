@@ -50,12 +50,40 @@ class MemRef(_IrMemRef):
     base variables and ``Scalar`` arithmetic byte offsets — type-checks
     cleanly when re-loaded as a ``@pl.program``.
 
+    Called with **no offset and size**, it declares an allocation of your own
+    rather than describing an existing one: size and address are left for
+    ``InitMemRef`` to derive, and the compiler's opportunistic reuse never packs
+    anything else into it. The allocation takes the name of the variable it is
+    bound to, so the name is written once::
+
+        scratch = pl.MemRef()
+
+        t0: pl.Tile[[64, 64], pl.FP32, scratch, pl.Mem.Vec] = pl.load(x, [0, 0], [64, 64])
+        t1: pl.Tile[[64, 64], pl.FP32, scratch, pl.Mem.Vec] = pl.exp(t0)
+
+    Reference it by variable, so a misspelling is a ``NameError`` rather than a
+    second allocation. Since the variable *is* the name, one declaration may not
+    be reached through two names (``b = a``) and two declarations may not claim
+    one name; both are rejected. ``pl.MemRef("other")`` names it explicitly,
+    overriding the variable — that is the form the IR printer emits, so a dumped
+    program reparses without a surrounding Python scope.
+
+    Tiles sharing one declared allocation must not be live at the same time, and
+    must agree on memory space; both are checked. Declaring an allocation inside a
+    ``pl.pipeline(stage=2)`` body is rejected — the cloned stages would make a
+    tile co-live with itself — so to hand-manage a level, drive it with
+    ``pl.range`` and declare one allocation per slot.
+
     Note: ``pl.MemRef(...)`` calls inside a ``@pl.program`` body are resolved
     by the parser (``parser/type_resolver.py``), not dispatched through this
     ``__init__``. A ``Scalar`` byte offset is therefore only ever seen by
     pyright; it never reaches the underlying ``ir.MemRef`` constructor.
     """
 
+    @overload
+    def __init__(self, span: Span = ...) -> None: ...
+    @overload
+    def __init__(self, name: str, span: Span = ...) -> None: ...
     @overload
     def __init__(self, base: Var, byte_offset: _ByteOffset, size: int, span: Span = ...) -> None: ...
     @overload

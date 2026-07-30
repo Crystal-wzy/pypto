@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -26,6 +27,7 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
@@ -34,6 +36,7 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/memref_collectors.h"
@@ -97,10 +100,113 @@ std::optional<size_t> GetOutputReusesInputArg(const std::string& op_name) {
   return registry.GetEntry(op_name).GetOutputReusesInputArg();
 }
 
+// Byte size of a shaped type, or nullopt when any extent is dynamic.
+std::optional<uint64_t> ShapedTypeSizeBytes(const ShapedTypePtr& type) {
+  uint64_t num_elements = 1;
+  for (const auto& dim : type->shape_) {
+    auto const_dim = As<ConstInt>(dim);
+    // A non-positive extent would wrap the unsigned product into a huge size.
+    if (!const_dim || const_dim->value_ <= 0) return std::nullopt;
+    num_elements *= static_cast<uint64_t>(const_dim->value_);
+  }
+  return num_elements * type->dtype_.GetByte();
+}
+
+// ============================================================================
+// Author-declared allocations (`pl.Tile[..., pl.MemRef("name"), ...]`)
+// ============================================================================
+
+/// Base Ptr of a declared allocation -> the size it must hold (largest bound tile).
+using DeclaredAllocMap = std::map<const Var*, uint64_t>;
+
+/// The declared-allocation MemRef `type` carries, or null when it carries none.
+///
+/// `MemRef::is_pinned_` is what tells an author's declaration apart from a
+/// compiler allocation: re-parsing a post-allocation dump also puts MemRefs on
+/// TileTypes, and those are the compiler's. Keying on an explicit field rather
+/// than on "we are standing before InitMemRef" keeps the classification a
+/// property of the data, so a dump can be reparsed and re-run without its
+/// allocations turning into declared ones.
+///
+/// Returning the MemRef (not just its base) spares every caller a second,
+/// unchecked unwrap of the same optional.
+MemRefPtr GetDeclaredAlloc(const TypePtr& type) {
+  auto tile_type = As<TileType>(type);
+  if (!tile_type || !tile_type->memref_.has_value()) return nullptr;
+  const auto& memref = *tile_type->memref_;
+  if (!memref->base_ || !memref->is_pinned_) return nullptr;
+  return memref;
+}
+
+/// Collect every declared allocation in a function, deriving each one's size
+/// (the largest bound tile) and checking the bound tiles agree on memory space.
+class DeclaredAllocCollector : public IRVisitor {
+ public:
+  DeclaredAllocMap buffers;
+
+  // Every binding reaches this pass on a Var's type, so one VarLike override
+  // covers assignment LHSs and iter_args alike. Parameters are NOT visited —
+  // the traversal starts at the body — which is sound because the parser refuses
+  // a one-argument `pl.MemRef(...)` in a parameter annotation, so no declaration
+  // can arrive on a param.
+  void VisitVarLike_(const VarPtr& op) override {
+    if (op) Record(op);
+    IRVisitor::VisitVarLike_(op);
+  }
+
+ private:
+  void Record(const VarPtr& var) {
+    auto binding = GetDeclaredAlloc(var->GetType());
+    if (!binding) return;
+    const VarPtr& base = binding->base_;
+    auto tile_type = As<TileType>(var->GetType());
+
+    auto size = ShapedTypeSizeBytes(tile_type);
+    CHECK_SPAN(size.has_value(), var->span_)
+        << "Tile '" << var->name_hint_ << "' is bound to the declared allocation '" << base->name_hint_
+        << "' but has a dynamic shape; a declared allocation must be sized at compile time";
+
+    auto& buffer_size = buffers[base.get()];
+    buffer_size = std::max(buffer_size, *size);
+
+    if (tile_type->memory_space_.has_value()) {
+      auto [it, inserted] = spaces_.emplace(base.get(), *tile_type->memory_space_);
+      CHECK_SPAN(inserted || it->second == *tile_type->memory_space_, var->span_)
+          << "Tiles bound to the declared allocation '" << base->name_hint_
+          << "' must all live in the same memory space, but '" << var->name_hint_ << "' is "
+          << MemorySpaceToString(*tile_type->memory_space_) << " while the allocation is already "
+          << MemorySpaceToString(it->second);
+    }
+  }
+
+  std::map<const Var*, MemorySpace> spaces_;
+};
+
 // Mutator to initialize MemRef for variables
 class InitMemRefMutator : public IRMutator {
  public:
-  InitMemRefMutator() = default;
+  explicit InitMemRefMutator(const DeclaredAllocMap& declared_allocs) : declared_allocs_(declared_allocs) {}
+
+  /// Whether `type` is bound to one of this function's declared allocations.
+  [[nodiscard]] bool HasUserBinding(const TypePtr& type) const {
+    if (declared_allocs_.empty()) return false;
+    auto binding = GetDeclaredAlloc(type);
+    return binding && declared_allocs_.count(binding->base_.get()) > 0;
+  }
+
+  /// The MemRef a user binding asks for, sized from the whole bound set.
+  /// Returns nullopt when `type` carries no binding.
+  std::optional<MemRefPtr> UserBoundMemRef(const TypePtr& type) const {
+    if (declared_allocs_.empty()) return std::nullopt;
+    auto binding = GetDeclaredAlloc(type);
+    if (!binding) return std::nullopt;
+    auto it = declared_allocs_.find(binding->base_.get());
+    if (it == declared_allocs_.end()) return std::nullopt;
+    // Every bound tile gets the SAME base Ptr — that shared identity is what
+    // makes them share storage — sized to the largest member so the buffer
+    // holds any of them.
+    return std::make_shared<MemRef>(binding->base_, binding->byte_offset_, it->second);
+  }
 
   // Resolve memory space from TileType::memory_space_ field (set by InferTileMemorySpace),
   // falling back to DDR when default_to_ddr is true.
@@ -204,7 +310,10 @@ class InitMemRefMutator : public IRMutator {
     if (auto shaped_type = std::dynamic_pointer_cast<const ShapedType>(var_expr->GetType())) {
       // Resolve memory space once, pass to both CreateMemRef and CloneType
       auto memory_space = ResolveTileMemorySpace(var_expr->GetType(), /*default_to_ddr=*/true);
-      auto memref = CreateMemRef(shaped_type, var, memory_space);
+      // A declared allocation wins over a fresh one: the whole point is
+      // that this tile lands in the buffer the kernel author named.
+      auto memref = UserBoundMemRef(var_expr->GetType());
+      if (!memref.has_value()) memref = CreateMemRef(shaped_type, var, memory_space);
       new_type = CloneTypeWithMemRefAndRemapExprs(
           var_expr->GetType(), memref, [this](const ExprPtr& expr) { return VisitExpr(expr); }, memory_space);
     } else {
@@ -352,6 +461,16 @@ class InitMemRefMutator : public IRMutator {
     if (auto call = std::dynamic_pointer_cast<const Call>(op->value_)) {
       LOG_DEBUG << "Processing AssignStmt for " << op->var_->name_hint_ << " with call to "
                 << call->op_->name_;
+
+      // A view / in-place result physically IS its source's buffer, so binding
+      // it to a different one cannot be honored. Say so instead of silently
+      // dropping the binding — the user asked for something impossible.
+      CHECK_SPAN(!op_predicates::OutputInheritsSourceBuffer(call->op_->name_) ||
+                     !HasUserBinding(op->var_->GetType()),
+                 op->var_->span_)
+          << "Tile '" << op->var_->name_hint_ << "' is produced by '" << call->op_->name_
+          << "', which lands in its source tile's allocation, so it cannot be given one of its own. "
+             "Bind the source tile instead.";
 
       // Handle view operations: output should share MemRef with input tile.
       // A pure metadata view (slice/reshape/...) inherits its input's buffer.  A
@@ -541,6 +660,7 @@ class InitMemRefMutator : public IRMutator {
   }
 
   std::map<VarPtr, VarPtr> var_map_;
+  const DeclaredAllocMap& declared_allocs_;
   uint64_t next_id_ = 0;
 };
 
@@ -578,8 +698,28 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
   // Step 1: Normalize statement structure to ensure SeqStmts
   auto normalized_func = NormalizeStmtStructure(func);
 
-  // Step 2: Mutate variables to initialize their MemRef
-  InitMemRefMutator mutator;
+  // Step 2: Resolve author-declared allocations (`pl.Tile[..., pl.MemRef("name"),
+  // ...]`), then mutate variables to initialize their MemRef. They must be
+  // collected up front: a declared allocation's size is the max over ALL tiles
+  // bound to it, which is only known after the whole function has been seen.
+  DeclaredAllocCollector declared_alloc_collector;
+  declared_alloc_collector.VisitStmt(normalized_func->body_);
+  const DeclaredAllocMap& declared_allocs = declared_alloc_collector.buffers;
+
+  // The isolation guarantee is enforced by MemoryReuse, which ptoas replaces
+  // wholesale under memory_planner=PTOAS. Honoring the declaration's allocation
+  // but not its isolation would hand back exactly the coalescing the author
+  // declared it to prevent, so reject the combination rather than degrade quietly.
+  if (!declared_allocs.empty()) {
+    const auto* ctx = PassContext::Current();
+    CHECK(ctx == nullptr || ctx->GetMemoryPlanner() != MemoryPlanner::PtoAS)
+        << "A declared allocation (one-argument pl.MemRef(...)) is not supported under "
+           "memory_planner=PTOAS: ptoas owns memory planning and would be free to coalesce the "
+           "allocations you separated. Drop the declarations, or compile with the default PyPTO "
+           "memory planner.";
+  }
+
+  InitMemRefMutator mutator(declared_allocs);
 
   std::vector<VarPtr> new_params;
   new_params.reserve(normalized_func->params_.size());
@@ -611,7 +751,8 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
   alloc_stmts.reserve(memrefs.size());
   for (const auto& [memref, memory_space] : memrefs) {
     if (seen_bases.insert(memref->base_.get()).second) {
-      alloc_stmts.push_back(CreateAllocStatement(memref, memory_space));
+      const bool pinned = declared_allocs.count(memref->base_.get()) > 0;
+      alloc_stmts.push_back(CreateAllocStatement(memref, memory_space, pinned));
     }
   }
 

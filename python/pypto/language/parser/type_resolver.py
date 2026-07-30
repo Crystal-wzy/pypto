@@ -513,12 +513,12 @@ class TypeResolver:
         memory_space_node: ast.expr | None = None
 
         for node in extra_nodes:
-            if self._is_memref_node(node) or self._resolve_memref_var_ref(node) is not None:
+            if self._is_memref_node(node) or (self._resolve_memref_var_ref(node) is not None):
                 if memref_node is not None:
                     raise ParserTypeError(
                         "Tile annotation can contain at most one memref argument",
                         span=self._get_span(node),
-                        hint="Remove the duplicate pl.MemRef(...) or MemRefType variable argument",
+                        hint="Remove the duplicate pl.MemRef(...) / MemRefType argument",
                     )
                 memref_node = node
                 continue
@@ -560,7 +560,8 @@ class TypeResolver:
             raise ParserTypeError(
                 "Tile annotation with a memref argument must also specify explicit memory space",
                 span=self._get_span(memref_node),
-                hint="Use pl.Tile[[shape], dtype, pl.MemRef(base, offset, size), pl.Mem.Vec] or "
+                hint="Use pl.Tile[[shape], dtype, pl.MemRef(base, offset, size), pl.Mem.Vec], "
+                'pl.Tile[[shape], dtype, pl.MemRef("scratch"), pl.Mem.Vec], or '
                 "pl.Tile[[shape], dtype, memref_var, pl.Mem.Vec]",
             )
 
@@ -592,13 +593,112 @@ class TypeResolver:
         return ir.TileType(shape, dtype, memref, tile_view, memory_space)
 
     def _resolve_memref_var_ref(self, node: ast.expr) -> "ir.MemRef | None":
-        """Resolve a previously bound MemRef variable used in a Tile annotation."""
-        if not isinstance(node, ast.Name) or self.scope_lookup is None:
+        """Resolve a MemRef referenced by name in a Tile annotation.
+
+        Two sources, in order: a MemRef bound earlier in the parsed program (a
+        printed dump names its alloc-defined Ptr that way), then an allocation the
+        author declared in enclosing Python::
+
+            scratch = pl.MemRef()
+            t: pl.Tile[[64, 64], pl.FP32, scratch, pl.Mem.Vec] = ...
+
+        The declared form is the one to prefer: a misspelled reference is a
+        ``NameError`` from Python itself, whereas a misspelled string in the
+        inline ``pl.MemRef("scartch")`` form quietly declares a second allocation.
+
+        Args:
+            node: Candidate AST node from a Tile annotation's trailing arguments
+
+        Returns:
+            The MemRef, or None if the node is not a MemRef reference
+        """
+        if not isinstance(node, ast.Name):
             return None
-        var = self.scope_lookup(node.id)
-        if isinstance(var, ir.MemRef):
-            return var
-        return None
+        if self.scope_lookup is not None:
+            var = self.scope_lookup(node.id)
+            if isinstance(var, ir.MemRef):
+                return var
+        declared = self.expr_evaluator.closure_vars.get(node.id)
+        if not isinstance(declared, ir.MemRef):
+            return None
+        if not declared.is_pinned_:
+            # A fully specified MemRef object: it already carries its own base.
+            return declared
+        return self._make_declared_memref(self._declared_alloc_name(declared, node), self._get_span(node))
+
+    def _declared_alloc_name(self, declared: "ir.MemRef", node: ast.Name) -> str:
+        """The name a declared allocation goes by, and the checks that keep it one.
+
+        An unnamed ``pl.MemRef()`` is named after the variable it is bound to, so
+        the name is written once. That only holds up while variable and allocation
+        correspond one-to-one, which is what the two checks below enforce:
+
+        * one declaration reached through two names (``b = a``) would silently
+          become two allocations;
+        * two declarations claiming one name would silently become one.
+
+        A declaration with an explicit name is exempt from the first check — the
+        name is its own, not the variable's — but still may not collide with
+        another declaration.
+
+        Args:
+            declared: The declared allocation's MemRef marker
+            node: The AST Name node referencing it
+
+        Returns:
+            The allocation's name
+
+        Raises:
+            ParserTypeError: If the variable-to-allocation correspondence breaks
+        """
+        explicit = declared.base_.name_hint
+        name = explicit or node.id
+        span = self._get_span(node)
+
+        if not hasattr(self, "_declared_alloc_names"):
+            self._declared_alloc_names: dict[int, str] = {}
+            self._declared_alloc_owners: dict[str, int] = {}
+
+        seen = self._declared_alloc_names.setdefault(id(declared), name)
+        if seen != name:
+            raise ParserTypeError(
+                f"Declared allocation '{seen}' is also referenced as '{name}'",
+                span=span,
+                hint=f"An unnamed pl.MemRef() is named after its variable, so aliasing it "
+                f"('{name} = {seen}') is ambiguous. Reference it as '{seen}', declare a "
+                f'separate pl.MemRef(), or name it explicitly with pl.MemRef("...")',
+            )
+
+        owner = self._declared_alloc_owners.setdefault(name, id(declared))
+        if owner != id(declared):
+            raise ParserTypeError(
+                f"Two separate pl.MemRef() declarations both resolve to the name '{name}'",
+                span=span,
+                hint="Declared allocations are identified by name within a function. Give one of "
+                'them an explicit name with pl.MemRef("...")',
+            )
+        return name
+
+    def _make_declared_memref(self, name: str, span: "ir.Span") -> "ir.MemRef":
+        """Build the unresolved MemRef for a declared allocation's name.
+
+        A declared allocation's name is its own namespace, unrelated to Python
+        variable names, so this must not reach ``scope_lookup``. That fallback
+        exists for ``pl.MemRef(base, offset, size)`` naming an alloc-defined Ptr;
+        a declaration never has one (it is resolved before InitMemRef creates
+        any). Left in, a name that merely collided with an in-scope variable — a
+        tensor parameter ``a`` and ``pl.MemRef("a")`` — would silently take that
+        variable, of arbitrary type, as the allocation base.
+
+        Args:
+            name: Allocation name, shared by every annotation naming it
+            span: Source location
+
+        Returns:
+            A MemRef with ``is_pinned_`` set, on the interned base Ptr
+        """
+        base_var = self._intern_base_ptr(name, span, skip_scope_lookup=True)
+        return ir.MemRef(base_var, 0, 0, span, is_pinned=True)
 
     def _resolve_tuple_type(self, subscript_node: ast.Subscript) -> list[ir.Type]:
         """Resolve tuple[T1, T2, ...] return type annotation.
@@ -1579,14 +1679,19 @@ class TypeResolver:
             hint="Use pl.PadValue.null, pl.PadValue.zero, pl.PadValue.max, or pl.PadValue.min",
         )
 
-    def _is_memref_node(self, node: ast.expr) -> bool:
-        """Check if an AST node is a pl.MemRef(...) call."""
+    @staticmethod
+    def _is_call_to(node: ast.expr, name: str) -> bool:
+        """Check if an AST node is a ``pl.<name>(...)`` or bare ``<name>(...)`` call."""
         if not isinstance(node, ast.Call):
             return False
         func = node.func
-        return (isinstance(func, ast.Attribute) and func.attr == "MemRef") or (
-            isinstance(func, ast.Name) and func.id == "MemRef"
+        return (isinstance(func, ast.Attribute) and func.attr == name) or (
+            isinstance(func, ast.Name) and func.id == name
         )
+
+    def _is_memref_node(self, node: ast.expr) -> bool:
+        """Check if an AST node is a pl.MemRef(...) call."""
+        return self._is_call_to(node, "MemRef")
 
     def _is_memory_space_node(self, node: ast.expr) -> bool:
         """Check if an AST node is a pl.Mem.<space> or pl.MemorySpace.<space> reference."""
@@ -1610,6 +1715,8 @@ class TypeResolver:
         """Resolve a pl.MemRef(base, byte_offset, size) AST call to ir.MemRef.
 
         Supports:
+        - Declaration: pl.MemRef(name) — an allocation of the author's own, size
+          and address left for InitMemRef and the allocator to derive
         - New format: pl.MemRef(base_name, byte_offset, size) — bare name or string ref
         - Legacy format: pl.MemRef(addr, size, id) — integer addr
 
@@ -1630,6 +1737,22 @@ class TypeResolver:
             )
 
         span = self._get_span(node)
+
+        # One argument: a declared allocation. The author names it and nothing
+        # else — InitMemRef derives the size from the tiles bound to it and the
+        # allocator assigns the address — so there is no offset/size to give.
+        if len(node.args) == 1 and not node.keywords:
+            name_node = node.args[0]
+            if not (
+                isinstance(name_node, ast.Constant) and isinstance(name_node.value, str) and name_node.value
+            ):
+                raise ParserTypeError(
+                    f"A declared allocation's name must be a non-empty string literal, "
+                    f"got {ast.unparse(name_node)}",
+                    span=span,
+                    hint='Use pl.MemRef("scratch")',
+                )
+            return self._make_declared_memref(name_node.value, span)
 
         if len(node.args) == 3:
             first_arg = node.args[0]
@@ -1663,15 +1786,25 @@ class TypeResolver:
             hint="Use pl.MemRef(base_name, byte_offset, size)",
         )
 
-    def _intern_base_ptr(self, name: str, span: "ir.Span") -> "ir.Var":
+    def _intern_base_ptr(self, name: str, span: "ir.Span", skip_scope_lookup: bool = False) -> "ir.Var":
         """Get or create a shared Var for a base Ptr name.
 
         Ensures that two MemRef annotations referencing the same base name
         share the same Var instance, so MemRef.SameAllocation() works after
         parse round-trips. Checks scope_lookup first (for alloc-defined vars),
         then falls back to a per-resolver cache.
+
+        Args:
+            name: Base Ptr name to intern
+            span: Source location, used when a fresh Var is created
+            skip_scope_lookup: Resolve only through the resolver-local cache.
+                Set for a declared allocation's name, which lives in its own
+                namespace — see ``_make_declared_memref``.
+
+        Returns:
+            The shared Var for this base name
         """
-        if self.scope_lookup is not None:
+        if self.scope_lookup is not None and not skip_scope_lookup:
             existing = self.scope_lookup(name)
             if existing is not None:
                 return existing

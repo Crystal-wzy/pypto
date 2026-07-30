@@ -46,6 +46,20 @@ bool IsInitializePipe(const CallPtr& call);
 /// propagation and the tpop lifetime / tfree finalizer.
 bool IsBufferAliasingViewOp(const std::string& op_name);
 
+/// True when the op's output lands in a source operand's storage rather than a
+/// buffer of its own — either a buffer-aliasing view (`IsBufferAliasingViewOp`)
+/// or an in-place / accumulate op (`GetOutputReusesInputArg`).
+///
+/// Broader than `IsBufferAliasingViewOp` by the in-place / accumulate case only.
+/// Both exclude `tile.transpose`: it inherits the input's memory *space* but
+/// permutes into a fresh buffer, so it does own its storage.
+///
+/// Use this to answer "does this output get to choose its own buffer" —
+/// InitMemRef rejects a declared allocation on such an output, and MemoryReuse
+/// excludes those tiles from the co-live check because they occupy storage the
+/// source already accounts for.
+bool OutputInheritsSourceBuffer(const std::string& op_name);
+
 /// True for builtin ops whose name is namespaced `tile.` / `tensor.` /
 /// `system.` / `array.`. Builtin ops are never user Functions, so they carry
 /// no callee body and no Out/InOut params to trace.
