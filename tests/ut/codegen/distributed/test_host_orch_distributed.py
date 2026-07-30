@@ -67,8 +67,10 @@ def pass_verification_context():
         yield
 
 
-def _lower(program) -> str:
+def _lower(program, convert_to_ssa=False) -> str:
     """Apply the late host-distributed pipeline, then run distributed codegen directly."""
+    if convert_to_ssa:
+        program = passes.convert_to_ssa()(program)
     program = passes.synthesize_allreduce_signals()(program)
     program = passes.materialize_comm_domain_scopes()(program)
     program = passes.materialize_dist_tensor_ctx()(program)
@@ -1082,6 +1084,84 @@ def test_host_collective_builtin_template_package_exists(package_name, variant):
         assert (templates / name).is_file(), f"missing {name} in {package_name}"
     assert (root / "__init__.py").is_file(), f"missing __init__.py in {package_name}"
     assert variant.startswith("builtin.tensor."), variant
+
+
+# ---------------------------------------------------------------------------
+#  IfStmt phi codegen (issue #2180)
+# ---------------------------------------------------------------------------
+
+
+def test_if_cross_branch_phi_yields_tensors() -> None:
+    """Tensor phi emitted by ConvertToSSA for a cross-branch diverging variable
+    is yielded via ``tensors[...]`` assignments, not bare Python names (issue #2180)."""
+    SIZE = 4
+    P = 2
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def identity(self, x: pl.Tensor[[SIZE, SIZE], pl.FP32]) -> pl.Tensor[[SIZE, SIZE], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_run(self, x: pl.Tensor[[SIZE, SIZE], pl.FP32]) -> pl.Tensor[[SIZE, SIZE], pl.FP32]:
+            return self.identity(x)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(
+            self, x: pl.Tensor[[SIZE, SIZE], pl.FP32], zero: pl.Tensor[[SIZE, SIZE], pl.FP32]
+        ) -> pl.Scalar[pl.INT32]:
+            for r in pl.range(P):
+                if r == 0:
+                    boundary = zero
+                else:
+                    boundary = self.chip_run(x)
+                self.chip_run(boundary)
+            return 0  # pyright: ignore[reportReturnType]
+
+    code = _lower(Prog, convert_to_ssa=True)
+
+    # Sanity check: the generated Python must be syntactically valid.
+    compile(code, "<host_orch>", "exec")
+
+    # Locate the ``if`` line via line-anchored regex (avoids false matches
+    # on substrings within comments, identifiers, or guard lines).
+    lines = code.splitlines()
+    if_idx = None
+    for i, line in enumerate(lines):
+        if re.search(r"^\s*if\s+.*:\s*$", line):
+            if_idx = i
+            break
+    assert if_idx is not None, f"No if statement found in generated code:\n{code}"
+
+    # Find the matching ``else:`` at the same indent level.
+    if_indent = len(lines[if_idx]) - len(lines[if_idx].lstrip())
+    else_idx = None
+    for i in range(if_idx + 1, len(lines)):
+        stripped = lines[i].lstrip()
+        if stripped.startswith("else:") and (len(lines[i]) - len(stripped)) == if_indent:
+            else_idx = i
+            break
+    assert else_idx is not None, f"No else at indent level {if_indent} in generated code:\n{code}"
+
+    then_block = "\n".join(lines[if_idx + 1 : else_idx])
+    else_block = "\n".join(lines[else_idx + 1 :])
+
+    # Both branches must emit a tensors-based phi assignment so the merged
+    # scope has a single ``tensors["boundary__phi_v<...>"]`` entry.
+    phi_yield_pat = r'tensors\["boundary__phi_v\d+"\]\s*=\s*tensors\["[^"]+"\]'
+    assert re.search(phi_yield_pat, then_block), (
+        "Then-branch must yield tensor phi via tensors[...] = tensors[...]:\n" + code
+    )
+    assert re.search(phi_yield_pat, else_block), (
+        "Else-branch must yield tensor phi via tensors[...] = tensors[...]:\n" + code
+    )
+
+    # No bare-Python-name tensor assignment in the then-branch (the bug was
+    # ``boundary__ssa_v0 = zero__ssa_v0`` which raised NameError).
+    assert not re.search(r"boundary__ssa_v\d+\s*=.*\w+__ssa", then_block), (
+        "Then-branch must not contain bare Python tensor assignments:\n" + code
+    )
 
 
 if __name__ == "__main__":

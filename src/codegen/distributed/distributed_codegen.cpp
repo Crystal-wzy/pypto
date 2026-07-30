@@ -39,6 +39,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -759,6 +760,23 @@ void DistributedCodegen::VisitStmt_(const ir::AssignStmtPtr& op) {
     return;
   }
 
+  // Tensor→tensor alias: ``t = kernel_param`` — emit as a tensors-dict
+  // reference so both names resolve via ``tensors[...]`` in the generated
+  // Python.  Bare Python names for tensors are invisible to the prepared
+  // runtime's tensor registry (issue #2180).
+  // Only plain TensorType (not DistributedTensorType) goes through the
+  // tensors dict; distributed tensors use window_buffer_ references.
+  if (ir::As<ir::TensorType>(op->var_->GetType()) && ir::AsVarLike(op->value_)) {
+    VisitExpr(op->value_);
+    if (!current_expr_value_.empty()) {
+      emitter_.EmitLine("tensors[\"" + var_name + "\"] = tensors[\"" + current_expr_value_ + "\"]");
+      declared_vars_.insert(var_name);
+      current_expr_value_ = "";
+    }
+    current_target_var_ = "";
+    return;
+  }
+
   // Standard expression
   VisitExpr(op->value_);
 
@@ -829,19 +847,46 @@ void DistributedCodegen::VisitStmt_(const ir::ForStmtPtr& op) {
 void DistributedCodegen::VisitStmt_(const ir::IfStmtPtr& op) {
   INTERNAL_CHECK(op != nullptr) << "Internal error: null IfStmt";
 
+  // ConvertToSSA always appends an else carrying the phi's incoming values
+  // (convert_to_ssa_pass.cpp:936-939), so a phi is always defined on both paths.
+  INTERNAL_CHECK_SPAN(op->return_vars_.empty() || op->else_body_.has_value(), op->span_)
+      << "Internal error: IfStmt with return_vars_ must carry an else_body "
+         "holding the phi's incoming values";
+
   VisitExpr(op->condition_);
-  std::string condition = current_expr_value_;
+  const std::string condition = current_expr_value_;
   current_expr_value_ = "";
+
+  // Merge each branch's yield into the phi name so post-if consumers see one
+  // name instead of a branch-local SSA name (issue #2180).
+  auto emit_yields = [&](const ir::StmtPtr& body) {
+    const auto yld = ir::transform_utils::GetLastYieldStmt(ir::transform_utils::UnwrapAutoScope(body));
+    if (!yld) return;
+    for (size_t i = 0; i < op->return_vars_.size() && i < yld->value_.size(); ++i) {
+      VisitExpr(yld->value_[i]);
+      const std::string val = current_expr_value_;
+      current_expr_value_ = "";
+      const std::string phi = SanitizeName(op->return_vars_[i]->name_hint_);
+      if (ir::AsTensorTypeLike(op->return_vars_[i]->GetType())) {
+        emitter_.EmitLine("tensors[\"" + phi + "\"] = tensors[\"" + val + "\"]");
+      } else {
+        emitter_.EmitLine(phi + " = " + val);
+      }
+      declared_vars_.insert(phi);
+    }
+  };
 
   emitter_.EmitLine("if " + condition + ":");
   emitter_.IncreaseIndent();
   VisitStmt(op->then_body_);
+  emit_yields(op->then_body_);
   emitter_.DecreaseIndent();
 
   if (op->else_body_.has_value()) {
     emitter_.EmitLine("else:");
     emitter_.IncreaseIndent();
     VisitStmt(*op->else_body_);
+    emit_yields(*op->else_body_);
     emitter_.DecreaseIndent();
   }
 }
