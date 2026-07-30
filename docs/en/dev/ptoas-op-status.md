@@ -65,7 +65,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | **DMA Data Movement (10)** |  |  |  |  |  |  |  |  |
 | pto.tload | TLOAD | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tprefetch | TPREFETCH | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
-| pto.tprefetch_async | TPREFETCH_ASYNC | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
+| pto.tprefetch_async | TPREFETCH_ASYNC | tile | ✅ | ❌ | ❌ | ✅ | — | Emitted by `pl.prefetch.*` (`make_context` / `async_prefetch` / `session` / `wait`); not a tile/tensor frontend. PTOAS op availability does not imply runtime SDMA workspace provision; artifact metadata enables it automatically, with ST coverage currently limited to onboard a2a3. Platforms without a provider fail during initialization rather than degrading to a no-op |
 | pto.make_prefetch_async_context | pto::PrefetchAsyncContext | internal | ✅ | — | — | — | — | validated as part of async-prefetch integration |
 | pto.get_prefetch_async_session | .session | internal | ✅ | — | — | — | — | validated as part of async-prefetch integration |
 | pto.tstore | TSTORE | tile | ✅ | ✅ | ❌ | ✅ | — |  |
@@ -273,6 +273,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | **Source Compatibility / Manual Mode (1)** |  |  |  |  |  |  |  |  |
 | pto.tassign | TASSIGN | internal | ✅ | — | — | — | — | inactive backend hook; no standalone ST |
 
-**Stats**: 204 public/compatibility PTOAS ops; 113 have a pypto tile frontend and 75 have a tensor frontend;
-110 have same-name ST coverage (106 regular STs and 4 distributed STs); 62 lack same-name ST coverage
-(52 regular and 10 distributed); within these 204, another 32 ops are not suitable for standalone STs.
+**Stats**: 204 public/compatibility PTOAS ops; 113 have a pypto tile frontend and 75 have a tensor frontend
+(plus four non-tile/tensor `pl.prefetch.*` ops); 111 have same-name ST coverage
+(107 regular STs and 4 distributed STs); 61 lack same-name ST coverage (51 regular and 10 distributed);
+within these 204, another 32 ops are not suitable for standalone STs.

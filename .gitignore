@@ -135,6 +135,7 @@ dmypy.json
 .history/
 .agent/
 .copilot/
+docs/superpowers/
 
 # Local Superpowers design, plan, and execution artifacts
 .superpowers/

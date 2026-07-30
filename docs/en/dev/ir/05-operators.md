@@ -10,6 +10,7 @@ Type-safe operator definitions with automatic type deduction, organized into mod
 | **TileOp** | TileType | Hardware-optimized tile operations | `src/ir/op/tile_ops/` |
 | **SyncOp** | UnknownType (barriers); ScalarType (task / launch queries) | Pipeline barriers, synchronization, TaskId and SPMD launch-shape queries | `src/ir/op/sync_ops/` |
 | **CrossCoreOp** | UnknownType/TileType | AIC↔AIV cross-core communication | `src/ir/op/sync_ops/cross_core.cpp` |
+| **PrefetchOp** | Opaque handles | Asynchronous GM→L2 cache prefetch | `src/ir/op/prefetch/prefetch_async.cpp` |
 
 **Key Features**: Fluent API, automatic type deduction, kwargs for metadata, NumPy-style broadcasting, type promotion, dynamic dimensions (`kDynamicDim`)
 
@@ -464,6 +465,80 @@ class CrossCoreExample:
 
 See [TPUSH/TPOP ISA Reference](../../reference/pto-isa/01-tpush_tpop.md) and [Buffer Management](../../reference/pto-isa/02-buffer_management.md) for hardware details.
 
+## PrefetchOp: Asynchronous GM→L2 Prefetch
+
+A latency-hiding cache hint. `async_prefetch` starts an SDMA-backed pull of a
+global-memory region into L2 while unrelated compute proceeds; `wait` blocks
+until it lands. The prefetch changes no tensor values — a kernel is numerically
+identical with or without it, so only performance differs.
+
+Unlike most PTO intrinsics, `TPREFETCH_ASYNC` carries no implicit wait-event
+synchronization, so completion is explicit via an event/session pair.
+
+### Operations
+
+| DSL | Operands | Result | PTOAS op |
+| --- | -------- | ------ | -------- |
+| `pl.prefetch.make_context()` | None | `PrefetchAsyncContextType` | `pto.make_prefetch_async_context` |
+| `pl.prefetch.async_prefetch(src, ctx)` | GM Tensor, context | `AsyncEventType` | `pto.tprefetch_async` |
+| `pl.prefetch.session(ctx)` | context | `AsyncSessionType` | `pto.get_prefetch_async_session` |
+| `pl.prefetch.wait(evt, session)` | event, session | `BOOL` scalar | `pto.comm.wait_async_event` |
+
+The three result types are opaque singleton markers (no shape, no buffer), in
+the same family as `CommCtxType`. The SDMA workspace is not a program operand:
+the runtime owns it, and codegen injects a hidden pointer into prefetch kernels.
+
+### Constraints
+
+- `src` must be a **flat contiguous logical-1D GM** region: a fully static shape
+  whose dimensions are all `1` except the last (`[N]`, `[1, N]`, `[1, 1, N]`).
+  This mirrors the PTOAS `TPrefetchAsyncOp::verify()` check, so a shape mistake
+  fails at PyPTO IR construction rather than at PTOAS verification.
+
+### Example Usage
+
+```python
+@pl.program
+class PrefetchExample:
+    @pl.function(type=pl.FunctionType.InCore)
+    def main(
+        self, x: pl.Tensor[[1, 4096], pl.FP32],
+        out: pl.Tensor[[1, 128], pl.FP32],
+    ) -> pl.Tensor[[1, 128], pl.FP32]:
+        ctx = pl.prefetch.make_context()
+        evt = pl.prefetch.async_prefetch(x, ctx)     # warms L2, does not block
+        session = pl.prefetch.session(ctx)
+        # ... unrelated compute overlaps the prefetch ...
+        pl.prefetch.wait(evt, session)               # x is now resident in L2
+        tile = pl.load(x, [0, 0], [1, 128])
+        return pl.store(tile, [0, 0], out)
+```
+
+**Core placement**: this family is **AIV-only**. `TPREFETCH_ASYNC` drives its
+SDMA `tmpBuf` from a Vec(UB) scratch tile held inside `PrefetchAsyncContext`
+(pto-isa static_asserts `ScratchTile::Loc == TileType::Vec`), and UB lives on
+the vector core. The ops declare `CoreAffinity::VECTOR`, so in a mixed kernel
+`ExpandMixedKernel` keeps them on the vector lane — they are neither placed on
+nor duplicated onto the cube lane.
+
+**Runtime ownership and support**: normal one-shot execution reads the generated
+artifact's SDMA requirement and automatically constructs an enabled worker. No
+workspace appears in the user, orchestration, or runtime tensor signature. For
+an explicitly reused L2 worker, opt in when constructing it:
+
+```python
+with ChipWorker(
+    config=RunConfig(platform="a2a3", device_id=0), enable_sdma=True
+):
+    compiled(a, out, config=cfg)
+```
+
+The current runtime-provisioned execution path is covered only on onboard a2a3.
+An enabled worker on simulator, a5, or another runtime without an SDMA provider
+fails during runtime initialization. PyPTO does not allocate a fallback
+workspace or silently turn a requested prefetch into a no-op. See
+`tests/st/runtime/ops/test_prefetch_async.py` for the a2a3 system test.
+
 ## File Organization
 
 | Directory/File | Contents |
@@ -478,6 +553,7 @@ See [TPUSH/TPOP ISA Reference](../../reference/pto-isa/01-tpush_tpop.md) and [Bu
 | `sync_ops/task.cpp` | SyncOp: TaskId sentinel and predicate |
 | `sync_ops/launch.cpp` | SyncOp: SPMD launch-shape queries |
 | `sync_ops/cross_core.cpp` | CrossCoreOp: tpush, tpop, pipe init, buffers |
+| `prefetch/prefetch_async.cpp` | PrefetchOp: make_context, async_prefetch, session, wait |
 
 **Benefits**:
 

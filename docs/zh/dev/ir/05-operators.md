@@ -10,6 +10,7 @@
 | **TileOp** | TileType | 硬件优化的 Tile 操作 | `src/ir/op/tile_ops/` |
 | **SyncOp** | UnknownType（屏障）；ScalarType（task / 启动形状查询） | 流水线屏障、同步、TaskId 与 SPMD 启动形状查询 | `src/ir/op/sync_ops/` |
 | **CrossCoreOp** | UnknownType/TileType | AIC↔AIV 跨核通信 | `src/ir/op/sync_ops/cross_core.cpp` |
+| **PrefetchOp** | 不透明句柄 (opaque handle) | GM→L2 异步预取 | `src/ir/op/prefetch/prefetch_async.cpp` |
 
 **主要特性**：流式 API、自动类型推导、kwargs 元数据、NumPy 风格广播、类型提升、动态维度（`kDynamicDim`）
 
@@ -456,6 +457,77 @@ class CrossCoreExample:
 
 参阅 [TPUSH/TPOP ISA 参考](../../reference/pto-isa/01-tpush_tpop.md) 和[缓冲区管理](../../reference/pto-isa/02-buffer_management.md)了解硬件细节。
 
+## PrefetchOp：GM→L2 异步预取
+
+一种隐藏访存延迟 (latency hiding) 的缓存提示。`async_prefetch` 通过 SDMA 异步地把一段
+全局内存 (GM) 拉入 L2 缓存，期间可以并行执行不相关的计算；`wait` 阻塞直到预取完成。
+预取不改变任何张量的值——同一个 kernel 加不加预取在数值上完全一致，只影响性能。
+
+与大多数 PTO intrinsic 不同，`TPREFETCH_ASYNC` 不携带隐式的 wait-event 同步，
+因此必须通过 event/session 这对句柄显式等待完成。
+
+### 操作
+
+| DSL | 操作数 | 结果 | PTOAS op |
+| --- | ------ | ---- | -------- |
+| `pl.prefetch.make_context()` | 无 | `PrefetchAsyncContextType` | `pto.make_prefetch_async_context` |
+| `pl.prefetch.async_prefetch(src, ctx)` | GM Tensor、context | `AsyncEventType` | `pto.tprefetch_async` |
+| `pl.prefetch.session(ctx)` | context | `AsyncSessionType` | `pto.get_prefetch_async_session` |
+| `pl.prefetch.wait(evt, session)` | event、session | `BOOL` 标量 | `pto.comm.wait_async_event` |
+
+这三个结果类型都是不透明的单例标记类型 (opaque singleton marker，无 shape、无 buffer)，
+与 `CommCtxType` 属于同一族。SDMA workspace 不是程序操作数：runtime 持有它，
+codegen 会向 prefetch kernel 注入隐藏指针。
+
+### 约束
+
+- `src` 必须是**扁平连续的逻辑一维 GM** 区域：shape 必须完全静态，且除最后一维外
+  所有维度都为 `1`（`[N]`、`[1, N]`、`[1, 1, N]`）。该检查与 PTOAS 的
+  `TPrefetchAsyncOp::verify()` 保持一致，因此 shape 写错会在 PyPTO IR 构造阶段就报错，
+  而不是拖到 PTOAS 校验阶段。
+
+### 使用示例
+
+```python
+@pl.program
+class PrefetchExample:
+    @pl.function(type=pl.FunctionType.InCore)
+    def main(
+        self, x: pl.Tensor[[1, 4096], pl.FP32],
+        out: pl.Tensor[[1, 128], pl.FP32],
+    ) -> pl.Tensor[[1, 128], pl.FP32]:
+        ctx = pl.prefetch.make_context()
+        evt = pl.prefetch.async_prefetch(x, ctx)     # 预热 L2，不阻塞
+        session = pl.prefetch.session(ctx)
+        # ... 此处的无关计算与预取重叠执行 ...
+        pl.prefetch.wait(evt, session)               # 此时 x 已驻留在 L2
+        tile = pl.load(x, [0, 0], [1, 128])
+        return pl.store(tile, [0, 0], out)
+```
+
+**执行核**：这一族是 **AIV-only**。`TPREFETCH_ASYNC` 的 SDMA `tmpBuf` 来自
+`PrefetchAsyncContext` 内部的 Vec(UB) scratch tile（pto-isa 有
+`static_assert(ScratchTile::Loc == TileType::Vec)`），而 UB 位于向量核。这些算子
+声明了 `CoreAffinity::VECTOR`，因此在混合 kernel 中 `ExpandMixedKernel` 会把它们留在
+向量侧——既不会放到 cube 侧，也不会被复制到 cube 侧。
+
+**Runtime 所有权与支持范围**：普通的单次执行 (one-shot execution) 会读取
+生成 artifact 中的 SDMA 需求，并自动创建已启用 SDMA 的 worker。user、
+orchestration 和 runtime tensor signature 中都不会出现 workspace。显式复用
+L2 worker 时，需在构造时启用该能力：
+
+```python
+with ChipWorker(
+    config=RunConfig(platform="a2a3", device_id=0), enable_sdma=True
+):
+    compiled(a, out, config=cfg)
+```
+
+当前由 runtime 提供 workspace 的执行路径仅在 onboard a2a3 上覆盖。在模拟器、
+a5 或不提供 SDMA provider 的 runtime 上，启用该能力的 worker 会在 runtime
+初始化时失败。PyPTO 不会分配后备 workspace，也不会把请求的 prefetch
+静默降级为 no-op。onboard a2a3 ST 参见 `tests/st/runtime/ops/test_prefetch_async.py`。
+
 ## 文件组织
 
 | 目录/文件 | 内容 |
@@ -470,6 +542,7 @@ class CrossCoreExample:
 | `sync_ops/task.cpp` | SyncOp：TaskId 哨兵与判定 |
 | `sync_ops/launch.cpp` | SyncOp：SPMD 启动形状查询 |
 | `sync_ops/cross_core.cpp` | CrossCoreOp: tpush, tpop, pipe init, buffers |
+| `prefetch/prefetch_async.cpp` | PrefetchOp: make_context, async_prefetch, session, wait |
 
 **优势**：
 
