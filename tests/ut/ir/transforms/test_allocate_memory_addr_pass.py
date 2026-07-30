@@ -9,6 +9,7 @@
 
 import re
 
+import pypto
 import pypto.language as pl
 import pytest
 from pypto import ir, passes
@@ -167,7 +168,7 @@ def test_allocate_memory_addr_rejects_overlapping_reserve_buffer_ranges():
     with pytest.raises(
         # Message is now emitted by the shared reserve_buffer_utils resolver (used by both
         # AllocateMemoryAddr and MemoryReuse), so match the pass-agnostic substring.
-        Exception,
+        pypto.InternalError,
         match=re.escape("overlapping reserve_buffer ranges"),
     ):
         program = passes.init_mem_ref()(Before)
@@ -520,7 +521,7 @@ def test_allocated_memory_addr_verifier_errors_when_vec_exceeds_safe_cap():
         pipeline = passes.PassPipeline()
         pipeline.add_pass(passes.allocate_memory_addr())
         with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.AFTER)]):
-            with pytest.raises(ValueError, match=r"Vec buffer usage .* exceeds platform limit"):
+            with pytest.raises(pypto.Error, match=r"Vec buffer usage .* exceeds platform limit"):
                 pipeline.run(program)
     finally:
         reset_for_testing()
