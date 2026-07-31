@@ -52,6 +52,20 @@ b: pl.Tensor[[n, m], pl.INT64]     # Symbolic shape
 t: pl.Tile[[16, 16], pl.FP16]
 ```
 
+### Tensor Layout and View
+
+The third subscript element is a layout or a `pl.TensorView`, each written inline or
+held in a variable — bind it once to share one view across several parameters. A
+layout is shorthand for a stride-less view, so every form yields a `TensorView`.
+Same slot and spellings for `pl.DistributedTensor`.
+
+```python
+STRIDED = pl.TensorView(stride=[128, 1], layout=pl.TensorLayout.ND)
+
+x: pl.Tensor[[32, 64], pl.FP32, pl.NZ]      # layout, inline
+y: pl.Tensor[[32, 64], pl.FP32, STRIDED]    # view, by variable
+```
+
 ### Memory References (MemRef)
 
 ```python

@@ -52,6 +52,19 @@ b: pl.Tensor[[n, m], pl.INT64]     # Symbolic shape
 t: pl.Tile[[16, 16], pl.FP16]
 ```
 
+### 张量布局 (Layout) 和视图 (TensorView)
+
+下标第三个元素是布局 (layout) 或 `pl.TensorView`，两者均可内联书写或绑定到变量——
+绑定一次即可在多个参数间共享同一视图。布局是"无 stride 视图"的简写，因此各种写法
+最终都会解析为一个 `TensorView`。`pl.DistributedTensor` 的下标位置与写法相同。
+
+```python
+STRIDED = pl.TensorView(stride=[128, 1], layout=pl.TensorLayout.ND)
+
+x: pl.Tensor[[32, 64], pl.FP32, pl.NZ]      # 布局，内联
+y: pl.Tensor[[32, 64], pl.FP32, STRIDED]    # 视图，通过变量
+```
+
 ### 内存引用 (MemRef)
 
 ```python
