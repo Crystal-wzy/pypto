@@ -210,13 +210,48 @@ walls. Query the four metrics uniformly:
 ```python
 stats.per_round("device" | "host" | "effective" | "union")  # -> [one value per round]
 stats.per_rank("device" | "host" | "effective")             # -> {pid: [one per round]}
+stats.per_dispatch("device" | "host" | "effective")         # -> {(pid, slot): [one per round]}
 ```
 
-Both views aggregate **per rank per round**: each entry sums that rank's
-dispatches within the round (a card runs its dispatches serially), so they are
-per-round-per-rank figures, **not** per-dispatch. When a rank runs exactly one
-dispatch per round the sum is that single dispatch's value; for the individual
-dispatches in any case, read `stats.rounds_dispatches[k][pid]` (see below).
+`per_round` / `per_rank` aggregate **per rank per round**: each entry sums that
+rank's dispatches within the round (a card runs its dispatches serially), so they
+are per-round-per-rank busy figures, **not** per-dispatch.
+
+`per_dispatch` is the un-fused view — it sums nothing. It keys on `(pid, slot)`,
+where `slot` is the dispatch's position within its rank's round. A rank that
+issues several dispatches per round therefore keeps one series per dispatch
+instead of a single summed number.
+
+A slot only identifies a dispatch if the rank issues the same callables in the
+same order every round. A constant dispatch count does not guarantee that, so
+the parse checks it: if any slot carried more than one task across the rounds,
+`stats.unstable_dispatch_slots` is set and the per-dispatch views report empty
+rather than averaging distinct kernels under the first round's label. Round
+boundaries are unaffected, so `per_rank` / `per_round` stay valid.
+`stats.dispatch_tasks()` labels each slot with the orchestration function it
+runs, and `stats.dispatch_groups()` returns the underlying `TraceInvocation` per
+round.
+
+```python
+stats.per_dispatch("device")   # {(4242, 0): [4.1, 3.8, ...], (4242, 1): [6.3, 6.5, ...]}
+stats.dispatch_tasks()         # {(4242, 0): "prefill_orch", (4242, 1): "decode_orch"}
+```
+
+The markers themselves carry no name — only `hid`, the ELF Build-ID of the
+callable's orchestration `.so` (still available as `TraceInvocation.task`). pypto
+recovers the name by recomputing that Build-ID over the same `.so` bytes it hands
+the runtime, and pairing it with that orchestration's generated name at assemble time
+(`TraceInvocation.task_name`). The label falls back to the raw hash when the
+pairing is unavailable: on `*sim` platforms (whose host seeds `hid` with the
+runtime `callable_id` instead of a Build-ID), or for a callable assembled in a
+different process.
+
+The mean-tree views are dispatch-aware too: on an L3 run
+`print_mean_tree()` renders **one tree per `(pid, slot)`** rather than one tree
+averaging a rank's different kernels together, and `pid=` / `slot=` narrow it to a
+single dispatch. `format_tree()`'s launch headers carry `round=` / `slot=` for the
+same reason. `mean_invocation()` returns a single tree, so it raises unless
+`pid=` / `slot=` select one dispatch.
 
 `effective` is the orch∪sched on-device window (per-card L2 Effective); `union`
 is the cross-rank host-timeline window (captures start skew — host-domain, so it
