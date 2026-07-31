@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -116,8 +117,32 @@ std::optional<uint64_t> ShapedTypeSizeBytes(const ShapedTypePtr& type) {
 // Author-declared allocations (`pl.Tile[..., pl.MemRef("name"), ...]`)
 // ============================================================================
 
-/// Base Ptr of a declared allocation -> the size it must hold (largest bound tile).
-using DeclaredAllocMap = std::map<const Var*, uint64_t>;
+/// Slot geometry derived for one declared allocation.
+struct DeclaredAlloc {
+  uint64_t slot_size = 0;  ///< Bytes per slot — the largest tile bound to any slot
+  /// How many slots the author declared; 0 until the first binding records it.
+  /// The sentinel must be a value a real declaration can never carry — 1 would
+  /// collide with an ordinary unsubscripted declaration, and a later, genuinely
+  /// different count would then overwrite it instead of tripping the mismatch
+  /// check. `Record` rejects anything below 1, so 0 is safe.
+  uint64_t slot_count = 0;
+
+  /// Total bytes to allocate: every slot is the same size and they sit contiguously,
+  /// which is what makes `slot_index * slot_size` a valid offset.
+  ///
+  /// Both factors are author-controlled (`slots=N` and the bound tile's shape), so
+  /// the product is checked rather than assumed: wrapping would turn an absurd
+  /// request into a *small* allocation and hand out addresses inside it.
+  [[nodiscard]] uint64_t TotalSize() const {
+    CHECK(slot_count == 0 || slot_size <= std::numeric_limits<uint64_t>::max() / slot_count)
+        << "Declared allocation is too large: " << slot_count << " slots of " << slot_size
+        << " bytes overflows a 64-bit size";
+    return slot_size * slot_count;
+  }
+};
+
+/// Base Ptr of a declared allocation -> its slot geometry.
+using DeclaredAllocMap = std::map<const Var*, DeclaredAlloc>;
 
 /// The declared-allocation MemRef `type` carries, or null when it carries none.
 ///
@@ -166,8 +191,21 @@ class DeclaredAllocCollector : public IRVisitor {
         << "Tile '" << var->name_hint_ << "' is bound to the declared allocation '" << base->name_hint_
         << "' but has a dynamic shape; a declared allocation must be sized at compile time";
 
-    auto& buffer_size = buffers[base.get()];
-    buffer_size = std::max(buffer_size, *size);
+    auto& alloc = buffers[base.get()];
+    // One slot must hold the largest tile bound to ANY slot: the slots are
+    // uniform, so a per-slot size would make the stride inconsistent.
+    alloc.slot_size = std::max(alloc.slot_size, *size);
+
+    CHECK_SPAN(binding->slot_count_ >= 1, var->span_)
+        << "Declared allocation '" << base->name_hint_ << "' must have at least one slot, got "
+        << binding->slot_count_;
+    if (alloc.slot_count == 0) {
+      alloc.slot_count = binding->slot_count_;
+    }
+    CHECK_SPAN(alloc.slot_count == binding->slot_count_, var->span_)
+        << "References to the declared allocation '" << base->name_hint_
+        << "' disagree on how many slots it has (" << alloc.slot_count << " vs " << binding->slot_count_
+        << "); one declaration has one slot count";
 
     if (tile_type->memory_space_.has_value()) {
       auto [it, inserted] = spaces_.emplace(base.get(), *tile_type->memory_space_);
@@ -194,7 +232,7 @@ class InitMemRefMutator : public IRMutator {
     return binding && declared_allocs_.count(binding->base_.get()) > 0;
   }
 
-  /// The MemRef a user binding asks for, sized from the whole bound set.
+  /// The MemRef a user binding asks for, sized to the slot it selects.
   /// Returns nullopt when `type` carries no binding.
   std::optional<MemRefPtr> UserBoundMemRef(const TypePtr& type) const {
     if (declared_allocs_.empty()) return std::nullopt;
@@ -203,9 +241,44 @@ class InitMemRefMutator : public IRMutator {
     auto it = declared_allocs_.find(binding->base_.get());
     if (it == declared_allocs_.end()) return std::nullopt;
     // Every bound tile gets the SAME base Ptr — that shared identity is what
-    // makes them share storage — sized to the largest member so the buffer
-    // holds any of them.
-    return std::make_shared<MemRef>(binding->base_, binding->byte_offset_, it->second);
+    // makes them share storage — and the slot index becomes the byte offset:
+    // `index * slot_size`. A constant index folds here, so a single-slot or
+    // constant-slot declaration keeps the ConstInt offset every downstream pass
+    // already expects. A runtime index survives as an expression that
+    // AllocateMemoryAddr adds the base address to and codegen lowers into the
+    // tile's address assignment.
+    //
+    // Size is ONE SLOT, not the whole allocation: `size_` is the extent of the
+    // region this MemRef denotes, and `[offset, offset + size_)` is the range
+    // `MayAlias` intersects and the address verifier bounds-checks. Sizing a slot
+    // to the whole set would make slot 1 of two span `[S, 3S)` — overrunning the
+    // allocation for the verifier, and overlapping slot 0 for MayAlias, which
+    // would report the ping-pong's two halves as aliasing. The allocation itself
+    // is sized to the full set separately, where the alloc statement is built.
+    return std::make_shared<MemRef>(binding->base_, SlotByteOffset(*binding, it->second),
+                                    it->second.slot_size);
+  }
+
+  /// The byte offset a declaration's slot index denotes, folded when constant.
+  ///
+  /// Returns `binding`'s own offset untouched for an unsubscripted declaration —
+  /// there is no slot arithmetic to do, and slot 0 of a 1-slot allocation is the
+  /// allocation itself.
+  static ExprPtr SlotByteOffset(const MemRef& binding, const DeclaredAlloc& alloc) {
+    if (!binding.slot_index_.has_value() || !*binding.slot_index_) return binding.byte_offset_;
+    const ExprPtr& slot_index = *binding.slot_index_;
+    const auto& span = binding.span_;
+    if (auto const_index = As<ConstInt>(slot_index)) {
+      return std::make_shared<ConstInt>(
+          static_cast<int64_t>(static_cast<uint64_t>(const_index->value_) * alloc.slot_size), DataType::INT64,
+          span);
+    }
+    // INDEX for the runtime product: the index comes from loop variables, which are
+    // INDEX-typed, and the existing dynamic-offset expressions (tile.slice views)
+    // are built the same way. Codegen widens to the i64 the PTOAS `alloc_tile` addr
+    // operand wants when it lowers the address.
+    auto stride = std::make_shared<ConstInt>(static_cast<int64_t>(alloc.slot_size), DataType::INDEX, span);
+    return std::make_shared<Mul>(slot_index, stride, DataType::INDEX, span);
   }
 
   // Resolve memory space from TileType::memory_space_ field (set by InferTileMemorySpace),
@@ -751,8 +824,12 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
   alloc_stmts.reserve(memrefs.size());
   for (const auto& [memref, memory_space] : memrefs) {
     if (seen_bases.insert(memref->base_.get()).second) {
-      const bool pinned = declared_allocs.count(memref->base_.get()) > 0;
-      alloc_stmts.push_back(CreateAllocStatement(memref, memory_space, pinned));
+      // A declared allocation covers all its slots; the MemRef that happens to be
+      // seen first names only one of them, so take the size from the collector.
+      auto declared = declared_allocs.find(memref->base_.get());
+      const bool pinned = declared != declared_allocs.end();
+      auto alloc_size = pinned ? std::make_optional(declared->second.TotalSize()) : std::optional<uint64_t>{};
+      alloc_stmts.push_back(CreateAllocStatement(memref, memory_space, pinned, alloc_size));
     }
   }
 
