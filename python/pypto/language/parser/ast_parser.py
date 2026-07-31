@@ -491,6 +491,13 @@ _AT_STASH_KWARGS = {
     "dumps": "dumps_kw",
 }
 
+# Call attrs that never appear inside a printed ``attrs={...}`` dict. On
+# ``system.task_dummy`` they ride bespoke surfaces (``manual_dep_edges`` prints
+# as ``deps=[...]``; ``dummy_task`` is re-derived from the op), and the printer
+# rejects them on every other op. Accepting either from a generic attrs dict
+# would build IR that cannot be printed back.
+_TASK_DUMMY_ONLY_ATTRS = frozenset({"manual_dep_edges", "dummy_task"})
+
 
 def _split_spmd_for_loop_name_hints(name_hint: str) -> tuple[str, str]:
     """Map one ``for i in pl.spmd(..., name_hint=...)`` hint to Spmd vs InCore names.
@@ -7294,6 +7301,14 @@ class ASTParser:
                 "unsupported kind (expected all ints, all pl.adir.<name>, or all names)",
                 span=node_span,
             )
+        # ``pl.<DTYPE>`` -> DataType. The printer emits DataType attrs in this
+        # form (PrintAttrValue's DataType arm), and ``parse_expression`` has no
+        # way to represent a dtype, so resolve it before the generic fallback.
+        if isinstance(value_node, ast.Attribute):
+            try:
+                return self.type_resolver.resolve_dtype(value_node)
+            except ParserTypeError:
+                pass
         # Bare name -> Var; any other expression -> the parsed IR expression.
         return self.parse_expression(value_node)
 
@@ -7676,6 +7691,12 @@ class ASTParser:
         wrappers / IR builders take no attrs parameter, so the dispatch helpers
         parse it here and re-attach it via ``ir.set_call_attrs`` after building
         the call. Returns ``None`` when no ``attrs=`` kwarg is present.
+
+        Values are read by ``_parse_attr_value`` — the same open-world reader the
+        GlobalVar-call / Submit paths use — so every type the printer's
+        ``PrintAttrValue`` can emit round-trips. No key allowlist: the writer
+        (``print_serialized_attrs``) is a denylist, so a key without a bespoke
+        surface must be recoverable here or the round-trip silently loses it.
         """
         for keyword in call.keywords:
             if keyword.arg != "attrs":
@@ -7685,8 +7706,38 @@ class ASTParser:
                     "op attrs must be a dict literal",
                     span=self.span_tracker.get_span(keyword.value),
                 )
-            return self._parse_attrs_dict(keyword.value)
+            return self._parse_generic_attrs_dict(ast.unparse(call.func), keyword.value)
         return None
+
+    def _parse_generic_attrs_dict(self, method_name: str, node: ast.Dict) -> dict[str, object]:
+        """Read an open-world ``attrs={...}`` dict literal via ``_parse_attr_value``.
+
+        Only the string-literal-key invariant is enforced; each value's type is
+        inferred from syntax by ``_parse_attr_value``, whose matching writer is
+        ``PrintAttrValue`` in the C++ python printer.
+        """
+        result: dict[str, object] = {}
+        for key_node, value_node in zip(node.keys, node.values):
+            if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+                raise ParserSyntaxError(
+                    "attrs keys must be string literals",
+                    span=self.span_tracker.get_span(key_node) if key_node else None,
+                )
+            key = key_node.value
+            if key in _TASK_DUMMY_ONLY_ATTRS:
+                # The printer never emits these into ``attrs={...}``: on
+                # ``system.task_dummy`` they ride the bespoke ``deps=`` surface
+                # (and ``dummy_task`` is re-derived from the op), and on any
+                # other op the printer rejects them outright. Accepting one here
+                # would build IR that cannot be printed back.
+                raise ParserSyntaxError(
+                    f"attrs['{key}'] on call to '{method_name}' is not a writable attr; "
+                    "manual dependency edges are written as deps=[...] on "
+                    "pl.system.task_dummy or pl.submit",
+                    span=self.span_tracker.get_span(value_node),
+                )
+            result[key] = self._parse_attr_value(method_name, key, value_node)
+        return result
 
     @staticmethod
     def _attach_op_attrs(result: ir.Expr, attrs: dict[str, object] | None) -> ir.Expr:
@@ -8037,7 +8088,10 @@ class ASTParser:
                 "pl.system.task_dummy must not use positional arguments",
                 span=span,
             )
-        allowed_kwargs = {"deps"}
+        # ``attrs=`` is the machine-only round-trip surface, not a user API: the
+        # printer's denylist emits every non-bespoke attr into it, so rejecting
+        # it here would turn a printed attr into an unparseable program.
+        allowed_kwargs = {"deps", "attrs"}
         for kw in call.keywords:
             if kw.arg not in allowed_kwargs:
                 raise ParserTypeError(
@@ -8056,6 +8110,11 @@ class ASTParser:
         attrs: list[tuple[str, Any]] = [("dummy_task", True)]
         if deps:
             attrs.append(("manual_dep_edges", deps))
+        # ``deps=`` and the op identity are the bespoke carriers for
+        # ``manual_dep_edges`` / ``dummy_task``, reconstructed above; both are
+        # rejected inside a generic attrs dict, so everything left here is an
+        # ordinary attr to recover.
+        attrs.extend((self._parse_op_attrs(call) or {}).items())
         return ir.Call(base.op, base.args, base.kwargs, attrs, base.type, base.span)
 
     def _parse_array_op(self, op_name: str, call: ast.Call) -> ir.Expr:

@@ -811,6 +811,11 @@ void IRPythonPrinter::PrintAttrValue(const std::any& value, const Span& span) {
     stream_ << std::quoted(std::any_cast<std::string>(value));
   } else if (t == typeid(double)) {
     stream_ << FormatFloatLiteral(std::any_cast<double>(value));
+  } else if (t == typeid(DataType)) {
+    // ``LowerHostTensorCollectives`` stamps a DataType attr on every
+    // ``builtin.tensor.<collective>`` call. Printed in the ``pl.<DTYPE>`` DSL
+    // form the dtype resolver reads back (ast_parser._parse_attr_value).
+    stream_ << prefix_ << "." << DataTypeToString(std::any_cast<DataType>(value));
   } else if (t == typeid(std::vector<ArgDirection>)) {
     const auto& dirs = std::any_cast<std::vector<ArgDirection>>(value);
     stream_ << "[";
@@ -852,7 +857,7 @@ void IRPythonPrinter::PrintAttrValue(const std::any& value, const Span& span) {
     // the source rather than masked by a dropped attr.
     INTERNAL_CHECK_SPAN(false, span)
         << "Internal error: no DSL attr-value codec for type '" << DemangleTypeName(t.name())
-        << "'. The python printer round-trips int/bool/str/double/vector<ArgDirection>/"
+        << "'. The python printer round-trips int/bool/str/double/DataType/vector<ArgDirection>/"
            "vector<int32_t>/vector<VarPtr>/VarPtr/ExprPtr attrs; add a PrintAttrValue arm, a "
            "matching _parse_attr_value case, and ConvertKwargsDict support for this type instead "
            "of dropping it.";
@@ -1018,18 +1023,34 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     stream_ << op_name << "(";
   }
 
-  // Serialize ONLY op-call attrs that genuinely need to survive print -> parse,
-  // via an explicit allowlist. Most attrs are re-derived by the parser or have
-  // bespoke syntax. ``pipeline_membership`` and the compiler-generated
-  // Tensor-to-Mat bridge provenance have neither and must survive until their
-  // downstream passes consume them. Keep this helper available to special call
-  // forms below so an early return cannot silently drop either attr.
+  // Serialize op-call attrs into a trailing machine-only ``attrs={...}`` dict
+  // via an open-world DENYLIST: EVERY key round-trips unless it already owns a
+  // bespoke surface. This mirrors the GlobalVar-call branch above and the
+  // Submit branch below, so the three call-like paths share one policy — a new
+  // attr on a builtin-op call can never be silently dropped on print -> parse.
+  // A value type without a codec fails loudly inside ``PrintAttrValue``
+  // (surfacing the gap) rather than vanishing. The matching reader is
+  // ``ast_parser._parse_op_attrs`` -> ``_parse_attr_value``. Keep this helper
+  // available to the special call forms below so an early return cannot skip
+  // the dict.
+  const bool is_task_dummy = IsOp(op, "system.task_dummy");
   auto print_serialized_attrs = [&](bool need_comma) {
     std::vector<const std::pair<std::string, std::any>*> serialized_attrs;
     for (const auto& kv : op->attrs_) {
-      if (kv.first == kPipelineMembershipAttr || kv.first == kCompilerTensorToTileMatBridgeAttr) {
-        serialized_attrs.push_back(&kv);
+      if (kv.first == kAttrManualDepEdges || kv.first == kAttrDummyTask) {
+        // Bespoke surfaces, but ONLY on ``system.task_dummy``: there
+        // ``manual_dep_edges`` prints as ``deps=[...]`` and ``dummy_task`` is
+        // re-derived by the parser from the op itself. On any other op neither
+        // surface exists, so skipping the key would be precisely the silent
+        // drop this denylist removes — fail loud instead. Manual dependency
+        // edges belong on ``Submit::deps_`` (ManualDepsOnSubmitOnly).
+        INTERNAL_CHECK_SPAN(is_task_dummy, op->span_)
+            << "Internal error: call to '" << op->op_->name_ << "' carries attrs[\"" << kv.first
+            << "\"], which has a DSL surface only on system.task_dummy; manual dependency edges "
+               "belong on Submit::deps_";
+        continue;
       }
+      serialized_attrs.push_back(&kv);
     }
     if (serialized_attrs.empty()) return;
 
