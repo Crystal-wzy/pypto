@@ -164,7 +164,7 @@ def load(
     tensor: Expr,
     offsets: Sequence[int | Expr] | _ir_core.MakeTuple,
     shapes: Sequence[int | Expr] | _ir_core.MakeTuple,
-    valid_shapes: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
     target_memory: MemorySpace = MemorySpace.Vec,
     clamp: bool = False,
     span: Span | None = None,
@@ -182,7 +182,7 @@ def load(
             Always in the source tensor's coordinate system.
         shapes: Shape of the region to load in each dimension (sequence of scalars),
             or a MakeTuple. Always in the source tensor's coordinate system.
-        valid_shapes: Valid shape of the tile in each dimension (sequence of scalars), or a
+        valid_shape: Valid shape of the tile in each dimension (sequence of scalars), or a
             MakeTuple. When provided, sets TileView.valid_shape in the output TileType.
             When omitted, shapes is used as valid_shape. Useful for dynamic shapes where
             the actual valid data region differs from the allocated tile size.
@@ -191,7 +191,7 @@ def load(
         target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat).
             MX-layout tensors require an explicit MemorySpace.Mat.
         clamp: Sanction a read that runs off the end of the source. By default a
-            load asserts that ``offsets + valid_shapes`` stays inside the source
+            load asserts that ``offsets + valid_shape`` stays inside the source
             and is rejected when that provably fails; with ``clamp=True`` the
             request is cut back to the source edge instead.
         span: Optional source span for debugging (auto-captured if not provided)
@@ -228,17 +228,21 @@ def load(
     kwargs: dict[str, Any] = {"target_memory": target_memory}
     if clamp:
         kwargs["clamp"] = True
-    valid_shapes_tuple = shapes_tuple
-    if valid_shapes is not None:
-        valid_shapes_tuple = _to_make_tuple(valid_shapes, actual_span)
-        if len(valid_shapes_tuple.elements) != len(shapes_tuple.elements):
-            raise ValueError(
-                f"valid_shapes and shapes must have same number of dimensions, "
-                f"got {len(valid_shapes_tuple.elements)} valid_shapes and {len(shapes_tuple.elements)} shapes"
-            )
 
+    valid_shape_tuple = shapes_tuple
+    if valid_shape is not None:
+        valid_shape_tuple = _to_make_tuple(valid_shape, actual_span)
+        if len(valid_shape_tuple.elements) != len(shapes_tuple.elements):
+            raise ValueError(
+                "valid_shape and shapes must have same number of dimensions, "
+                f"got {len(valid_shape_tuple.elements)} valid_shape dimensions "
+                f"and {len(shapes_tuple.elements)} shapes"
+            )
     return _ir_core.create_op_call(
-        "tile.load", [tensor, offsets_tuple, shapes_tuple, valid_shapes_tuple], kwargs, actual_span
+        "tile.load",
+        [tensor, offsets_tuple, shapes_tuple, valid_shape_tuple],
+        kwargs,
+        actual_span,
     )
 
 
@@ -2715,7 +2719,14 @@ def _resolve_tpop_type(
     return None
 
 
-def tpush_to_aiv(tile: Expr, *, split: int, id: int | None = None, span: Span | None = None) -> Call:
+def tpush_to_aiv(
+    tile: Expr,
+    *,
+    split: int,
+    id: int | None = None,
+    _full_box_transport: bool = False,
+    span: Span | None = None,
+) -> Call:
     """Push tile data from AIC to AIV via cross-core pipe.
 
     Args:
@@ -2728,6 +2739,8 @@ def tpush_to_aiv(tile: Expr, *, split: int, id: int | None = None, span: Span | 
     kwargs = {"split": split}
     if id is not None:
         kwargs["id"] = id
+    if _full_box_transport:
+        kwargs["_full_box_transport"] = True
     return _ir_core.create_op_call("tile.tpush_to_aiv", [tile], kwargs, actual_span)
 
 
@@ -2782,6 +2795,7 @@ def tpop_from_aic(
     dtype: DataType | None = None,
     split: int = 0,
     id: int | None = None,
+    _full_box_transport: bool = False,
     span: Span | None = None,
 ) -> Call:
     """Pop tile data from AIC cross-core pipe into AIV.
@@ -2799,6 +2813,8 @@ def tpop_from_aic(
     kwargs = {"split": split}
     if id is not None:
         kwargs["id"] = id
+    if _full_box_transport:
+        kwargs["_full_box_transport"] = True
     if resolved_type is not None:
         op = _ir_core.get_op("tile.tpop_from_aic")
         return _ir_core.Call(op, [], kwargs, resolved_type, actual_span)
