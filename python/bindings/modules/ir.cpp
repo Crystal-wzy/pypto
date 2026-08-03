@@ -658,19 +658,26 @@ void BindIR(nb::module_& m) {
            nb::arg("start_offset") = ExprPtr{}, nb::arg("blayout") = TileLayout::row_major,
            nb::arg("slayout") = TileLayout::none_box, nb::arg("fractal") = static_cast<uint64_t>(512),
            nb::arg("pad") = PadValue::null,
-           "Create a tile view; all fields default to empty/null/row_major/none_box/512/null")
+           "Create a tile view; all fields default to empty/null/row_major/none_box/512/null. "
+           "fractal is a size in bytes, not elements.")
       .def(nb::init<const std::vector<int64_t>&, const std::vector<int64_t>&, ExprPtr, TileLayout, TileLayout,
                     uint64_t, PadValue>(),
            nb::arg("valid_shape"), nb::arg("stride"), nb::arg("start_offset"),
            nb::arg("blayout") = TileLayout::row_major, nb::arg("slayout") = TileLayout::none_box,
            nb::arg("fractal") = static_cast<uint64_t>(512), nb::arg("pad") = PadValue::null,
-           "Create a tile view with integer valid_shape and stride, auto-converted to ConstInt")
+           "Create a tile view with integer valid_shape and stride, auto-converted to ConstInt. "
+           "fractal is a size in bytes, not elements.")
       .def_ro("valid_shape", &TileView::valid_shape, "Valid shape dimensions")
       .def_ro("stride", &TileView::stride, "Stride for each dimension")
       .def_ro("start_offset", &TileView::start_offset, "Starting offset")
       .def_ro("blayout", &TileView::blayout, "Block layout")
       .def_ro("slayout", &TileView::slayout, "Scatter layout")
-      .def_ro("fractal", &TileView::fractal, "Fractal size")
+      .def_ro("fractal", &TileView::fractal,
+              "Fractal size in bytes (not elements). In a boxed (NZ/ZN) layout the inner box is "
+              "M0 = 16 rows by fractal / dtype_bytes / M0 cols; the two matmul-path values are "
+              "16x16 boxes: 512 (Mat/Left/Right operand, FP16) and 1024 (Acc accumulator, "
+              "FP32/INT32). MX scale tiles carry 32, the MX block size (1-byte scale dtype, so "
+              "bytes and elements coincide).")
       .def_ro("pad", &TileView::pad, "Pad mode")
       .def(
           "__eq__", [](const TileView& self, const TileView& other) { return self == other; },
