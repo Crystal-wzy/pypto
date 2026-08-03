@@ -597,7 +597,7 @@ from pypto.backend import BackendType
 output_dir = ir.compile(
     program,
     output_dir=None,                           # 为 None 时自动生成
-    strategy=ir.OptimizationStrategy.Default,  # 或 DebugTileOptimization
+    strategy=ir.OptimizationStrategy.Default,  # 唯一的优化策略
     dump_passes=True,                          # 将 IR 快照写入 output_dir/passes_dump/
     backend_type=BackendType.Ascend910B,
 )
@@ -606,7 +606,7 @@ output_dir = ir.compile(
 | 参数 | 选项 | 说明 |
 | ---- | ---- | ---- |
 | `program` | `ir.Program` | 必填，待编译的程序对象（来自 `@pl.program` 等） |
-| `strategy` | `OptimizationStrategy.Default`、`DebugTileOptimization` | `Default` = 完整 tensor 导向流水线。`DebugTileOptimization` = 仅用于调试的 PTO tile 流水线，不包含 tensor-only pass |
+| `strategy` | `OptimizationStrategy.Default` | `Default` = 完整 tensor 导向流水线（唯一策略） |
 | `backend_type` | `BackendType.Ascend910B`、`BackendType.Ascend950` | Pass 与代码生成的目标硬件（从 `pypto.backend` 导入 `BackendType`） |
 | `dump_passes` | `True`/`False` | 为 `True` 时在每个 pass 后将 IR 快照写入 `<output_dir>/passes_dump/`（默认 `True`） |
 | `skip_ptoas` | `True`/`False` | 跳过 ptoas；只生成原始 `.pto`（MLIR），不生成已编译的 C++ 包装代码（默认 `False`） |
@@ -615,7 +615,8 @@ output_dir = ir.compile(
 
 ### 优化流水线
 
-`Default` 策略按顺序运行以下 pass：
+`Default` 策略按顺序运行以下主要阶段。这里只是摘要，并非完整流水线 ——
+完整的 pass 列表及其确切位置见 [pass 文档](../dev/passes/00-pass_manager.md)：
 
 1. **UnrollLoops** —— 展开循环迭代
 2. **CtrlFlowTransform** —— 将控制流改写为结构化 IR
