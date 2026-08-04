@@ -1784,9 +1784,15 @@ def assemble(
         atomic: Combine mode for the write. ``AtomicType.None_`` (default)
             overwrites; ``AtomicType.Add`` atomically adds ``source`` into the
             target at ``offset`` — used for split-K, where several cores
-            accumulate partial products into one output. Only valid when the
-            target lowers to a global-memory store (a function output tensor);
-            an atomic assemble into an on-chip tile is rejected.
+            accumulate partial products into one output. Only valid inside an
+            InCore function — typically a ``pl.at(level=pl.Level.CORE_GROUP, ...)``
+            scope — where ``source`` lowers to an on-chip tile (a compute result)
+            and the write lowers to an atomic-add store into a global-memory
+            target (a function output tensor). Every other form is rejected at
+            compile time: a tensor-to-tensor assemble has no store to carry the
+            combine, an assemble into an on-chip tile has no global-memory
+            destination, and at the orchestration level no atomic-combine
+            instruction exists at all.
 
             NOTE: atomic-add accumulation order across cores is not fixed, so
             floating-point results are non-deterministic. The target must be
