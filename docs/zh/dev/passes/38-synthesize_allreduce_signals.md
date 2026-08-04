@@ -65,11 +65,10 @@ alloc / window / allreduce 链路。
 以下情况会抛出 `pypto::ValueError`：
 
 - allreduce 位置参数数量不是 `target` 或 `target, signal`；
-- allreduce 出现在 `for` 或 `while` 循环中；
-- allreduce 作为嵌套表达式出现，而不是直接赋值、表达式语句或 return value。
+- allreduce 作为嵌套表达式出现，而不是直接赋值、表达式语句或 return value；
+- allreduce 出现在 `for` / `while` 循环内。
 
-循环内 allreduce 会被拒绝，因为当前 signal 协议是 single-use；编译器不能在
-动态多次调用之间复用同一个 signal buffer。
+该循环限制针对 HOST 通道：`builtin.tensor.allreduce` kernel（由 `LowerHostTensorCollectives` lower）不是自清理的 —— 它用 `AtomicAdd(+1)` 增加 ready/per-chunk 信用却从不回减 —— 因此循环前合成（或显式传入）的 signal 会在后续迭代中复用残留的 `>=` 阈值。由 [`LowerCompositeOps`](12-lower_composite_ops.md#屏障-信号协议) lower 的 InCore 组合算子则因该 pass 会发出自清理尾声而具备循环安全性。
 
 ## Pass 属性
 
