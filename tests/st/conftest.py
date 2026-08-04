@@ -51,7 +51,8 @@ from harness.core.test_runner import (  # noqa: E402
     shutdown_pipeline,
     start_pipeline,
 )
-from pypto import LogLevel, set_log_level  # noqa: E402
+from pypto import LogLevel  # noqa: E402
+from pypto.pypto_core import _clear_thread_log_level, _set_thread_log_level  # noqa: E402
 from pypto.runtime.runner import RunConfig  # noqa: E402
 
 # Temp directories created for pre-compilation (when --save-kernels is not set).
@@ -480,7 +481,7 @@ def tensor_shape(request):
 
 # Skip markers
 def pytest_configure(config):
-    """Register custom markers and apply early global settings."""
+    """Register custom markers and apply early runtime settings."""
     config.addinivalue_line(
         "markers",
         "platforms(*ids): restrict the test to the given platform ids "
@@ -498,15 +499,7 @@ def pytest_configure(config):
         "ci.yml change.",
     )
 
-    # Set C++ log level as early as possible so it applies to collection too.
-    # Forked child processes inherit this setting via os.fork().
-    try:
-        level_name: str = config.getoption("--pypto-log-level")
-        set_log_level(LogLevel[level_name])
-    except (ValueError, KeyError):
-        pass  # option not yet registered (e.g. during --co --help)
-
-    # Set PyPTO runtime log level (orthogonal to PyPTO C++ logger above).
+    # Set the PyPTO runtime log level independently of the per-ST-item C++ logger.
     try:
         runtime_level = config.getoption("--runtime-log-level")
     except KeyError:
@@ -516,6 +509,29 @@ def pytest_configure(config):
             from pypto.runtime import configure_log  # noqa: PLC0415
 
             configure_log(runtime_level)  # ValueError propagates: invalid CLI value must fail fast
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Apply the requested C++ log level only while an ST item is running.
+
+    ``tests/st/conftest.py`` can be loaded in a mixed ST/UT session.  Changing
+    the process-global C++ logger in ``pytest_configure`` therefore suppressed
+    diagnostics expected by later unit tests.  Surround the complete pytest
+    protocol (fixture setup, test call, and teardown) so forked runtime workers
+    still inherit the requested level, then clear the thread-local override.
+    """
+    del nextitem
+    if not item.path.is_relative_to(_ST_DIR):
+        yield
+        return
+
+    try:
+        level_name: str = item.config.getoption("--pypto-log-level")
+        _set_thread_log_level(LogLevel[level_name])
+        yield
+    finally:
+        _clear_thread_log_level()
 
 
 def pytest_itemcollected(item):
@@ -844,26 +860,32 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         f"\n[PyPTO] Pipeline: {len(test_cases)} test case(s); "
         f"compile_workers={max_workers}, execute_mode={execute_mode}, {device_info}"
     )
-    start_pipeline(
-        test_cases=test_cases,
-        cache_dir=cache_dir,
-        session_platform=session_platform,
-        dump_passes=dump_passes,
-        codegen_only=codegen_only,
-        compile_workers=max_workers,
-        device_pool=device_pool,
-        enable_l2_swimlane=enable_l2_swimlane,
-        enable_dump_args=enable_dump_args,
-        enable_pmu=enable_pmu,
-        enable_dep_gen=enable_dep_gen,
-        enable_scope_stats=enable_scope_stats,
-        analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
-        execute_mode=execute_mode,
-        task_max_time=task_max_time,
-        task_queue_timeout=task_queue_timeout,
-        task_submit_device=task_submit_device,
-        execute_batch_size=execute_batch_size,
-    )
+    pypto_log_level = LogLevel[session.config.getoption("--pypto-log-level")]
+    _set_thread_log_level(pypto_log_level)
+    try:
+        start_pipeline(
+            test_cases=test_cases,
+            cache_dir=cache_dir,
+            session_platform=session_platform,
+            dump_passes=dump_passes,
+            codegen_only=codegen_only,
+            pypto_log_level=pypto_log_level,
+            compile_workers=max_workers,
+            device_pool=device_pool,
+            enable_l2_swimlane=enable_l2_swimlane,
+            enable_dump_args=enable_dump_args,
+            enable_pmu=enable_pmu,
+            enable_dep_gen=enable_dep_gen,
+            enable_scope_stats=enable_scope_stats,
+            analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+            execute_mode=execute_mode,
+            task_max_time=task_max_time,
+            task_queue_timeout=task_queue_timeout,
+            task_submit_device=task_submit_device,
+            execute_batch_size=execute_batch_size,
+        )
+    finally:
+        _clear_thread_log_level()
     print("[PyPTO] Pipeline scheduled — pytest item loop starting\n")
 
 

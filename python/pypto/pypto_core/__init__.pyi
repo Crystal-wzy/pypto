@@ -29,6 +29,12 @@ from .logging import (
     log_warn,
     set_log_level,
 )
+from .logging import (
+    _clear_thread_log_level as _clear_thread_log_level,
+)
+from .logging import (
+    _set_thread_log_level as _set_thread_log_level,
+)
 
 class DataType:
     """Data type representation for PyPTO tensors and operations"""
