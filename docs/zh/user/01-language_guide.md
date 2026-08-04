@@ -31,7 +31,7 @@
 ```python
 x: pl.Tensor[[64, 128], pl.FP32]        # 二维，64×128，float32
 y: pl.Tensor[[256], pl.FP16]            # 一维，256 个元素，float16
-z: pl.Tensor[[64, 128], pl.FP16, pl.NZ] # 带 NZ 布局
+s: pl.Tensor[[64, 128], pl.UINT8, pl.MX_A_ZZ] # MX scale 操作数 —— 见「张量布局」
 ```
 
 **`pl.Tile[[shape], dtype]`** —— 片上内存缓冲区（默认统一缓冲区）。
@@ -51,6 +51,8 @@ idx: pl.Scalar[pl.INDEX]                # 索引标量
 
 `pl.Tensor[...]` annotation 写 **runtime 行优先 shape**，不写 layout 标记。layout 是 IR 内部概念，由派生/消费视图的 op 推导，不需要在 annotation 上表达。
 
+唯一的例外是 **MX 布局**（`pl.MX_A_ZZ` / `pl.MX_B_NN`）：它描述 scale 操作数的落盘打包方式，任何 op 都推导不出来，因此必须显式标注；其 load 需要 `target_memory=pl.Mem.Mat` 且 dtype 为 `pl.UINT8` / `pl.FP8E8M0`。
+
 ```python
 # ✅ 推荐 —— 写源 tensor shape，不写 layout 标记：
 b: pl.Tensor[[N, K], pl.FP32]
@@ -63,7 +65,7 @@ b: pl.Tensor[[K, N], pl.FP32, pl.DN]   # → 解析期抛 ParserTypeError
 
 > **为什么不支持 `pl.Tensor[..., pl.DN]`。** layout-only 简写迫使用户脑子里同时持有两套坐标系（IR 逻辑后视图 shape 与 runtime 行优先 shape）—— 恰恰是 RFC #1300 想要消除的歧义。改用：去掉 layout 标记，写 runtime shape —— matmul B^T 场景给 `pl.matmul` 传 `b_trans=True`（或 `a_trans=True`），或自然 load 后用 `pl.tile.transpose_view(...)`（参见下文「数据搬运」）；DN-producing op 之后的 slice 自动继承父 layout。
 
-如需 NZ（硬件 tile layout），写 `pl.Tile[..., pl.NZ]` —— NZ 是 tile-only，不允许作为 TensorType annotation。`pl.NZ` 常量保留用于 tile annotation 和 IR 内部使用。
+如需 NZ（硬件 tile layout），写 `pl.Tile[..., pl.NZ]` —— NZ 是 tile-only，不允许作为 TensorType annotation。`pl.NZ` 常量保留用于 tile annotation 和 IR 内部使用。解析器不会拒绝 `pl.Tensor[..., pl.NZ]`，但该注解无法编译：ptoas 会报 `layout mismatch: user-specified layout=nz but inferred=nd`。
 
 若需要在 IR 层面写 DN tensor（如测试 fixture 或 round-trip 打印的 IR），用 `pl.TensorView(stride=[...], layout=pl.TensorLayout.DN)` —— 强制写显式 stride，避免隐式坐标翻转的隐患。
 
