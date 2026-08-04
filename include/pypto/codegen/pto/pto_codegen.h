@@ -731,6 +731,18 @@ class PTOCodegen : public CodegenBase {
     std::string valid_col_ssa;  ///< valid_col operand SSA value (always emitted)
   };
 
+  /// One author-declared multi-slot allocation (`pl.MemRef(slots=N)`), lowered to
+  /// a ptoas `pto.alloc_multi_tile` region whose slots are selected per use by
+  /// `pto.multi_tile_get`. PTOAS-planner mode only — see PlanMultiBufferRegions.
+  struct MultiBufferRegion {
+    std::string region_ssa;     ///< The `%mb` handle the slots are taken from
+    std::string mtb_type_str;   ///< `!pto.multi_tile_buf<<slot>, count=N>`
+    std::string slot_type_str;  ///< The single-slot `!pto.tile_buf<...>` type
+    std::string valid_row_ssa;  ///< valid_row operand (shared by every slot)
+    std::string valid_col_ssa;  ///< valid_col operand (shared by every slot)
+    uint64_t count = 1;         ///< Slot count, in [2, 16] (the ptoas bound)
+  };
+
   /**
    * @brief Compute the type string and (addr, valid_row, valid_col) operands
    *        for a `pto.alloc_tile` op.
@@ -775,6 +787,65 @@ class PTOCodegen : public CodegenBase {
   void EmitExtraAllocTiles();
 
   /**
+   * @brief Decide which author-declared multi-slot allocations become ptoas
+   *        multi-buffer regions, and reserve their `%mb` handles.
+   *
+   * `pl.MemRef(slots=N)` says "one allocation, N uniform slots, this use takes
+   * slot k" — exactly what ptoas `pto.alloc_multi_tile` + `pto.multi_tile_get`
+   * describe, and describing it that way is what lets ptoas plan the slots as one
+   * region and derive per-slot (dynamic event id) synchronization from the slot
+   * expression. Emitting N unrelated `alloc_tile`s instead throws that away.
+   *
+   * Runs only under the PTOAS memory planner (`emit_tile_addr_ == false`). Under
+   * the PyPTO planner, ptoas runs at `--pto-level=level3`, where the fan-out of an
+   * explicit base address is not constant-folded, so its slot narrowing degrades
+   * to conservative aliasing — the multi-buffer form is measurably *worse* there
+   * than the baked-address `alloc_tile` path (an extra false WAR pair between two
+   * constant slots). See hw-native-sys/PTOAS#1106.
+   *
+   * A region is eligible when every tile bound to that allocation selects a slot,
+   * the slots share one tile_buf type and one static valid extent, at most one of
+   * them is live per loop iteration, the memory space is a local one ptoas supports
+   * for multi_tile_buf (vec / mat / acc), and the count is within ptoas's `[2, 16]`.
+   *
+   * The one-slot-per-iteration condition is a ptoas synchronization limit, not a
+   * typing one — see CoLiveSlotCollector.
+   *
+   * Anything else is a `ValueError` naming the shape, *not* a fallback: under this
+   * planner per-slot `alloc_tile`s would leave ptoas free to plan the slots on top
+   * of each other, which is the one thing the declaration exists to prevent. The
+   * ordinary `alloc_tile` path is reached only when no region is planned at all —
+   * under the PyPTO planner, or for an allocation that declares no slots.
+   *
+   * @param func The function being generated (scanned for tile phis, which take a
+   *             head-declared handle a per-use slot cannot provide)
+   */
+  void PlanMultiBufferRegions(const ir::FunctionPtr& func);
+
+  /**
+   * @brief The multi-buffer region `memref` takes a slot of, or null.
+   */
+  [[nodiscard]] const MultiBufferRegion* GetMultiBufferRegion(const ir::MemRefPtr& memref) const;
+
+  /**
+   * @brief Emit `%slot = pto.multi_tile_get %mb[%k]` for a slot of a region.
+   *
+   * Emitted where the ordinary `alloc_tile` would be — at the tile's definition —
+   * so a runtime slot index (`l0c[i % 2]`) is read inside the loop that names it.
+   *
+   * @return false when no region was planned for `memref`'s allocation — it
+   *         declares no slots, or the PyPTO planner is in use. An allocation that
+   *         declares slots this planner cannot describe never reaches here:
+   *         PlanMultiBufferRegions has already raised.
+   */
+  bool TryEmitMultiTileGet(const ir::MemRefPtr& memref, const std::string& tile_buf, const ir::Span& span);
+
+  /**
+   * @brief Emit the `pto.alloc_multi_tile` declarations in the function head.
+   */
+  void EmitMultiBufferRegionAllocs();
+
+  /**
    * @brief Get indent string for current level
    */
   std::string GetIndent() const;
@@ -812,6 +883,12 @@ class PTOCodegen : public CodegenBase {
     std::vector<ExtraAllocTile> extra_alloc_tiles;
     std::map<std::string, std::string> ssa_to_tile_buf_type;
     std::map<std::string, SubviewMaterializationInfo> subview_materializations;
+
+    /// Eligible multi-buffer regions, keyed by the allocation's base Ptr.
+    std::map<const ir::Var*, MultiBufferRegion> multi_buffer_regions;
+    /// The same regions in discovery order — the map is keyed by pointer, which
+    /// is not a stable order to emit declarations in.
+    std::vector<const ir::Var*> multi_buffer_region_order;
 
     int temp_counter = 0;
     std::set<std::string> used_ssa_names;
@@ -905,6 +982,8 @@ class PTOCodegen : public CodegenBase {
       memref_identity_type.clear();
       memref_identity_mixed_types.clear();
       emitted_tile_alloc_names.clear();
+      multi_buffer_regions.clear();
+      multi_buffer_region_order.clear();
 
       current_function.reset();
       current_result_var.reset();
