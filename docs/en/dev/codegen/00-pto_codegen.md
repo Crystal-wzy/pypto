@@ -148,13 +148,13 @@ print(pto_code)
 through `pto.subview`, which is a pure view alias of the source tile (no
 data movement, no extra `pto.alloc_tile`).  `pto.subview` requires the
 result `tile_buf` to share `dtype`, `memory_space`, `blayout`, `slayout`,
-`fractal`, and `pad` with the source — `DeduceTileSliceType` propagates
-those four `TileView` fields from the source so the produced `TileType`
+`fractal`, `pad`, and `compact` with the source — `DeduceTileSliceType` propagates
+those five `TileView` fields from the source so the produced `TileType`
 satisfies the constraints by construction.  Backend codegen also runs a
 `CheckSubviewTileCompat` guard at lowering time:
 
 - Source and result must both carry an explicit `TileView`.
-- `dtype`, `blayout`, `slayout`, `fractal`, and `pad` must match exactly.
+- `dtype`, `blayout`, `slayout`, `fractal`, `pad`, and `compact` must match exactly.
 - `pad` must be `PadValue::null` — `pto.subview` is a view, not a fillpad,
   so use `tile.fillpad` on the slice result if zero/min/max padding is
   required.
@@ -188,9 +188,11 @@ sub-window carved out by `pto.subview`.
 - `id` is optional. When omitted, PTOAS defaults to frontend pipe id `0`. Use explicit ids only when authoring multiple independent frontend pipes; automatic bidirectional mixed-kernel setup keeps a single `dir_mask = 3` pipe.
 - If the pushed tile was allocated with dynamic `valid_row` / `valid_col` operands or updated by
   `tile.set_validshape`, `tpush` emits the same tile handle after its runtime valid shape has been
-  updated. For split `tpush`, codegen temporarily uses a full non-split transport dimension (`cols`
-  for up/down, `rows` for left/right), then restores the producer tile's logical valid shape;
-  consumer-side dynamic tpop operands carry the logical extents used by compute and store.
+  updated. For split `tpush`, codegen temporarily uses the full physical transport box, then restores
+  the producer tile's logical valid shape; consumer-side dynamic tpop operands carry the logical
+  extents used by compute and store. A partial no-split Acc-to-Vec transfer also uses the full physical
+  box for both TPUSH and TPOP, because the Cube-to-Vector FIFO is physically box-strided, and restores
+  the logical valid shape immediately on each side of the transport.
 - When a tpop result `TileView.valid_shape` differs from the physical tile shape, PTO codegen emits PTOAS frontend operands as `%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`. This covers dynamic expressions and static non-full shapes such as `[0, 0]`; the operands carry the logical extents used by compute and store.
 - For split consumers, `SplitVectorKernel` localizes those dynamic tpop
   valid-shape operands per subblock (for example global `[8, 16]` becomes
@@ -520,7 +522,8 @@ The codegen:
 
 ### Tile Buffer Attributes
 
-Generated `alloc_tile` operations derive dtype and dimensions from TileType metadata, and layout/fractal/pad from the associated TileView (when available):
+Generated `alloc_tile` operations derive dtype and dimensions from TileType metadata, and
+layout/fractal/pad/compact mode from the associated TileView (when available):
 
 ```mlir
 !pto.tile_buf<
@@ -533,7 +536,8 @@ Generated `alloc_tile` operations derive dtype and dimensions from TileType meta
   blayout=row_major,   // Block layout (from TileView, default: row_major)
   slayout=none_box,    // Scatter layout (from TileView, default: none_box)
   fractal=512,         // Fractal size in bytes, not elements (from TileView, default: 512)
-  pad=0                // Pad mode as int (from TileView, default: 0/null)
+  pad=0,               // Pad mode as int (from TileView, default: 0/null)
+  compact=1            // Optional compact mode (normal=1; omitted for null=0)
 >
 ```
 
@@ -545,8 +549,12 @@ Generated `alloc_tile` operations derive dtype and dimensions from TileType meta
 | `slayout` | `TileView::slayout` | `none_box`, `row_major`, `col_major` | `none_box` |
 | `fractal` | `TileView::fractal` | uint64 | `512` |
 | `pad` | `TileView::pad` | `null(0)`, `zero(1)`, `max(2)`, `min(3)` | `null(0)` |
+| `compact` | `TileView::compact` | `null(0)`, `normal(1)` | `null(0)` |
 
 When no TileView is associated with the MemRef, the codegen falls back to the default values listed above.
+The `compact` attribute is omitted for its null default. A partial `tile.extract` into L0A/L0B sets
+`normal(1)` automatically so TEXTRACT transfers only the logical `valid_shape` instead of treating
+box-alignment padding as data.
 
 ## Kernel Wrapper Generation (PTO Backend)
 

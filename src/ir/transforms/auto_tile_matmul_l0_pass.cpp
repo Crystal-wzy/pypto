@@ -71,8 +71,10 @@
 /// M/N tiling (output exceeds L0c)
 /// -------------------------------
 /// When ``ChooseL0Tile`` returns ``m < M`` or ``n < N`` the ``[M, N]`` output
-/// Acc overflows L0c.  The operands are already Mat-resident, so only the
-/// output overflows. For plain ``tile.matmul``, the pass emits a
+/// Acc's physical footprint overflows L0c.  Capacity uses the backend's
+/// accumulator-row alignment, which may be stricter than the logical M shape
+/// (Ascend910B INT32 M=16 occupies 32 physical rows).  The operands are already
+/// Mat-resident, so only the output overflows. For plain ``tile.matmul``, the pass emits a
 /// ``ceil(M/m) x ceil(N/n)`` grid and hands each ``[m_eff, n_eff]`` Acc result to
 /// a placement strategy: either direct-store to the sole 2D
 /// ``tile.store(c, base, out)`` consumer, or assembly into an on-chip Mat scratch
@@ -92,9 +94,12 @@
 ///     ``tile.matmul_acc``; M/N tiling for plain ``tile.matmul`` with either a
 ///     direct-store or Mat-scratch placement, with a pipelined K-loop or a
 ///     straight-line single-K-block (``k == K``) per sub-tile.
-///     M/N tiling of ``tile.matmul_acc`` (needs per-sub-tile accumulator
-///     slicing), a Vec left operand, or a mixed/non-matmul on-chip consumer is
-///     deferred with a ``PerfHint``.
+///     The canonical frontend split-K create/pipeline/store form is M/N-tiled
+///     outside its K loop: each output sub-tile completes the whole source K
+///     reduction before the next one starts. Arbitrary standalone
+///     ``tile.matmul_acc`` (which would need slices of a caller-owned
+///     accumulator), a Vec left operand, or a mixed/non-matmul on-chip consumer
+///     is deferred with a ``PerfHint``.
 ///   * A compatible f32-to-bf16/f16 ``tile.cast(mode="rint")`` feeding only
 ///     matmul operands is folded into the Acc-to-Mat FIXPIPE writeback.
 ///   * Any 16-aligned K.  When the chosen ``k`` does not divide ``K``
@@ -138,13 +143,16 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/l0_tile_chooser.h"
+#include "pypto/ir/transforms/utils/l0c_footprint.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -165,6 +173,16 @@ ExprPtr MakeIndexTuple(const std::vector<int64_t>& values, const Span& span) {
   elements.reserve(values.size());
   for (auto v : values) elements.push_back(MakeIndex(v, span));
   return std::make_shared<MakeTuple>(std::move(elements), span);
+}
+
+int64_t AlignStaticExtent(int64_t extent, int64_t alignment, const Span& span) {
+  INTERNAL_CHECK_SPAN(extent > 0 && alignment > 0, span)
+      << "Internal error: tile extent/alignment must be positive, got " << extent << "/" << alignment;
+  const int64_t remainder = extent % alignment;
+  const int64_t increment = remainder == 0 ? 0 : alignment - remainder;
+  INTERNAL_CHECK_SPAN(extent <= std::numeric_limits<int64_t>::max() - increment, span)
+      << "Internal error: box-aligning tile extent " << extent << " by " << alignment << " overflows int64";
+  return extent + increment;
 }
 
 /// True if `tile`'s 2D shape is static and its memory space is one of
@@ -268,6 +286,36 @@ AssignStmtPtr BuildAccInit(int64_t m, int64_t n, const DataType& dtype, const st
   return std::make_shared<AssignStmt>(var, call, span);
 }
 
+struct AccInitValue {
+  std::vector<StmtPtr> stmts;
+  VarPtr value;
+};
+
+/// Build an Acc placeholder whose allocation may be box-padded while its valid
+/// rectangle remains the logical output tile. The ordinary unpadded case keeps
+/// the historical single ``tile.create`` form byte-for-byte.
+AccInitValue BuildAccInitWithValidShape(int64_t physical_m, int64_t physical_n, ExprPtr valid_m,
+                                        ExprPtr valid_n, const DataType& dtype, const std::string& name_hint,
+                                        const Span& span) {
+  INTERNAL_CHECK_SPAN(valid_m && valid_n, span)
+      << "Internal error: accumulator initializer requires two valid extents";
+  auto valid_m_const = As<ConstInt>(valid_m);
+  auto valid_n_const = As<ConstInt>(valid_n);
+  if (valid_m_const && valid_n_const && physical_m == valid_m_const->value_ &&
+      physical_n == valid_n_const->value_) {
+    auto init = BuildAccInit(physical_m, physical_n, dtype, name_hint, span);
+    return AccInitValue{{init}, init->var_};
+  }
+
+  auto storage = BuildAccInit(physical_m, physical_n, dtype, name_hint + "_storage", span);
+  auto& reg = OpRegistry::GetInstance();
+  auto narrowed_call =
+      reg.Create("tile.set_validshape", {storage->var_, std::move(valid_m), std::move(valid_n)}, span);
+  auto narrowed_var = std::make_shared<Var>(name_hint, narrowed_call->GetType(), span);
+  auto narrowed = std::make_shared<AssignStmt>(narrowed_var, narrowed_call, span);
+  return AccInitValue{{storage, narrowed}, narrowed_var};
+}
+
 struct KLoopRewrite {
   AssignStmtPtr original;
   VarPtr lhs_src;                 ///< [M, K] left operand — Mat- or Vec-resident
@@ -281,6 +329,10 @@ struct KLoopRewrite {
   int64_t m = 0;
   int64_t n = 0;
   int64_t k = 0;
+  /// Logical output window carried by the loop accumulator. These may be
+  /// smaller than m/n when a boxed boundary operand is physically padded.
+  ExprPtr valid_m = nullptr;
+  ExprPtr valid_n = nullptr;
   /// Output sub-tile origin (row, col) within the [M, N] product. The per-iter
   /// extracts slice ``lhs[mi : mi + m, ko : ko + k]`` and ``rhs[ko : ko + k,
   /// ni : ni + n]``. Null means 0 — the K-only path (m == M, n == N) leaves
@@ -381,10 +433,11 @@ RewriteResult BuildKLoopRewrite(const KLoopRewrite& r) {
       loop_iter_type = r.acc_init->GetType();
     } else {
       auto acc_dtype = As<TileType>(r.original->var_->GetType())->dtype_;
-      auto c_init = BuildAccInit(r.m, r.n, acc_dtype, base + "_l0_init", sp);
-      out.push_back(c_init);
-      loop_init = c_init->var_;
-      loop_iter_type = c_init->var_->GetType();
+      auto c_init =
+          BuildAccInitWithValidShape(r.m, r.n, r.valid_m, r.valid_n, acc_dtype, base + "_l0_init", sp);
+      for (auto& stmt : c_init.stmts) out.push_back(std::move(stmt));
+      loop_init = c_init.value;
+      loop_iter_type = c_init.value->GetType();
     }
   }
 
@@ -469,6 +522,10 @@ struct MatmulTiling {
   bool stage_lhs_to_mat = false;
   int64_t M = 0, N = 0, K = 0;
   int64_t m = 0, n = 0, k = 0;
+  /// Logical output extents. Ordinarily identical to M/N; a box-padded
+  /// boundary matmul keeps the larger physical M/N in the operands/result.
+  ExprPtr output_valid_m = nullptr;
+  ExprPtr output_valid_n = nullptr;
   /// Chosen L0 stationarity (which operand is pinned single-buffered across the
   /// moving grid). Output-stationary unless the chooser picked A/B-stationary
   /// (k == K); BuildFullKPipelined sets the loop order + single-buffers the
@@ -513,6 +570,37 @@ KLoopRewrite MakeKLoop(const MatmulTiling& t, ExprPtr mi, ExprPtr ni, int64_t m_
   r.m = m_eff;
   r.n = n_eff;
   r.k = t.k;
+  auto local_valid_extent = [&](const ExprPtr& output_valid, const ExprPtr& offset,
+                                int64_t physical_extent) -> ExprPtr {
+    INTERNAL_CHECK_SPAN(output_valid, t.assign->span_)
+        << "Internal error: matmul output requires a logical valid extent";
+    if (!offset) return output_valid;
+
+    // Constant output grids are by far the common case. Fold them here so the
+    // generated set_validshape operands stay simple constants.
+    if (auto valid_const = As<ConstInt>(output_valid)) {
+      if (auto offset_const = As<ConstInt>(offset)) {
+        return MakeIndex(std::clamp<int64_t>(valid_const->value_ - offset_const->value_, 0, physical_extent),
+                         t.assign->span_);
+      }
+    }
+
+    // Keep the zero-offset form canonical with InferWindowReadValidShape. This
+    // also avoids asking the verifier to prove `max(valid, 0) - 0 == valid`.
+    if (auto offset_const = As<ConstInt>(offset); offset_const && offset_const->value_ == 0) {
+      return MakeMin(output_valid, MakeIndex(physical_extent, t.assign->span_), t.assign->span_);
+    }
+
+    // The logical window of a physical sub-tile is
+    // clamp(output_valid - offset, 0, physical_extent). Spell the lower clamp
+    // as max(output_valid, offset) - offset so UINT64 valid extents cannot
+    // underflow when the sub-tile starts beyond the logical boundary.
+    auto clamped_valid = MakeMax(output_valid, offset, t.assign->span_);
+    auto remaining = MakeSub(clamped_valid, offset, t.assign->span_);
+    return MakeMin(remaining, MakeIndex(physical_extent, t.assign->span_), t.assign->span_);
+  };
+  r.valid_m = local_valid_extent(t.output_valid_m, mi, m_eff);
+  r.valid_n = local_valid_extent(t.output_valid_n, ni, n_eff);
   r.mi = std::move(mi);
   r.ni = std::move(ni);
   r.name_base = std::move(name_base);
@@ -523,8 +611,9 @@ KLoopRewrite MakeKLoop(const MatmulTiling& t, ExprPtr mi, ExprPtr ni, int64_t m_
 /// so which L0 tile shape to use.  Returns the tiling plan on success;
 /// otherwise nullopt and (when useful) appends a PerfHint.  The caller
 /// dispatches K-only vs M/N tiling on ``MatmulTiling::needs_mn_tiling()``.
-std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vector<Diagnostic>& hints,
-                                          bool force_output_stationary = false) {
+std::optional<MatmulTiling> AnalyzeMatmul(
+    const AssignStmtPtr& assign, std::vector<Diagnostic>& hints, bool force_output_stationary = false,
+    std::optional<tile_view_semantics::BoxedTileAlignment> output_box_alignment = std::nullopt) {
   auto call = As<Call>(assign->value_);
   if (!call || !call->op_) return std::nullopt;
 
@@ -587,6 +676,9 @@ std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vect
   // accumulator footprint.
   auto out_tile = As<TileType>(call->GetType());
   INTERNAL_CHECK(out_tile) << "Internal error: tile.matmul result is not a TileType";
+  const auto output_valid_shape = tile_view_semantics::GetEffectiveTileView(*out_tile).valid_shape;
+  INTERNAL_CHECK_SPAN(output_valid_shape.size() == 2, assign->span_)
+      << "Internal error: tile.matmul result valid_shape must be 2D";
   uint32_t bytes_c = DTypeBytes(out_tile->dtype_);
   if (bytes_a == 0 || bytes_b == 0 || bytes_c == 0) {
     hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-003",
@@ -629,6 +721,17 @@ std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vect
   cfg.align_m = handler->GetL0FractalAlignment();
   cfg.align_n = handler->GetL0FractalAlignment();
   cfg.align_k = handler->GetL0FractalAlignment();
+  cfg.l0c_align_m = handler->GetL0cMAlignment(out_tile->dtype_);
+  if (output_box_alignment) {
+    INTERNAL_CHECK_SPAN(output_box_alignment->rows > 0 && output_box_alignment->cols > 0 &&
+                            output_box_alignment->rows <= std::numeric_limits<int>::max() &&
+                            output_box_alignment->cols <= std::numeric_limits<int>::max(),
+                        assign->span_)
+        << "Internal error: canonical split-K operand boxing has an invalid alignment ["
+        << output_box_alignment->rows << ", " << output_box_alignment->cols << "]";
+    cfg.box_align_m = static_cast<int>(output_box_alignment->rows);
+    cfg.box_align_n = static_cast<int>(output_box_alignment->cols);
+  }
   cfg.min_m = handler->GetMinL0TileDim();
   cfg.min_n = handler->GetMinL0TileDim();
   cfg.min_k = handler->GetMinL0TileDim();
@@ -731,6 +834,8 @@ std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vect
   t.m = res.m;
   t.n = res.n;
   t.k = res.k;
+  t.output_valid_m = output_valid_shape[0];
+  t.output_valid_n = output_valid_shape[1];
   t.stationarity = res.stationarity;
   t.os_holds_a = res.os_holds_a;
   // dbC=2 is realized only by the full-K emitter: BuildFullKPipelined attaches
@@ -887,17 +992,30 @@ class SubtilePlacer {
                                        const ExprPtr& col_off, const VarPtr& chain_in, int step) = 0;
 };
 
+CallPtr PreserveCallAttrs(const std::vector<std::pair<std::string, std::any>>& attrs,
+                          const CallPtr& deduced) {
+  if (attrs.empty()) return deduced;
+  return std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, attrs, deduced->GetType(),
+                                deduced->span_);
+}
+
+CallPtr PreserveCallAttrs(const CallPtr& original, const CallPtr& deduced) {
+  return PreserveCallAttrs(original->attrs_, deduced);
+}
+
 /// Direct-store placement: ``out = tile.store(sub, [base_r + mi, base_c + ni],
 /// out_prev)`` per sub-tile, chaining the DDR output tensor in SSA form.
 class DirectGmPlacer : public SubtilePlacer {
  public:
   DirectGmPlacer(ExprPtr base_r, ExprPtr base_c, VarPtr out_in,
-                 std::vector<std::pair<std::string, std::any>> store_kwargs, Span span)
+                 std::vector<std::pair<std::string, std::any>> store_kwargs,
+                 std::vector<std::pair<std::string, std::any>> store_attrs, Span span)
       : base_r_(std::move(base_r)),
         base_c_(std::move(base_c)),
         out_in_(std::move(out_in)),
         out_base_(out_in_->name_hint_),
         kwargs_(std::move(store_kwargs)),
+        attrs_(std::move(store_attrs)),
         sp_(std::move(span)) {}
 
   [[nodiscard]] VarPtr Init(std::vector<StmtPtr>& /*stmts*/) override { return out_in_; }
@@ -907,7 +1025,8 @@ class DirectGmPlacer : public SubtilePlacer {
     auto& reg = OpRegistry::GetInstance();
     auto offs = std::make_shared<MakeTuple>(
         std::vector<ExprPtr>{AddOffset(base_r_, row_off, sp_), AddOffset(base_c_, col_off, sp_)}, sp_);
-    auto scall = reg.Create("tile.store", {sub, offs, chain_in}, kwargs_, sp_);
+    auto deduced = reg.Create("tile.store", {sub, offs, chain_in}, kwargs_, sp_);
+    auto scall = PreserveCallAttrs(attrs_, deduced);
     auto sv = std::make_shared<Var>(out_base_ + "_t" + std::to_string(step), scall->GetType(), sp_);
     stmts.push_back(std::make_shared<AssignStmt>(sv, scall, sp_));
     return sv;
@@ -918,6 +1037,7 @@ class DirectGmPlacer : public SubtilePlacer {
   VarPtr out_in_;
   std::string out_base_;
   std::vector<std::pair<std::string, std::any>> kwargs_;
+  std::vector<std::pair<std::string, std::any>> attrs_;
   Span sp_;
 };
 
@@ -967,6 +1087,513 @@ class MatScratchPlacer : public SubtilePlacer {
   std::string base_;
   Span sp_;
 };
+
+/// Count every syntactic Var/IterArg read in one function traversal while
+/// excluding SSA definition sites. The canonical split-K pre-phase uses this
+/// index to prove that its create and loop result have no consumers outside the
+/// matched create/loop/store chain.
+class CanonicalReadCounter : public IRVisitor {
+ public:
+  std::unordered_map<const Var*, size_t> counts;
+
+ protected:
+  void VisitVarLike_(const VarPtr& op) override {
+    if (op) ++counts[op.get()];
+  }
+
+  // The generic visitor follows an IterArg read through ``initValue_``.  That
+  // is useful for recursive dependency walks, but this index counts direct SSA
+  // edges: the initializer is visited once at the enclosing loop and an
+  // IterArg use in the body must not count it again.
+  void VisitExpr_(const IterArgPtr& op) override { VisitVarLike_(op); }
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    if (op && op->value_) VisitExpr(op->value_);
+  }
+
+  void VisitStmt_(const IfStmtPtr& op) override {
+    if (op->condition_) VisitExpr(op->condition_);
+    if (op->then_body_) VisitStmt(op->then_body_);
+    if (op->else_body_.has_value() && *op->else_body_) VisitStmt(*op->else_body_);
+  }
+
+  void VisitStmt_(const ForStmtPtr& op) override {
+    if (op->start_) VisitExpr(op->start_);
+    if (op->stop_) VisitExpr(op->stop_);
+    if (op->step_) VisitExpr(op->step_);
+    for (const auto& iter_arg : op->iter_args_) {
+      if (iter_arg && iter_arg->initValue_) VisitExpr(iter_arg->initValue_);
+    }
+    if (op->body_) VisitStmt(op->body_);
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    if (op->condition_) VisitExpr(op->condition_);
+    for (const auto& iter_arg : op->iter_args_) {
+      if (iter_arg && iter_arg->initValue_) VisitExpr(iter_arg->initValue_);
+    }
+    if (op->body_) VisitStmt(op->body_);
+  }
+};
+
+/// Canonical frontend split-K reduction matched for loop-level M/N tiling:
+///
+///   init = tile.create([M, N])
+///   for kb, (acc,) in pipeline(..., init_values=(init,)):
+///     lhs = tile.load(A, [mi0, k0], [M, Kb], ...)
+///     rhs = tile.load(B, [k0, ni0], [Kb, N], ...)
+///     if first:
+///       next = tile.matmul(lhs, rhs)
+///     else:
+///       next = tile.matmul_acc(acc, lhs, rhs)
+///     yield next
+///   out = tile.store(loop_result, [base_m, base_n], out)
+///
+/// The whole loop must move outside the output-tile grid: every [m, n]
+/// accumulator completes all split-K iterations before the next output tile is
+/// started. Merely slicing the matmul_acc call in place would leave the
+/// impossible full [M, N] loop-carried accumulator live in L0C.
+struct CanonicalSplitKAccMatch {
+  AssignStmtPtr init;
+  ForStmtPtr loop;
+  AssignStmtPtr store;
+  AssignStmtPtr lhs_load;
+  AssignStmtPtr rhs_load;
+  AssignStmtPtr matmul;
+  AssignStmtPtr matmul_acc;
+  VarPtr phi;
+  int64_t M = 0;
+  int64_t N = 0;
+  int64_t K = 0;  ///< K width of one source split-K iteration
+};
+
+struct CanonicalOutputWindow {
+  int64_t valid_m = 0;
+  int64_t valid_n = 0;
+  int64_t physical_m = 0;
+  int64_t physical_n = 0;
+};
+
+std::optional<std::pair<AssignStmtPtr, YieldStmtPtr>> MatchSingleAssignYield(const StmtPtr& body,
+                                                                             const char* op_name) {
+  auto seq = As<SeqStmts>(body);
+  if (!seq || seq->stmts_.size() != 2) return std::nullopt;
+  auto assign = As<AssignStmt>(seq->stmts_[0]);
+  auto yield = As<YieldStmt>(seq->stmts_[1]);
+  auto call = assign ? As<Call>(assign->value_) : nullptr;
+  if (!assign || !yield || !call || !IsOp(call, op_name) || yield->value_.size() != 1 ||
+      yield->value_[0].get() != assign->var_.get()) {
+    return std::nullopt;
+  }
+  return std::make_pair(assign, yield);
+}
+
+bool IsStatic2DTuple(const ExprPtr& expr, int64_t dim0, int64_t dim1) {
+  auto tuple = As<MakeTuple>(expr);
+  if (!tuple || tuple->elements_.size() != 2) return false;
+  auto first = As<ConstInt>(tuple->elements_[0]);
+  auto second = As<ConstInt>(tuple->elements_[1]);
+  return first && second && first->value_ == dim0 && second->value_ == dim1;
+}
+
+std::optional<CanonicalSplitKAccMatch> MatchCanonicalSplitKAcc(
+    const AssignStmtPtr& init, const ForStmtPtr& loop, const AssignStmtPtr& store,
+    const std::unordered_map<const Var*, size_t>& use_counts) {
+  if (!init || !loop || !store || loop->kind_ != ForKind::Pipeline || loop->iter_args_.size() != 1 ||
+      loop->return_vars_.size() != 1) {
+    return std::nullopt;
+  }
+
+  auto init_call = As<Call>(init->value_);
+  auto store_call = As<Call>(store->value_);
+  if (!init_call || !IsOp(init_call, "tile.create") || !store_call || !IsOp(store_call, "tile.store") ||
+      store_call->args_.size() != 3 || loop->iter_args_[0]->initValue_.get() != init->var_.get() ||
+      store_call->args_[0].get() != loop->return_vars_[0].get()) {
+    return std::nullopt;
+  }
+  auto store_offsets = As<MakeTuple>(store_call->args_[1]);
+  if (!store_offsets || store_offsets->elements_.size() != 2 || !AsVarLike(store_call->args_[2])) {
+    return std::nullopt;
+  }
+  auto init_use = use_counts.find(init->var_.get());
+  auto result_use = use_counts.find(loop->return_vars_[0].get());
+  // True read counts exclude definitions: the create feeds exactly one IterArg
+  // initializer and the loop result feeds exactly one store. Any other read
+  // would be invalidated when the triplet is replaced.
+  if (init_use == use_counts.end() || init_use->second != 1 || result_use == use_counts.end() ||
+      result_use->second != 1) {
+    return std::nullopt;
+  }
+
+  auto body = As<SeqStmts>(loop->body_);
+  if (!body || body->stmts_.size() < 2) return std::nullopt;
+  const size_t if_pos = body->stmts_.size() - 2;
+  auto if_stmt = As<IfStmt>(body->stmts_[if_pos]);
+  auto outer_yield = As<YieldStmt>(body->stmts_.back());
+  if (!if_stmt || !if_stmt->else_body_.has_value() || if_stmt->return_vars_.size() != 1 || !outer_yield ||
+      outer_yield->value_.size() != 1 || outer_yield->value_[0].get() != if_stmt->return_vars_[0].get()) {
+    return std::nullopt;
+  }
+
+  auto then_mm = MatchSingleAssignYield(if_stmt->then_body_, "tile.matmul");
+  auto else_mm = MatchSingleAssignYield(*if_stmt->else_body_, "tile.matmul_acc");
+  auto then_acc = MatchSingleAssignYield(if_stmt->then_body_, "tile.matmul_acc");
+  auto else_plain = MatchSingleAssignYield(*if_stmt->else_body_, "tile.matmul");
+  AssignStmtPtr matmul;
+  AssignStmtPtr matmul_acc;
+  if (then_mm && else_mm) {
+    matmul = then_mm->first;
+    matmul_acc = else_mm->first;
+  } else if (then_acc && else_plain) {
+    matmul = else_plain->first;
+    matmul_acc = then_acc->first;
+  } else {
+    return std::nullopt;
+  }
+
+  auto mm_call = As<Call>(matmul->value_);
+  auto acc_call = As<Call>(matmul_acc->value_);
+  if (!mm_call || !acc_call || mm_call->args_.size() != 2 || acc_call->args_.size() != 3 ||
+      acc_call->args_[0].get() != loop->iter_args_[0].get() ||
+      mm_call->args_[0].get() != acc_call->args_[1].get() ||
+      mm_call->args_[1].get() != acc_call->args_[2].get()) {
+    return std::nullopt;
+  }
+  auto lhs = AsVarLike(mm_call->args_[0]);
+  auto rhs = AsVarLike(mm_call->args_[1]);
+  // One source load cannot simultaneously be narrowed as [m, K] and [K, n].
+  // Reject the square self-matmul corner rather than mutate it ambiguously.
+  if (!lhs || !rhs || lhs.get() == rhs.get()) return std::nullopt;
+
+  std::unordered_map<const Var*, AssignStmtPtr> direct_defs;
+  for (size_t i = 0; i < if_pos; ++i) {
+    auto assign = As<AssignStmt>(body->stmts_[i]);
+    if (!assign) return std::nullopt;
+    direct_defs.emplace(assign->var_.get(), assign);
+    // Duplicating a source split-K loop per output tile is legal only when all
+    // definitions other than the two operand loads are scalar computations.
+    // This excludes hidden tile side effects or unrelated loads instead of
+    // silently multiplying them.
+    if (assign->var_.get() != lhs.get() && assign->var_.get() != rhs.get() &&
+        (As<Call>(assign->value_) || !As<ScalarType>(assign->var_->GetType()))) {
+      return std::nullopt;
+    }
+  }
+  auto lhs_it = direct_defs.find(lhs.get());
+  auto rhs_it = direct_defs.find(rhs.get());
+  if (lhs_it == direct_defs.end() || rhs_it == direct_defs.end()) return std::nullopt;
+  auto lhs_load_call = As<Call>(lhs_it->second->value_);
+  auto rhs_load_call = As<Call>(rhs_it->second->value_);
+  if (!lhs_load_call || !rhs_load_call || !IsOp(lhs_load_call, "tile.load") ||
+      !IsOp(rhs_load_call, "tile.load") || lhs_load_call->args_.size() != 4 ||
+      rhs_load_call->args_.size() != 4) {
+    return std::nullopt;
+  }
+  int64_t M = 0;
+  int64_t K_lhs = 0;
+  int64_t K_rhs = 0;
+  int64_t N = 0;
+  auto lhs_ty = As<TileType>(lhs->GetType());
+  auto rhs_ty = As<TileType>(rhs->GetType());
+  if (!IsStatic2DInSpaces(lhs_ty, {MemorySpace::Mat}, M, K_lhs) ||
+      !IsStatic2DInSpaces(rhs_ty, {MemorySpace::Mat}, K_rhs, N) || K_lhs != K_rhs) {
+    return std::nullopt;
+  }
+  // Replacing shape and valid_shape with the narrowed output window is sound
+  // only for full rectangular loads. A padded or dynamic valid_shape requires
+  // its own intersection arithmetic and stays on the conservative deferred
+  // path for now.
+  if (!As<MakeTuple>(lhs_load_call->args_[1]) || !As<MakeTuple>(rhs_load_call->args_[1]) ||
+      !IsStatic2DTuple(lhs_load_call->args_[2], M, K_lhs) ||
+      !IsStatic2DTuple(lhs_load_call->args_[3], M, K_lhs) ||
+      !IsStatic2DTuple(rhs_load_call->args_[2], K_rhs, N) ||
+      !IsStatic2DTuple(rhs_load_call->args_[3], K_rhs, N)) {
+    return std::nullopt;
+  }
+  auto init_ty = As<TileType>(init->var_->GetType());
+  auto init_m = init_ty && init_ty->shape_.size() == 2 ? As<ConstInt>(init_ty->shape_[0]) : nullptr;
+  auto init_n = init_ty && init_ty->shape_.size() == 2 ? As<ConstInt>(init_ty->shape_[1]) : nullptr;
+  if (!init_m || !init_n || init_m->value_ != M || init_n->value_ != N) return std::nullopt;
+
+  return CanonicalSplitKAccMatch{
+      init, loop, store, lhs_it->second, rhs_it->second, matmul, matmul_acc, if_stmt->return_vars_[0],
+      M,    N,    K_lhs};
+}
+
+std::optional<tile_view_semantics::BoxedTileAlignment> GetCanonicalOutputBoxAlignment(
+    const CanonicalSplitKAccMatch& match) {
+  auto lhs_type = As<TileType>(match.lhs_load->var_->GetType());
+  auto rhs_type = As<TileType>(match.rhs_load->var_->GetType());
+  INTERNAL_CHECK_SPAN(lhs_type && rhs_type, match.loop->span_)
+      << "Internal error: canonical split-K operand loads lost their TileTypes";
+
+  const auto lhs_alignment = tile_view_semantics::GetBoxedTileAlignment(*lhs_type);
+  const auto rhs_alignment = tile_view_semantics::GetBoxedTileAlignment(*rhs_type);
+  if (!lhs_alignment || !rhs_alignment) return std::nullopt;
+
+  return tile_view_semantics::BoxedTileAlignment{/*rows=*/lhs_alignment->rows,
+                                                 /*cols=*/rhs_alignment->cols};
+}
+
+CanonicalOutputWindow BuildCanonicalOutputWindow(
+    const CanonicalSplitKAccMatch& match, int64_t valid_m, int64_t valid_n,
+    const tile_view_semantics::BoxedTileAlignment& output_box_alignment) {
+  return CanonicalOutputWindow{
+      /*valid_m=*/valid_m,
+      /*valid_n=*/valid_n,
+      /*physical_m=*/AlignStaticExtent(valid_m, output_box_alignment.rows, match.loop->span_),
+      /*physical_n=*/AlignStaticExtent(valid_n, output_box_alignment.cols, match.loop->span_),
+  };
+}
+
+/// Retile one DeepClone of the canonical source K loop. Definitions are fresh
+/// already; this mutator narrows the two GM->Mat loads and re-deduces both MAD
+/// calls plus the if/loop phi types for one [m, n] output tile.
+class CanonicalSplitKRetiler : public IRMutator {
+ public:
+  CanonicalSplitKRetiler(const CanonicalSplitKAccMatch& match,
+                         const std::unordered_map<const Var*, VarPtr>& clone_map, const VarPtr& init,
+                         int64_t mi, int64_t ni, CanonicalOutputWindow window, std::string suffix)
+      : mi_(mi), ni_(ni), window_(window), k_(match.K), suffix_(std::move(suffix)) {
+    auto cloned = [&](const VarPtr& original) -> VarPtr {
+      auto it = clone_map.find(original.get());
+      INTERNAL_CHECK_SPAN(it != clone_map.end(), original->span_)
+          << "Internal error: canonical split-K clone omitted definition " << original->name_hint_;
+      return it->second;
+    };
+
+    lhs_load_ = cloned(match.lhs_load->var_).get();
+    rhs_load_ = cloned(match.rhs_load->var_).get();
+    matmul_ = cloned(match.matmul->var_).get();
+    matmul_acc_ = cloned(match.matmul_acc->var_).get();
+
+    auto old_iter_var = cloned(match.loop->iter_args_[0]);
+    auto old_iter = std::dynamic_pointer_cast<const IterArg>(old_iter_var);
+    INTERNAL_CHECK_SPAN(old_iter, match.loop->span_)
+        << "Internal error: canonical split-K IterArg cloned as a plain Var";
+    INTERNAL_CHECK_SPAN(init, match.loop->span_)
+        << "Internal error: canonical split-K output tile has no accumulator initializer";
+    auto acc_ty = init->GetType();
+    auto new_iter = std::make_shared<IterArg>(old_iter->name_hint_ + suffix_, acc_ty, init, old_iter->span_);
+    var_remap_[old_iter.get()] = new_iter;
+
+    auto old_phi = cloned(match.phi);
+    auto new_phi = std::make_shared<Var>(old_phi->name_hint_ + suffix_, acc_ty, old_phi->span_);
+    var_remap_[old_phi.get()] = new_phi;
+
+    auto old_return = cloned(match.loop->return_vars_[0]);
+    auto new_return = std::make_shared<Var>(old_return->name_hint_ + suffix_, acc_ty, old_return->span_);
+    var_remap_[old_return.get()] = new_return;
+  }
+
+ protected:
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    const Var* key = op->var_.get();
+    if (key != lhs_load_ && key != rhs_load_ && key != matmul_ && key != matmul_acc_) {
+      return IRMutator::VisitStmt_(op);
+    }
+    auto call = As<Call>(op->value_);
+    INTERNAL_CHECK_SPAN(call, op->span_) << "Internal error: canonical split-K definition is not a Call";
+    CallPtr rebuilt;
+    if (key == lhs_load_ || key == rhs_load_) {
+      rebuilt = RebuildLoad(call, /*lhs=*/key == lhs_load_);
+    } else {
+      std::vector<ExprPtr> args;
+      args.reserve(call->args_.size());
+      for (const auto& arg : call->args_) args.push_back(VisitExpr(arg));
+      auto deduced = OpRegistry::GetInstance().Create(call->op_->name_, args, call->kwargs_, call->span_);
+      rebuilt = PreserveCallAttrs(call, deduced);
+    }
+    auto var = std::make_shared<Var>(op->var_->name_hint_ + suffix_, rebuilt->GetType(), op->var_->span_);
+    var_remap_[op->var_.get()] = var;
+    return std::make_shared<AssignStmt>(var, rebuilt, op->span_, op->leading_comments_);
+  }
+
+ private:
+  CallPtr RebuildLoad(const CallPtr& call, bool lhs) {
+    std::vector<ExprPtr> args;
+    args.reserve(call->args_.size());
+    for (const auto& arg : call->args_) args.push_back(VisitExpr(arg));
+    auto offsets = As<MakeTuple>(args[1]);
+    INTERNAL_CHECK_SPAN(offsets && offsets->elements_.size() == 2, call->span_)
+        << "Internal error: canonical split-K tile.load lost its 2D offsets";
+    std::vector<ExprPtr> new_offsets = offsets->elements_;
+    if (lhs) {
+      new_offsets[0] = OffsetPlus(new_offsets[0], mi_, call->span_);
+      args[2] = MakeIndexTuple({window_.physical_m, k_}, call->span_);
+      args[3] = MakeIndexTuple({window_.valid_m, k_}, call->span_);
+    } else {
+      new_offsets[1] = OffsetPlus(new_offsets[1], ni_, call->span_);
+      args[2] = MakeIndexTuple({k_, window_.physical_n}, call->span_);
+      args[3] = MakeIndexTuple({k_, window_.valid_n}, call->span_);
+    }
+    args[1] = std::make_shared<MakeTuple>(std::move(new_offsets), call->span_);
+    auto deduced = OpRegistry::GetInstance().Create(call->op_->name_, args, call->kwargs_, call->span_);
+    return PreserveCallAttrs(call, deduced);
+  }
+
+  const Var* lhs_load_ = nullptr;
+  const Var* rhs_load_ = nullptr;
+  const Var* matmul_ = nullptr;
+  const Var* matmul_acc_ = nullptr;
+  int64_t mi_ = 0;
+  int64_t ni_ = 0;
+  CanonicalOutputWindow window_;
+  int64_t k_ = 0;
+  std::string suffix_;
+};
+
+struct CanonicalSplitKFold {
+  std::vector<StmtPtr> stmts;
+  VarPtr final_output;
+  VarPtr old_store_result;
+};
+
+std::optional<CanonicalSplitKFold> TryFoldCanonicalSplitKAcc(const CanonicalSplitKAccMatch& match,
+                                                             std::vector<Diagnostic>& hints) {
+  const auto output_box_alignment = GetCanonicalOutputBoxAlignment(match);
+  if (!output_box_alignment) {
+    hints.emplace_back(DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-006",
+                       "canonical split-K M/N tiling needs boxed Mat operand layouts with a supported static "
+                       "fractal alignment; left untouched",
+                       match.loop->span_);
+    return std::nullopt;
+  }
+  // The source loop already realizes output-stationary accumulation across its
+  // K blocks. Use the conservative output-stationary chooser regime for the
+  // output grid. Account for the same Mat boxing that RebuildLoad will apply to
+  // every physical output window, so chooser capacity cannot admit a logical
+  // tile that becomes oversized after padding. The recursively visited
+  // narrowed calls independently choose their legal inner K blocking.
+  auto tiling = AnalyzeMatmul(match.matmul, hints, /*force_output_stationary=*/true, output_box_alignment);
+  if (!tiling || !tiling->needs_mn_tiling()) return std::nullopt;
+
+  auto store_call = As<Call>(match.store->value_);
+  auto offsets = As<MakeTuple>(store_call->args_[1]);
+  auto out_in = AsVarLike(store_call->args_[2]);
+  INTERNAL_CHECK_SPAN(offsets && out_in, match.store->span_)
+      << "Internal error: matched canonical split-K store became invalid";
+  DirectGmPlacer placer(offsets->elements_[0], offsets->elements_[1], out_in, store_call->kwargs_,
+                        store_call->attrs_, match.store->span_);
+  std::vector<StmtPtr> stmts;
+  VarPtr chain = placer.Init(stmts);
+  auto out_ty = As<TileType>(match.matmul->var_->GetType());
+  INTERNAL_CHECK_SPAN(out_ty, match.matmul->span_)
+      << "Internal error: canonical split-K matmul result lost its TileType";
+  const int64_t num_m = (match.M + tiling->m - 1) / tiling->m;
+  const int64_t num_n = (match.N + tiling->n - 1) / tiling->n;
+  // Output-sensitive expansion: each source statement is cloned once per
+  // required output tile, matching BuildSplitKGrid. Work is O(input IR plus
+  // emitted IR); there is no repeated scan of the surrounding program.
+  int step = 0;
+  for (int64_t nj = 0; nj < num_n; ++nj) {
+    const int64_t ni = nj * tiling->n;
+    const int64_t n_eff = std::min<int64_t>(tiling->n, match.N - ni);
+    for (int64_t mj = 0; mj < num_m; ++mj) {
+      const int64_t mi = mj * tiling->m;
+      const int64_t m_eff = std::min<int64_t>(tiling->m, match.M - mi);
+      const std::string suffix = "_mn" + std::to_string(step);
+      const auto window = BuildCanonicalOutputWindow(match, m_eff, n_eff, *output_box_alignment);
+      auto init = BuildAccInitWithValidShape(window.physical_m, window.physical_n,
+                                             MakeIndex(window.valid_m, match.init->span_),
+                                             MakeIndex(window.valid_n, match.init->span_), out_ty->dtype_,
+                                             match.init->var_->name_hint_ + suffix, match.init->span_);
+      for (auto& init_stmt : init.stmts) stmts.push_back(std::move(init_stmt));
+
+      std::unordered_map<const Var*, ExprPtr> seed = {{match.init->var_.get(), init.value}};
+      auto clone = DeepClone(match.loop, seed, /*clone_def_vars=*/true);
+      auto cloned_loop = As<ForStmt>(clone.cloned_body);
+      INTERNAL_CHECK_SPAN(cloned_loop, match.loop->span_)
+          << "Internal error: canonical split-K loop clone is not a ForStmt";
+      CanonicalSplitKRetiler retiler(match, clone.var_map, init.value, mi, ni, window, suffix);
+      auto narrowed = As<ForStmt>(retiler.VisitStmt(cloned_loop));
+      INTERNAL_CHECK_SPAN(narrowed, match.loop->span_)
+          << "Internal error: canonical split-K retiling did not return a ForStmt";
+      stmts.push_back(narrowed);
+      chain = placer.PlaceAt(stmts, narrowed->return_vars_[0], MakeIndex(mi, match.store->span_),
+                             MakeIndex(ni, match.store->span_), chain, step);
+      ++step;
+    }
+  }
+  return CanonicalSplitKFold{std::move(stmts), chain, match.store->var_};
+}
+
+/// Rewrite every canonical create/loop/store triplet in one SeqStmts scan.
+/// ``use_counts`` is built once over the original function, so matching all
+/// nested sequences remains O(N) rather than recursively rescanning each
+/// subtree. A running remap preserves an earlier store's output chain in later
+/// siblings.
+StmtPtr RewriteCanonicalSplitKSeq(const SeqStmtsPtr& seq,
+                                  const std::unordered_map<const Var*, size_t>& use_counts,
+                                  std::vector<Diagnostic>& hints) {
+  if (!seq || seq->stmts_.size() < 3) return seq;
+  std::vector<StmtPtr> out;
+  out.reserve(seq->stmts_.size());
+  std::unordered_map<const Var*, VarPtr> remap;
+  bool changed = false;
+
+  for (size_t i = 0; i < seq->stmts_.size();) {
+    auto current = remap.empty() ? seq->stmts_[i] : transform_utils::Substitute(seq->stmts_[i], remap);
+    if (i + 2 < seq->stmts_.size()) {
+      auto next = remap.empty() ? seq->stmts_[i + 1] : transform_utils::Substitute(seq->stmts_[i + 1], remap);
+      auto third =
+          remap.empty() ? seq->stmts_[i + 2] : transform_utils::Substitute(seq->stmts_[i + 2], remap);
+      auto match = MatchCanonicalSplitKAcc(As<AssignStmt>(current), As<ForStmt>(next), As<AssignStmt>(third),
+                                           use_counts);
+      if (match) {
+        if (auto fold = TryFoldCanonicalSplitKAcc(*match, hints)) {
+          for (auto& stmt : fold->stmts) out.push_back(std::move(stmt));
+          remap[fold->old_store_result.get()] = fold->final_output;
+          i += 3;
+          changed = true;
+          continue;
+        }
+      }
+    }
+    if (current.get() != seq->stmts_[i].get()) changed = true;
+    out.push_back(std::move(current));
+    ++i;
+  }
+  if (!changed) return seq;
+  return SeqStmts::Flatten(std::move(out), seq->span_);
+}
+
+/// First phase of AutoTileMatmulL0: move canonical split-K reductions outside
+/// their M/N output grid before dbC planning or ordinary call-level tiling.
+class CanonicalSplitKPreMutator : public IRMutator {
+ public:
+  CanonicalSplitKPreMutator(const std::unordered_map<const Var*, size_t>& use_counts,
+                            std::vector<Diagnostic>& hints)
+      : use_counts_(use_counts), hints_(hints) {}
+
+ protected:
+  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    // Match before recursively mutating children so definition identities still
+    // refer to the original function-wide read index. The qualified base visit
+    // then reaches canonical triplets in nested source regions; newly generated
+    // loops do not match because their fresh Vars are absent from that index and
+    // wait for the ordinary AutoTile phase to K-tile their narrowed calls.
+    auto rewritten = As<SeqStmts>(RewriteCanonicalSplitKSeq(op, use_counts_, hints_));
+    INTERNAL_CHECK_SPAN(rewritten, op->span_)
+        << "Internal error: canonical split-K pre-phase did not preserve SeqStmts";
+    return IRMutator::VisitStmt_(rewritten);
+  }
+
+ private:
+  const std::unordered_map<const Var*, size_t>& use_counts_;
+  std::vector<Diagnostic>& hints_;
+};
+
+FunctionPtr RewriteCanonicalSplitKAcc(const FunctionPtr& func, std::vector<Diagnostic>& hints) {
+  CanonicalReadCounter counter;
+  counter.VisitStmt(func->body_);
+  CanonicalSplitKPreMutator mutator(counter.counts, hints);
+  auto new_body = mutator.VisitStmt(func->body_);
+  if (new_body == func->body_) return func;
+  auto rewritten = MutableCopy(func);
+  rewritten->body_ = new_body;
+  return rewritten;
+}
 
 /// Emit one straight-line full-K sub-tile (no K-loop): extract the ``[m_eff, K]``
 /// left and ``[K, n_eff]`` right panels, ``tile.matmul``, and hand the
@@ -1177,9 +1804,11 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildSplitKGrid(const MatmulTiling& t, S
 ///
 /// The Mat-scratch alternative is handled earlier by ``TryFoldMatScratch``.
 /// ``result_uses`` / ``store_stmt`` come from the precomputed SiblingIndex.
-/// Returns nullopt (with a PerfHint) when neither placement applies —
-/// ``matmul_acc`` (caller-supplied [M, N] accumulator), a Vec left operand,
-/// and mixed/non-matmul on-chip consumers are deferred.
+/// Returns nullopt (with a PerfHint) when neither placement applies — an
+/// arbitrary ``matmul_acc`` with a caller-supplied [M, N] accumulator, a Vec
+/// left operand, and mixed/non-matmul on-chip consumers are deferred. The
+/// canonical frontend split-K create/pipeline/store form is handled earlier at
+/// the enclosing-loop level.
 std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, const AssignStmt* store_stmt,
                                       std::vector<Diagnostic>& hints) {
   const Span sp = t.assign->span_;
@@ -1190,8 +1819,9 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
 
   if (t.is_acc()) {
     return skip(
-        "tile.matmul_acc with an oversized [M, N] output needs M/N tiling — the matmul_acc path is "
-        "deferred (needs per-sub-tile accumulator slicing); left untouched");
+        "oversized tile.matmul_acc does not match the canonical create -> split-K pipeline -> store "
+        "form handled by loop-level M/N tiling; slicing this caller-owned [M, N] accumulator is "
+        "unsupported, so the call is left untouched");
   }
   if (t.stage_lhs_to_mat) {
     return skip(
@@ -1225,7 +1855,8 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
       return skip(
           "tile.store target is not a simple tensor variable — M/N fold not applicable; left untouched");
     }
-    DirectGmPlacer placer(offs->elements_[0], offs->elements_[1], out_in, store_call->kwargs_, sp);
+    DirectGmPlacer placer(offs->elements_[0], offs->elements_[1], out_in, store_call->kwargs_,
+                          store_call->attrs_, sp);
     auto [stmts, last_out] = full_k ? BuildFullKPipelined(t, placer) : BuildSplitKGrid(t, placer);
     return MNFold{std::move(stmts), last_out, store_stmt->var_, store_stmt};
   }
@@ -1271,14 +1902,16 @@ bool CastFoldableToFixpipeMat(const CallPtr& cast, const TileTypePtr& src_ty, Da
 /// Both K-split (unrolled, constant offsets) and full-K (pipelined, loop-variable
 /// offsets) are supported: ``tile.assemble`` only needs a literal ``MakeTuple``
 /// offset whose *elements* may be loop variables (`ValidateIndexTupleElements`
-/// requires index-typed elements, not constants).  ``matmul_acc`` and Vec-left
-/// stay deferred.
+/// requires index-typed elements, not constants). Arbitrary ``matmul_acc`` and
+/// Vec-left stay deferred; the canonical split-K form is handled before this
+/// local call-level fold.
 std::optional<std::pair<std::vector<StmtPtr>, VarPtr>> TryFoldMatScratch(const MatmulTiling& t,
                                                                          int result_uses, int operand_uses,
                                                                          DataType scratch_dtype,
                                                                          std::vector<Diagnostic>& hints) {
   const Span sp = t.assign->span_;
-  // matmul_acc / Vec-left are deferred (the direct-store path already hinted these).
+  // Arbitrary matmul_acc / Vec-left are deferred (the direct-store path already
+  // hinted these). Canonical split-K is rewritten at the enclosing-loop level.
   if (t.is_acc() || t.stage_lhs_to_mat) return std::nullopt;
   // Every use must be a matmul operand: a non-operand use (store, elementwise,
   // matmul_acc accumulator) means substituting an upstream Mat scratch is illegal.
@@ -1345,20 +1978,13 @@ std::optional<std::pair<std::vector<StmtPtr>, VarPtr>> TryFoldMatScratch(const M
 /// arithmetic overflow return nullopt: an automatic capacity decision must
 /// never guess low.
 std::optional<uint64_t> StaticAlignedTileBytes(const TileTypePtr& tile, MemorySpace space,
-                                               const MemoryAllocatorPolicy& policy) {
+                                               const MemoryAllocatorPolicy& policy,
+                                               const backend::BackendHandler* handler) {
   if (!tile || tile->GetMemorySpace() != space) return std::nullopt;
-  const uint64_t elem_bytes = DTypeBytes(tile->dtype_);
-  if (elem_bytes == 0) return std::nullopt;
-  uint64_t bytes = elem_bytes;
-  for (const auto& dim : tile->shape_) {
-    auto value = As<ConstInt>(dim);
-    if (!value || value->value_ <= 0) return std::nullopt;
-    const uint64_t extent = static_cast<uint64_t>(value->value_);
-    if (bytes > std::numeric_limits<uint64_t>::max() / extent) return std::nullopt;
-    bytes *= extent;
-  }
-  const uint64_t aligned = policy.AlignAddress(bytes, space);
-  if (aligned < bytes) return std::nullopt;  // alignment arithmetic overflow
+  auto bytes = utils::StaticPhysicalAllocationBytes(tile, space, handler);
+  if (!bytes) return std::nullopt;
+  const uint64_t aligned = policy.AlignAddress(*bytes, space);
+  if (aligned < *bytes) return std::nullopt;  // alignment arithmetic overflow
   return aligned;
 }
 
@@ -1379,7 +2005,8 @@ std::optional<uint64_t> StaticAlignedTileBytes(const TileTypePtr& tile, MemorySp
 /// post-lowering multiplicity was omitted here.
 class AccFootprintCollector : public IRVisitor {
  public:
-  explicit AccFootprintCollector(const MemoryAllocatorPolicy& policy) : policy_(policy) {}
+  AccFootprintCollector(const MemoryAllocatorPolicy& policy, const backend::BackendHandler* handler)
+      : policy_(policy), handler_(handler) {}
 
   bool valid = true;
   uint64_t total_bytes = 0;
@@ -1432,7 +2059,7 @@ class AccFootprintCollector : public IRVisitor {
     if (!valid || !var || copies == 0) return;
     auto tile = As<TileType>(var->GetType());
     if (!tile || tile->GetMemorySpace() != MemorySpace::Acc) return;
-    auto bytes = StaticAlignedTileBytes(tile, MemorySpace::Acc, policy_);
+    auto bytes = StaticAlignedTileBytes(tile, MemorySpace::Acc, policy_, handler_);
     if (!bytes || copies > std::numeric_limits<uint64_t>::max() / *bytes) {
       valid = false;
       return;
@@ -1458,6 +2085,7 @@ class AccFootprintCollector : public IRVisitor {
   }
 
   const MemoryAllocatorPolicy& policy_;
+  const backend::BackendHandler* handler_ = nullptr;
   uint64_t pipeline_depth_ = 1;
   int explicit_dbc_depth_ = 0;
   std::unordered_map<const Var*, Entry> entries_;
@@ -1559,8 +2187,8 @@ bool IsPipelineAccumulatorProfitable(const PipelineAccumulatorCandidate& candida
 ///
 /// The direct-body scans are disjoint across nested loops, so this remains
 /// linear in program size.
-std::optional<PipelineAccumulatorCandidate> AnalyzePipelineAccumulator(const ForStmtPtr& loop,
-                                                                       const MemoryAllocatorPolicy& policy) {
+std::optional<PipelineAccumulatorCandidate> AnalyzePipelineAccumulator(
+    const ForStmtPtr& loop, const MemoryAllocatorPolicy& policy, const backend::BackendHandler* handler) {
   const int stages = loop ? loop->GetAttr<int>(kPipelineStagesAttr, 0) : 0;
   const int64_t trip_count = loop ? transform_utils::EvalConstTripCount(loop) : -1;
   if (!loop || loop->kind_ != ForKind::Pipeline || loop->HasAttr(kPipelineOverlapStoresAttr) ||
@@ -1638,7 +2266,7 @@ std::optional<PipelineAccumulatorCandidate> AnalyzePipelineAccumulator(const For
   if (!IsStatic2DInSpaces(acc_ty, {MemorySpace::Acc}, acc_m, acc_n) || acc_m != M || acc_n != N) {
     return std::nullopt;
   }
-  auto acc_bytes = StaticAlignedTileBytes(acc_ty, MemorySpace::Acc, policy);
+  auto acc_bytes = StaticAlignedTileBytes(acc_ty, MemorySpace::Acc, policy, handler);
   if (!acc_bytes) return std::nullopt;
 
   // Count all uses in the direct body, excluding assignment LHS definitions.
@@ -1738,18 +2366,23 @@ std::unordered_set<const ForStmt*> BuildPipelineDbCPlan(const FunctionPtr& func)
   auto policy = pypto::backend::GetBackend()->CreateMemoryAllocatorPolicy();
   if (!policy) return {};
 
-  AccFootprintCollector footprint(*policy);
+  const auto* handler = ctx ? ctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
+  const uint64_t l0c_bytes = handler ? handler->GetL0cCapacityBytes() : 0;
+  if (!handler || l0c_bytes == 0) return {};
+
+  AccFootprintCollector footprint(*policy, handler);
   footprint.VisitFunction(func);
   if (!footprint.valid) return {};
 
   class CandidateCollector : public IRVisitor {
    public:
-    explicit CandidateCollector(const MemoryAllocatorPolicy& policy) : policy_(policy) {}
+    CandidateCollector(const MemoryAllocatorPolicy& policy, const backend::BackendHandler* handler)
+        : policy_(policy), handler_(handler) {}
     std::unordered_map<const ForStmt*, PipelineAccumulatorCandidate> candidates;
 
    protected:
     void VisitStmt_(const ForStmtPtr& op) override {
-      if (auto candidate = AnalyzePipelineAccumulator(op, policy_)) {
+      if (auto candidate = AnalyzePipelineAccumulator(op, policy_, handler_)) {
         candidates.emplace(op.get(), *candidate);
       }
       IRVisitor::VisitStmt_(op);
@@ -1757,13 +2390,10 @@ std::unordered_set<const ForStmt*> BuildPipelineDbCPlan(const FunctionPtr& func)
 
    private:
     const MemoryAllocatorPolicy& policy_;
-  } candidates(*policy);
+    const backend::BackendHandler* handler_ = nullptr;
+  } candidates(*policy, handler);
   candidates.VisitStmt(func->body_);
   if (candidates.candidates.empty()) return {};
-
-  const auto* handler = ctx ? ctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
-  const uint64_t l0c_bytes = handler ? handler->GetL0cCapacityBytes() : 0;
-  if (l0c_bytes == 0) return {};
 
   for (auto it = candidates.candidates.begin(); it != candidates.candidates.end();) {
     if (!IsPipelineAccumulatorProfitable(it->second, l0c_bytes)) {
@@ -1910,11 +2540,10 @@ class AutoTileMutator : public IRMutator {
           const auto* bh_ctx = PassContext::Current();
           const auto* bh = bh_ctx ? bh_ctx->GetBackendHandler() : pypto::backend::GetBackend()->GetHandler();
           const uint64_t l0c_bytes = bh ? bh->GetL0cCapacityBytes() : 0;
-          const uint64_t acc_bytes = src_acc && m_ci && n_ci ? static_cast<uint64_t>(m_ci->value_) *
-                                                                   static_cast<uint64_t>(n_ci->value_) *
-                                                                   DTypeBytes(src_ty->dtype_)
-                                                             : 0;
-          if (src_acc && m_ci && n_ci && l0c_bytes && acc_bytes <= l0c_bytes) {
+          const auto acc_bytes = src_acc && m_ci && n_ci
+                                     ? utils::StaticPhysicalAllocationBytes(src_ty, MemorySpace::Acc, bh)
+                                     : std::optional<uint64_t>{};
+          if (src_acc && m_ci && n_ci && l0c_bytes && acc_bytes && *acc_bytes <= l0c_bytes) {
             if (!sibling_index) sibling_index = BuildSiblingIndex(op->stmts_);
             const Var* cb = cast_as->var_.get();
             auto uc = sibling_index->use_counts.find(cb);
@@ -2077,11 +2706,15 @@ class AutoTileMutator : public IRMutator {
 FunctionPtr TransformFunction(const FunctionPtr& func, std::vector<Diagnostic>& hints) {
   if (!func || !func->body_) return func;
   if (!IsInCoreType(func->func_type_)) return func;
-  AutoTileMutator mutator(BuildPipelineDbCPlan(func));
-  auto new_body = mutator.VisitStmt(func->body_);
+  // Canonical loop-carried split-K output tiling changes both the Acc inventory
+  // and loop identities. Rewrite it first so the #2131 dbC capacity/placement
+  // plan is computed from the exact IR the ordinary AutoTile phase will visit.
+  auto canonical = RewriteCanonicalSplitKAcc(func, hints);
+  AutoTileMutator mutator(BuildPipelineDbCPlan(canonical));
+  auto new_body = mutator.VisitStmt(canonical->body_);
   for (auto& d : mutator.hints) hints.push_back(std::move(d));
-  if (new_body == func->body_) return func;
-  auto new_func = MutableCopy(func);
+  if (new_body == canonical->body_) return canonical;
+  auto new_func = MutableCopy(canonical);
   new_func->body_ = new_body;
   return new_func;
 }

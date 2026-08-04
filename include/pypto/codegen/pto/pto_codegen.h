@@ -303,6 +303,16 @@ class PTOCodegen : public CodegenBase {
   std::pair<std::string, std::string> GetCurrentResultTpopValidShapeOperands();
 
   /**
+   * @brief Get the TileType of the current assignment result, if any.
+   *
+   * Backend emitters use this alongside the result buffer/type helpers when an
+   * operation's transport shape differs temporarily from its logical shape.
+   */
+  std::shared_ptr<const ir::TileType> GetCurrentResultTileType() const {
+    return fs_.current_result_tile_type;
+  }
+
+  /**
    * @brief Get tile_buf type string directly from a TileType
    *
    * Unlike GetTileBufTypeString(memref), this uses the shape/layout from the
@@ -598,7 +608,7 @@ class PTOCodegen : public CodegenBase {
    * box (carrying its fillpad'd columns) while PRESERVING the row
    * `valid_shape[0]`: subblock 0's real push stays full and subblock 1's
    * 0-row replay stays a no-op. Genuine `split==1/2` paths widen both axes --
-   * see `EmitSplitTpushTransportValidShape`.
+   * see `EmitTpushTransportValidShape`.
    */
   [[nodiscard]] bool IsDualAivDispatchFunction() const;
 
@@ -727,11 +737,17 @@ class PTOCodegen : public CodegenBase {
    *
    * The result is always dynamic (`v_row=?, v_col=?`) and carries explicit
    * `valid_row` / `valid_col` operands lowered from `tile_type->tile_view_.valid_shape`
-   * when present, falling back to `tile_type->shape_` otherwise.
+   * when present, falling back to `tile_type->shape_` otherwise. Head-declared
+   * control-flow buffers may request the physical shape so their declaration
+   * does not reference a body-local valid-shape SSA value; codegen restores the
+   * logical valid shape at the control-flow site before the buffer is used.
    *
    * @param tile_type Tile type carrying shape/tile_view/memref metadata.
+   * @param use_physical_valid_shape Use `shape_`, ignoring an explicit logical
+   *        `tile_view_.valid_shape`, for the alloc operands.
    */
-  AllocTileFields ComputeAllocTileFields(const std::shared_ptr<const ir::TileType>& tile_type);
+  AllocTileFields ComputeAllocTileFields(const std::shared_ptr<const ir::TileType>& tile_type,
+                                         bool use_physical_valid_shape = false);
 
   /**
    * @brief The tile_buf handle already bound to the buffer `memref` denotes.

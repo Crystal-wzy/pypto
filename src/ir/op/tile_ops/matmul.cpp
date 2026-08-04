@@ -31,6 +31,7 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -62,25 +63,34 @@ TypePtr DeduceTileMatMulType(const std::vector<ExprPtr>& args,
   CHECK(rhs_shape.size() == 2) << "The operator " << op_name << " requires rhs to be 2D, but got "
                                << rhs_shape.size() << " dimensions";
 
-  // Matrix multiplication: [M, K] @ [K, N] -> [M, N]
-  // We need to verify that K dimensions match
-  // Note: In PTO ISA, we see [M, K] @ [K, N] -> [M, N]
+  // Matrix multiplication: [M, K] @ [K, N] -> [M, N]. Physical boxed
+  // storage may be wider than the valid computation window, so dimensional
+  // compatibility follows valid_shape while the result allocation follows
+  // the operands' physical M/N extents.
+  const auto lhs_valid = GetValidShape(lhs_type);
+  const auto rhs_valid = GetValidShape(rhs_type);
+  const ExprPtr& k_dim_lhs = lhs_valid[1];
+  const ExprPtr& k_dim_rhs = rhs_valid[0];
 
-  ExprPtr m_dim = lhs_shape[0];
-  ExprPtr k_dim_lhs = lhs_shape[1];
-  ExprPtr k_dim_rhs = rhs_shape[0];
-  ExprPtr n_dim = rhs_shape[1];
-
-  // Try to verify K dimensions match if they are constant
-  auto k_lhs_const = As<ConstInt>(k_dim_lhs);
-  auto k_rhs_const = As<ConstInt>(k_dim_rhs);
-
-  if (k_lhs_const && k_rhs_const) {
-    CHECK(k_lhs_const->value_ == k_rhs_const->value_)
+  // Physical boxes must remain compatible even when their logical valid
+  // windows are narrower. Downstream extraction and L0 tiling index the
+  // physical K extent directly.
+  auto physical_k_lhs_const = As<ConstInt>(lhs_shape[1]);
+  auto physical_k_rhs_const = As<ConstInt>(rhs_shape[0]);
+  if (physical_k_lhs_const && physical_k_rhs_const) {
+    CHECK(physical_k_lhs_const->value_ == physical_k_rhs_const->value_)
         << "The operator " << op_name
-        << " requires matching inner dimensions, but got lhs K=" << k_lhs_const->value_
-        << " and rhs K=" << k_rhs_const->value_;
+        << " requires matching physical inner dimensions, but got lhs K=" << physical_k_lhs_const->value_
+        << " and rhs K=" << physical_k_rhs_const->value_;
   }
+
+  // PTO takes M/K from lhs and N from rhs. The rhs may expose a wider valid K
+  // window than lhs (for example a physically padded GM-to-Mat load), but it
+  // must contain every K element PTO will read.
+  CHECK(ProveValidExtentLessEqual(k_dim_lhs, k_dim_rhs) != ProofResult::kFalse)
+      << "The operator " << op_name
+      << " requires rhs valid K to cover lhs valid K, but got lhs K=" << PythonPrint(k_dim_lhs)
+      << " and rhs K=" << PythonPrint(k_dim_rhs);
 
   // A2A3 only support float or int32_t output, and input type must be same
   CHECK(lhs_type->dtype_ == rhs_type->dtype_)
@@ -89,8 +99,10 @@ TypePtr DeduceTileMatMulType(const std::vector<ExprPtr>& args,
   auto result_dtype =
       (lhs_type->dtype_.IsFloat() && rhs_type->dtype_.IsFloat()) ? DataType::FP32 : DataType::INT32;
 
-  // Output shape is [M, N]
-  std::vector<ExprPtr> output_shape = {m_dim, n_dim};
+  // Physical output shape follows the boxed operands; only their valid M/N
+  // rectangle contains computed values.
+  std::vector<ExprPtr> output_shape = {lhs_shape[0], rhs_shape[1]};
+  std::vector<ExprPtr> output_valid_shape = {lhs_valid[0], rhs_valid[1]};
 
   // Acc layout (Nz), taken from the destination space's implicit layout rather
   // than a hand-written triple. fractal is the inner box size in *bytes* — 16
@@ -99,7 +111,7 @@ TypePtr DeduceTileMatMulType(const std::vector<ExprPtr>& args,
   TileView tile_view;
   tile_view_semantics::SetTileLayout(
       tile_view, tile_view_semantics::GetImplicitTileLayout(output_shape, MemorySpace::Acc));
-  tile_view.valid_shape = output_shape;
+  tile_view.valid_shape = std::move(output_valid_shape);
 
   return std::make_shared<TileType>(output_shape, result_dtype, std::nullopt, tile_view, MemorySpace::Acc);
 }
@@ -136,38 +148,58 @@ TypePtr DeduceTileMatMulAccType(const std::vector<ExprPtr>& args,
   CHECK(rhs_shape.size() == 2) << "The operator " << op_name << " requires rhs to be 2D, but got "
                                << rhs_shape.size() << " dimensions";
 
-  // Matrix multiplication with accumulation: acc[M, N] += lhs[M, K] @ rhs[K, N]
-  ExprPtr m_dim_acc = acc_shape[0];
-  ExprPtr n_dim_acc = acc_shape[1];
+  // Matrix multiplication with accumulation: acc[M, N] += lhs[M, K] @ rhs[K, N].
+  // Match the logical valid rectangle, not padding in the boxed allocations.
+  const auto acc_valid = GetValidShape(acc_type);
+  const auto lhs_valid = GetValidShape(lhs_type);
+  const auto rhs_valid = GetValidShape(rhs_type);
+  const ExprPtr& m_dim_acc = acc_valid[0];
+  const ExprPtr& n_dim_acc = acc_valid[1];
 
-  // Verify dimensions match
-  auto m_acc_const = As<ConstInt>(m_dim_acc);
-  auto m_lhs_const = As<ConstInt>(lhs_shape[0]);
-  auto n_acc_const = As<ConstInt>(n_dim_acc);
-  auto n_rhs_const = As<ConstInt>(rhs_shape[1]);
-  auto k_lhs_const = As<ConstInt>(lhs_shape[1]);
-  auto k_rhs_const = As<ConstInt>(rhs_shape[0]);
+  // The aliased Acc result, lhs, and rhs must agree in physical M/N/K. Valid
+  // windows are checked separately below and may be narrower than these boxes.
+  auto physical_m_acc_const = As<ConstInt>(acc_shape[0]);
+  auto physical_m_lhs_const = As<ConstInt>(lhs_shape[0]);
+  auto physical_n_acc_const = As<ConstInt>(acc_shape[1]);
+  auto physical_n_rhs_const = As<ConstInt>(rhs_shape[1]);
+  auto physical_k_lhs_const = As<ConstInt>(lhs_shape[1]);
+  auto physical_k_rhs_const = As<ConstInt>(rhs_shape[0]);
 
-  if (m_acc_const && m_lhs_const) {
-    CHECK(m_acc_const->value_ == m_lhs_const->value_)
+  if (physical_m_acc_const && physical_m_lhs_const) {
+    CHECK(physical_m_acc_const->value_ == physical_m_lhs_const->value_)
         << "The operator " << op_name
-        << " requires matching M dimensions, but got acc M=" << m_acc_const->value_
-        << " and lhs M=" << m_lhs_const->value_;
+        << " requires matching physical M dimensions, but got acc M=" << physical_m_acc_const->value_
+        << " and lhs M=" << physical_m_lhs_const->value_;
+  }
+  if (physical_n_acc_const && physical_n_rhs_const) {
+    CHECK(physical_n_acc_const->value_ == physical_n_rhs_const->value_)
+        << "The operator " << op_name
+        << " requires matching physical N dimensions, but got acc N=" << physical_n_acc_const->value_
+        << " and rhs N=" << physical_n_rhs_const->value_;
+  }
+  if (physical_k_lhs_const && physical_k_rhs_const) {
+    CHECK(physical_k_lhs_const->value_ == physical_k_rhs_const->value_)
+        << "The operator " << op_name
+        << " requires matching physical K dimensions, but got lhs K=" << physical_k_lhs_const->value_
+        << " and rhs K=" << physical_k_rhs_const->value_;
   }
 
-  if (n_acc_const && n_rhs_const) {
-    CHECK(n_acc_const->value_ == n_rhs_const->value_)
-        << "The operator " << op_name
-        << " requires matching N dimensions, but got acc N=" << n_acc_const->value_
-        << " and rhs N=" << n_rhs_const->value_;
-  }
-
-  if (k_lhs_const && k_rhs_const) {
-    CHECK(k_lhs_const->value_ == k_rhs_const->value_)
-        << "The operator " << op_name
-        << " requires matching K dimensions, but got lhs K=" << k_lhs_const->value_
-        << " and rhs K=" << k_rhs_const->value_;
-  }
+  // PTO derives the computed M/K/N rectangle from lhs/lhs/rhs. The in-place
+  // accumulator and rhs K window may be larger, but must contain that complete
+  // rectangle. Unknown symbolic relations remain legal, matching the previous
+  // static-only validation while rejecting every provably out-of-bounds case.
+  CHECK(ProveValidExtentLessEqual(lhs_valid[0], m_dim_acc) != ProofResult::kFalse)
+      << "The operator " << op_name
+      << " requires acc valid M to cover lhs valid M, but got acc M=" << PythonPrint(m_dim_acc)
+      << " and lhs M=" << PythonPrint(lhs_valid[0]);
+  CHECK(ProveValidExtentLessEqual(rhs_valid[1], n_dim_acc) != ProofResult::kFalse)
+      << "The operator " << op_name
+      << " requires acc valid N to cover rhs valid N, but got acc N=" << PythonPrint(n_dim_acc)
+      << " and rhs N=" << PythonPrint(rhs_valid[1]);
+  CHECK(ProveValidExtentLessEqual(lhs_valid[1], rhs_valid[0]) != ProofResult::kFalse)
+      << "The operator " << op_name
+      << " requires rhs valid K to cover lhs valid K, but got lhs K=" << PythonPrint(lhs_valid[1])
+      << " and rhs K=" << PythonPrint(rhs_valid[0]);
 
   // A2A3 only support float or int32_t output, and input type must be same
   CHECK(lhs_type->dtype_ == rhs_type->dtype_)
@@ -180,14 +212,14 @@ TypePtr DeduceTileMatMulAccType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name << " requires accumulator dtype " << result_dtype.ToString()
       << ", but got " << acc_type->dtype_.ToString();
 
-  // Output shape is [M, N] (same as accumulator)
-  std::vector<ExprPtr> output_shape = {m_dim_acc, n_dim_acc};
+  // The output aliases the accumulator's physical storage and valid region.
+  std::vector<ExprPtr> output_shape = acc_shape;
 
   // Acc layout (Nz) — as in tile.matmul, from the destination's implicit layout.
   TileView tile_view;
   tile_view_semantics::SetTileLayout(
       tile_view, tile_view_semantics::GetImplicitTileLayout(output_shape, MemorySpace::Acc));
-  tile_view.valid_shape = output_shape;
+  tile_view.valid_shape = acc_valid;
 
   return std::make_shared<TileType>(output_shape, result_dtype, std::nullopt, tile_view, MemorySpace::Acc);
 }

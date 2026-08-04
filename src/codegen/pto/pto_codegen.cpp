@@ -1111,7 +1111,7 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
 }
 
 PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
-    const std::shared_ptr<const ir::TileType>& tile_type) {
+    const std::shared_ptr<const ir::TileType>& tile_type, bool use_physical_valid_shape) {
   AllocTileFields fields;
 
   // Type string always uses dynamic valid dims (v_row=?, v_col=?); the actual
@@ -1161,7 +1161,7 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
   //   - tile_type->shape_ otherwise (physical dims).
   const std::vector<ir::ExprPtr>* dims = nullptr;
   if (const auto& tile_view = tile_type->tile_view_;
-      tile_view.has_value() && !tile_view->valid_shape.empty()) {
+      !use_physical_valid_shape && tile_view.has_value() && !tile_view->valid_shape.empty()) {
     dims = &tile_view->valid_shape;
   } else if (!tile_type->shape_.empty()) {
     dims = &tile_type->shape_;
@@ -1860,7 +1860,7 @@ std::string PTOCodegen::GetTileBufTypeString(const ir::Var* base_ptr) const {
   std::string loc = MemorySpaceToMLIR(*memory_space);
   auto c = ExtractTileTypeInfo(*tile_it->second, GetTypeString(tile_it->second->dtype_));
   return FormatTileBufTypeString(loc, c.dtype_str, c.rows, c.cols, c.blayout, c.slayout, c.fractal, c.pad,
-                                 c.v_row, c.v_col, c.v_row_dynamic, c.v_col_dynamic);
+                                 c.compact, c.v_row, c.v_col, c.v_row_dynamic, c.v_col_dynamic);
 }
 
 std::string PTOCodegen::GetTileBufTypeStringFromTileType(
@@ -1872,7 +1872,7 @@ std::string PTOCodegen::GetTileBufTypeStringFromTileType(
   std::string loc = MemorySpaceToMLIR(*memory_space);
   auto c = ExtractTileTypeInfo(*tile_type, GetTypeString(tile_type->dtype_));
   return FormatTileBufTypeString(loc, c.dtype_str, c.rows, c.cols, c.blayout, c.slayout, c.fractal, c.pad,
-                                 c.v_row, c.v_col, c.v_row_dynamic, c.v_col_dynamic);
+                                 c.compact, c.v_row, c.v_col, c.v_row_dynamic, c.v_col_dynamic);
 }
 
 std::string PTOCodegen::GetViewTileBufTypeStringFromTileType(
@@ -1913,7 +1913,7 @@ std::string PTOCodegen::GetViewTileBufTypeStringFromTileType(
     }
   }
   return FormatTileBufTypeString(MemorySpaceToMLIR(*memory_space), c.dtype_str, c.rows, c.cols, c.blayout,
-                                 c.slayout, c.fractal, c.pad, c.v_row, c.v_col, c.v_row_dynamic,
+                                 c.slayout, c.fractal, c.pad, c.compact, c.v_row, c.v_col, c.v_row_dynamic,
                                  c.v_col_dynamic);
 }
 

@@ -2026,6 +2026,245 @@ class TestTileBroadcastOps:
 class TestTileMatMulOps:
     """Test suite for tile-level matrix multiplication operators."""
 
+    def test_matmul_and_acc_propagate_padded_operand_valid_shape(self):
+        """Matmul uses logical valid extents inside box-aligned storage.
+
+        A boundary Right tile may require 32 physical INT8 columns even when
+        only 16 columns are in bounds.  The resulting Acc tile must retain the
+        physical width for allocation and the logical width for computation
+        and stores; ``matmul_acc`` must preserve both.
+        """
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        lhs_type = ir.TileType(
+            dims(16, 128),
+            DataType.INT8,
+            tile_view=ir.TileView(valid_shape=dims(16, 128)),
+            memory_space=ir.MemorySpace.Left,
+        )
+        rhs_type = ir.TileType(
+            dims(128, 32),
+            DataType.INT8,
+            tile_view=ir.TileView(valid_shape=dims(128, 16)),
+            memory_space=ir.MemorySpace.Right,
+        )
+        lhs = ir.Var("lhs", lhs_type, span)
+        rhs = ir.Var("rhs", rhs_type, span)
+
+        matmul_type = tile.matmul(lhs, rhs).type
+        assert isinstance(matmul_type, ir.TileType)
+        assert _const_values(matmul_type.shape) == [16, 32]
+        assert _valid_of(matmul_type) == [16, 16]
+
+        acc_type = ir.TileType(
+            dims(16, 32),
+            DataType.INT32,
+            tile_view=ir.TileView(valid_shape=dims(16, 16)),
+            memory_space=ir.MemorySpace.Acc,
+        )
+        acc = ir.Var("acc", acc_type, span)
+        matmul_acc_type = tile.matmul_acc(acc, lhs, rhs).type
+        assert isinstance(matmul_acc_type, ir.TileType)
+        assert _const_values(matmul_acc_type.shape) == [16, 32]
+        assert _valid_of(matmul_acc_type) == [16, 16]
+
+    def test_matmul_rejects_mismatched_physical_k_with_matching_valid_k(self):
+        """Logical K agreement does not make incompatible physical boxes legal."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(dims(16, 32), DataType.INT8, tile_view=ir.TileView(valid_shape=dims(16, 16))),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(dims(16, 32), DataType.INT8, tile_view=ir.TileView(valid_shape=dims(16, 16))),
+            span,
+        )
+
+        with pytest.raises(ValueError, match="matching physical inner dimensions"):
+            tile.matmul(lhs, rhs)
+
+    def test_matmul_allows_rhs_valid_k_to_contain_lhs_valid_k(self):
+        """PTO reads lhs valid K and permits a wider valid window on rhs."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(
+                dims(16, 256),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(16, 255)),
+            ),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(
+                dims(256, 16),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(256, 16)),
+            ),
+            span,
+        )
+
+        result = tile.matmul(lhs, rhs).type
+        assert isinstance(result, ir.TileType)
+        assert _const_values(result.shape) == [16, 16]
+        assert _valid_of(result) == [16, 16]
+
+    def test_matmul_rejects_rhs_valid_k_smaller_than_lhs(self):
+        """The rhs valid K window must contain every lhs K element PTO reads."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(
+                dims(16, 256),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(16, 256)),
+            ),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(
+                dims(256, 16),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(255, 16)),
+            ),
+            span,
+        )
+
+        with pytest.raises(ValueError, match="rhs valid K to cover lhs valid K"):
+            tile.matmul(lhs, rhs)
+
+    def test_matmul_acc_allows_acc_valid_shape_to_contain_product(self):
+        """PTO may update a smaller product rectangle inside a wider accumulator."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        acc = ir.Var(
+            "acc",
+            ir.TileType(
+                dims(16, 32),
+                DataType.FP32,
+                tile_view=ir.TileView(valid_shape=dims(16, 32)),
+            ),
+            span,
+        )
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(
+                dims(16, 16),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(16, 16)),
+            ),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(
+                dims(16, 32),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(16, 24)),
+            ),
+            span,
+        )
+
+        result = tile.matmul_acc(acc, lhs, rhs).type
+        assert isinstance(result, ir.TileType)
+        assert _const_values(result.shape) == [16, 32]
+        assert _valid_of(result) == [16, 32]
+
+    @pytest.mark.parametrize(
+        ("acc_valid", "lhs_valid", "rhs_valid", "message"),
+        [
+            ((15, 32), (16, 16), (16, 24), "acc valid M"),
+            ((16, 23), (16, 16), (16, 24), "acc valid N"),
+            ((16, 32), (16, 16), (15, 24), "rhs valid K"),
+        ],
+    )
+    def test_matmul_acc_rejects_valid_shape_not_containing_product(
+        self, acc_valid, lhs_valid, rhs_valid, message
+    ):
+        """Each PTO-computed extent must fit its corresponding valid window."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        acc = ir.Var(
+            "acc",
+            ir.TileType(dims(16, 32), DataType.FP32, tile_view=ir.TileView(valid_shape=dims(*acc_valid))),
+            span,
+        )
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(dims(16, 16), DataType.FP16, tile_view=ir.TileView(valid_shape=dims(*lhs_valid))),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(dims(16, 32), DataType.FP16, tile_view=ir.TileView(valid_shape=dims(*rhs_valid))),
+            span,
+        )
+
+        with pytest.raises(ValueError, match=message):
+            tile.matmul_acc(acc, lhs, rhs)
+
+    @pytest.mark.parametrize(
+        ("acc_shape", "lhs_shape", "rhs_shape", "message"),
+        [
+            ((32, 32), (16, 16), (16, 32), "physical M"),
+            ((16, 64), (16, 16), (16, 32), "physical N"),
+            ((16, 32), (16, 32), (16, 32), "physical K"),
+        ],
+    )
+    def test_matmul_acc_rejects_mismatched_physical_boxes_with_matching_valid_shape(
+        self, acc_shape, lhs_shape, rhs_shape, message
+    ):
+        """All three physical dimensions remain part of the matmul_acc contract."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        valid_shape = dims(16, 16)
+        acc = ir.Var(
+            "acc",
+            ir.TileType(dims(*acc_shape), DataType.INT32, tile_view=ir.TileView(valid_shape=valid_shape)),
+            span,
+        )
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(dims(*lhs_shape), DataType.INT8, tile_view=ir.TileView(valid_shape=valid_shape)),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(dims(*rhs_shape), DataType.INT8, tile_view=ir.TileView(valid_shape=valid_shape)),
+            span,
+        )
+
+        with pytest.raises(ValueError, match=message):
+            tile.matmul_acc(acc, lhs, rhs)
+
     def test_tile_matmul(self):
         """Test tile.matmul operator - matrix multiplication."""
 
@@ -2469,6 +2708,25 @@ class TestTileSliceReshapeOps:
         result_type = tile.reshape(_partial_tile([8, 16], [5, 16]), [16, 8]).type
 
         assert _valid_of(result_type) == [10, 8]
+
+    def test_tile_reshape_preserves_compact_storage_mode(self):
+        """A zero-copy reshape keeps the source tile's compact representation."""
+        span = ir.Span.unknown()
+        source = ir.Var(
+            "src",
+            ir.TileType(
+                [8, 16],
+                DataType.INT8,
+                tile_view=ir.TileView(valid_shape=[5, 16], compact=ir.CompactMode.normal),
+            ),
+            span,
+        )
+
+        result_type = tile.reshape(source, [16, 8]).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert _valid_of(result_type) == [10, 8]
+        assert result_type.get_effective_tile_view().compact == ir.CompactMode.normal
 
     def test_tile_reshape_drops_full_unit_axis_exactly(self):
         """Erasing a provably full unit axis preserves an arbitrary rectangle."""
@@ -4296,6 +4554,56 @@ class TestTileExtractOp:
         rows, cols = result_type.shape
         assert isinstance(rows, ir.ConstInt) and rows.value == 64
         assert isinstance(cols, ir.ConstInt) and cols.value == 64
+        assert result_type.get_effective_tile_view().compact == ir.CompactMode.null
+
+    @pytest.mark.parametrize(
+        ("source_shape", "source_valid", "extract_shape", "target_memory", "expected_valid"),
+        [
+            ((384, 32), (384, 16), (192, 32), ir.MemorySpace.Right, (192, 16)),
+            ((32, 384), (16, 384), (32, 192), ir.MemorySpace.Left, (16, 192)),
+        ],
+        ids=["right-n-tail", "left-m-tail"],
+    )
+    def test_tile_extract_partial_l0_operand_infers_compact_mode(
+        self, source_shape, source_valid, extract_shape, target_memory, expected_valid
+    ):
+        """Partial Mat->L0 extracts select the valid-aware compact transfer."""
+        span = ir.Span.unknown()
+        src_type = ir.TileType(
+            source_shape,
+            DataType.INT8,
+            tile_view=ir.TileView(valid_shape=source_valid),
+            memory_space=ir.MemorySpace.Mat,
+        )
+        src = ir.Var("src", src_type, span)
+
+        call = tile.extract(src, 0, 0, shape=extract_shape, target_memory=target_memory)
+
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.memory_space == target_memory
+        assert _valid_of(result_type) == list(expected_valid)
+        assert result_type.get_effective_tile_view().compact == ir.CompactMode.normal
+
+    def test_tile_extract_partial_non_l0_destination_stays_noncompact(self):
+        """Compact inference is specific to boxed L0 operand transfers."""
+        span = ir.Span.unknown()
+        src = ir.Var(
+            "src",
+            ir.TileType(
+                [64, 64],
+                DataType.FP32,
+                tile_view=ir.TileView(valid_shape=[64, 32]),
+                memory_space=ir.MemorySpace.Acc,
+            ),
+            span,
+        )
+
+        result_type = tile.extract(src, 0, 0, shape=[32, 64], target_memory=ir.MemorySpace.Mat).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert _valid_of(result_type) == [32, 32]
+        assert result_type.get_effective_tile_view().compact == ir.CompactMode.null
 
     def test_tile_extract_acc_to_mat(self):
         """Acc source → Mat target: src lives in Acc, dtype preserved."""
