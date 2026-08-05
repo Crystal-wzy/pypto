@@ -15,6 +15,7 @@ import ctypes
 import importlib.util
 import inspect
 import json
+import logging
 import queue
 import sys
 import threading
@@ -31,6 +32,8 @@ import torch
 
 from .device_tensor import DeviceTensor, StackedDeviceTensor
 from .runtime_base import Worker
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pypto.ir.distributed_compiled_program import DistributedCompiledProgram, DistributedConfig
@@ -330,6 +333,37 @@ def _construct_worker(
         runtime=runtime_name,
         enable_sdma=enable_sdma,
     )
+
+
+def _close_local_worker(w: Any) -> None:
+    """Close a locally owned Worker, retrying incomplete Simpler cleanup once.
+
+    Simpler keeps failed cleanup-journal entries for the next ``close()`` call.
+    Local workers are not returned to the user, so give transient cleanup one
+    bounded retry here while still surfacing a persistent failure.
+    """
+    try:
+        w.close()
+    except BaseException as first_error:  # noqa: BLE001 - cleanup can preserve control-flow failures
+        try:
+            w.close()
+        except BaseException:  # noqa: BLE001 - surface the retry outcome
+            raise
+        if not isinstance(first_error, Exception):
+            # Cleanup completed, but KeyboardInterrupt/SystemExit must remain
+            # visible when there is no earlier operation failure to preserve.
+            raise
+
+
+def _close_local_worker_after_error(w: Any, operation: str) -> None:
+    """Best-effort cleanup without replacing an active operation failure."""
+    try:
+        _close_local_worker(w)
+    except BaseException:  # noqa: BLE001 - preserve the primary failure below
+        logger.exception(
+            "%s failed; Worker cleanup was interrupted or still failed after one retry",
+            operation,
+        )
 
 
 def _register_callables(
@@ -1073,9 +1107,13 @@ def execute_distributed(
             # build inside the timed dispatch. No-op without a prebuilt arena.
             w.init(prewarm_config=call_config)
             _dispatch(w, entry_fn, tensors, chip_cids, sub_ids, call_config, len(dc.device_ids))
-        finally:
+        except BaseException:  # noqa: BLE001 - cleanup must also run for interruption
             if w is not None:
-                w.close()
+                _close_local_worker_after_error(w, "one-shot distributed execution")
+            raise
+        else:
+            if w is not None:
+                _close_local_worker(w)
 
     dfx_base = output_dir / "dfx_outputs"
     swimlane = config is not None and config.enable_l2_swimlane
@@ -1376,15 +1414,13 @@ class DistributedWorker(Worker):
             # separate call into Simpler's private startup implementation.
             if self._persistent:
                 self._start_persistent_dispatcher()
-        except Exception:
+        except BaseException:  # noqa: BLE001 - partially built Workers still require cleanup
             if self._w is not None:
-                try:
-                    self._w.close()
-                except Exception:
-                    pass
+                _close_local_worker_after_error(self._w, "DistributedWorker construction")
             raise
 
         self._closed = False
+        self._close_complete = False
         # Live RegistrationHandles so close() can mark them closed. WeakSet
         # so handles that drop out of scope first don't pin DistributedWorker.
         self._handles: weakref.WeakSet[Any] = weakref.WeakSet()
@@ -1434,12 +1470,11 @@ class DistributedWorker(Worker):
         if not self._persistent:
             return
         live_domains = getattr(self._w, "_live_domains", None)
-        execute_pending = getattr(self._w, "_execute_pending_domain_releases", None)
         missing = []
         if not isinstance(live_domains, dict):
             missing.append("_live_domains")
-        if not callable(execute_pending):
-            missing.append("_execute_pending_domain_releases")
+        if not hasattr(self._w, "_building_run_resources"):
+            missing.append("_building_run_resources")
         if missing:
             raise RuntimeError(
                 "persistent distributed execution requires Simpler's private retention hooks: "
@@ -1465,24 +1500,40 @@ class DistributedWorker(Worker):
                     )
 
     def _detach_persistent_domain(self, handle: Any) -> None:
-        """Exclude a retained CommDomain from simpler's per-run release sweep."""
+        """Transfer one CommDomain from the current run to Worker ownership.
+
+        Simpler records a newly allocated domain in both the current
+        ``_RunResources.live_domains`` journal and ``Worker._live_domains``.
+        Remove only the run-local claim: the global entry must remain reachable
+        so ``Worker.close()`` can reclaim it if request finalization is
+        interrupted before the run is retired.
+        """
         live_domains = getattr(self._w, "_live_domains", None)
-        if not isinstance(live_domains, dict) or live_domains.get(handle.name) is not handle:
+        resources = getattr(self._w, "_building_run_resources", None)
+        run_live_domains = getattr(resources, "live_domains", None)
+        domain_lock = getattr(resources, "domain_lock", None)
+        if (
+            not isinstance(live_domains, dict)
+            or not isinstance(run_live_domains, dict)
+            or domain_lock is None
+        ):
             raise RuntimeError(
-                "persistent distributed execution requires Simpler's live-domain retention hook"
+                "persistent distributed execution requires Simpler's active per-run CommDomain journal"
             )
-        del live_domains[handle.name]
+        with domain_lock:
+            if bool(getattr(resources, "retired", False)):
+                raise RuntimeError("persistent CommDomain cannot be retained from an already-retired run")
+            if live_domains.get(handle.name) is not handle or run_live_domains.get(handle.name) is not handle:
+                raise RuntimeError(
+                    "persistent distributed execution could not transfer the CommDomain's run-local ownership"
+                )
+            del run_live_domains[handle.name]
 
     def _release_persistent_domains(
         self,
         domains_by_program: dict[str, dict[str, tuple[tuple[Any, ...], Any]]],
     ) -> None:
         """Release retained domains after the last request run-fence."""
-        execute_pending = getattr(self._w, "_execute_pending_domain_releases", None)
-        if not callable(execute_pending):
-            raise RuntimeError(
-                "persistent distributed execution requires Simpler's deferred domain-release hook"
-            )
         handles = [
             handle
             for program_domains in reversed(tuple(domains_by_program.values()))
@@ -1490,7 +1541,6 @@ class DistributedWorker(Worker):
         ]
         for handle in handles:
             handle.release()
-        execute_pending()
         not_freed = [handle for handle in handles if not bool(getattr(handle, "freed", False))]
         if not_freed:
             names = ", ".join(repr(handle.name) for handle in not_freed)
@@ -1567,19 +1617,17 @@ class DistributedWorker(Worker):
             if terminal is not None and terminal.error is None:
                 terminal.error = exc
         finally:
-            try:
-                self._release_persistent_domains(domains_by_program)
-            except BaseException as exc:  # noqa: BLE001 - surfaced by run/close
-                if self._persistent_error is None:
+            # A normally returned Worker.run() has completed every cleanup
+            # cursor step, including ``retire_domains``. Only then is the
+            # handle's captured owner guaranteed to free synchronously. On any
+            # request/finalization error, keep the global live-domain claim
+            # untouched and let Worker.close() perform its whole-tree sweep.
+            if self._persistent_error is None:
+                try:
+                    self._release_persistent_domains(domains_by_program)
+                except BaseException as exc:  # noqa: BLE001 - surfaced by close
                     self._persistent_error = exc
                     self._persistent_error_reported = False
-                elif self._persistent_error.__context__ is None:
-                    self._persistent_error.__context__ = exc
-                else:
-                    print(
-                        f"persistent CommDomain teardown also failed: {type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
             terminal = self._persistent_terminal_request
             if terminal is not None:
                 terminal.keepalive.clear()
@@ -1657,42 +1705,31 @@ class DistributedWorker(Worker):
     # ------------------------------------------------------------------
     # Device memory primitives
     #
-    # Routed through the simpler Orchestrator facade (``Worker._orch``) rather
-    # than ``Worker.malloc`` etc.: the level>=3 branch of those wrappers calls
-    # ``self._orch._impl.<op>(...)``, but the orchestrator's C++ handle lives on
-    # ``_o`` (no ``_impl``), so ``Worker.malloc`` raises ``AttributeError``. The
-    # facade methods (``malloc(worker_id, size)`` etc.) are the working path the
-    # generated host_orch and runtime examples use. ``_orch`` exists because
-    # __init__ starts the hierarchy eagerly.
+    # Simpler's public Worker methods own lifecycle admission and serialize
+    # device control against close() and in-flight hierarchical runs. Keep all
+    # memory traffic on that public surface instead of bypassing its lease via
+    # the private Orchestrator facade.
     # ------------------------------------------------------------------
-
-    def _orch(self) -> Any:
-        orch = getattr(self._w, "_orch", None)
-        if orch is None:
-            raise RuntimeError(
-                "DistributedWorker worker has no active orchestrator; the chip hierarchy was not started."
-            )
-        return orch
 
     def malloc(self, nbytes: int, *, worker_id: int = 0) -> int:
         """Allocate ``nbytes`` on chip *worker_id*; returns a device pointer."""
         self._require_open("malloc")
-        return int(self._orch().malloc(worker_id, nbytes))
+        return int(self._w.malloc(nbytes, worker_id))
 
     def free(self, ptr: int, *, worker_id: int = 0) -> None:
         """Release a pointer previously returned by :meth:`malloc`."""
         self._require_open("free")
-        self._orch().free(worker_id, ptr)
+        self._w.free(ptr, worker_id)
 
     def copy_to(self, dst_dev_ptr: int, src_host_ptr: int, nbytes: int, *, worker_id: int = 0) -> None:
         """H2D copy: ``nbytes`` from host *src_host_ptr* to device *dst_dev_ptr*."""
         self._require_open("copy_to")
-        self._orch().copy_to(worker_id, dst_dev_ptr, src_host_ptr, nbytes)
+        self._w.copy_to(dst_dev_ptr, src_host_ptr, nbytes, worker_id)
 
     def copy_from(self, dst_host_ptr: int, src_dev_ptr: int, nbytes: int, *, worker_id: int = 0) -> None:
         """D2H copy: ``nbytes`` from device *src_dev_ptr* back to host *dst_host_ptr*."""
         self._require_open("copy_from")
-        self._orch().copy_from(worker_id, dst_host_ptr, src_dev_ptr, nbytes)
+        self._w.copy_from(dst_host_ptr, src_dev_ptr, nbytes, worker_id)
 
     # ``alloc_tensor`` / ``free_tensor`` are inherited from Worker ABC.
     # Only the two behaviours that genuinely differ from L2 are overridden below:
@@ -2035,25 +2072,32 @@ class DistributedWorker(Worker):
             raise RuntimeError(f"DistributedWorker.{op}() called after close()")
 
     def close(self) -> None:
-        """Release the Worker and comm rootinfo file. Idempotent."""
-        if self._closed:
+        """Release runtime resources, retrying incomplete Worker cleanup."""
+        if self._close_complete:
             return
-        # Auto-free any DeviceTensors the caller forgot. Run BEFORE we set
-        # ``_closed`` so the per-op ``_require_open`` guard inside ``free``
-        # still admits these calls, and BEFORE we tear down the underlying
-        # worker so the free path is still live.
-        self._close_owned_tensors()
-        self._closed = True
-        # Mark every still-alive RegistrationHandle as closed so subsequent
-        # handle(...) calls raise instead of dispatching to a torn-down runtime.
-        for handle in list(self._handles):
-            handle._mark_closed()
-        self._handles.clear()
+        first_attempt = not self._closed
+        if first_attempt:
+            # Auto-free any DeviceTensors the caller forgot. Run BEFORE we set
+            # ``_closed`` so the per-op ``_require_open`` guard inside ``free``
+            # still admits these calls, and BEFORE we tear down the underlying
+            # worker so the free path is still live.
+            self._close_owned_tensors()
+            self._closed = True
+            # Mark every still-alive RegistrationHandle as closed so subsequent
+            # handle(...) calls raise instead of dispatching to a torn-down runtime.
+            for handle in list(self._handles):
+                handle._mark_closed()
+            self._handles.clear()
         try:
-            self._stop_persistent_dispatcher()
+            if first_attempt:
+                self._stop_persistent_dispatcher()
         finally:
             try:
                 self._w.close()
+                # Recent Simpler versions keep a cleanup journal when close()
+                # fails. Only mark cleanup complete after that journal drains,
+                # so a later close() can retry the underlying Worker.
+                self._close_complete = True
             finally:
                 self._inherited_host_tensors = ()
                 self._inherited_host_storage_ptrs.clear()
