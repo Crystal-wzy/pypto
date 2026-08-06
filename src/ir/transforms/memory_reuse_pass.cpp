@@ -15,12 +15,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -45,7 +47,9 @@
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/allocation_constraint_analysis.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/lifetime_analysis.h"
 #include "pypto/ir/transforms/utils/memory_footprint.h"
 #include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
@@ -58,44 +62,7 @@
 namespace pypto {
 namespace ir {
 
-/**
- * @brief Lifetime interval for a TileType variable (based on topological order)
- */
-struct LifetimeInterval {
-  VarPtr variable;           ///< The variable
-  int def_point;             ///< Definition point (topological order)
-  int last_use_point;        ///< Last use point (topological order)
-  MemorySpace memory_space;  ///< Memory space
-  uint64_t size;             ///< Size in bytes
-};
-
 namespace {
-
-/**
- * @brief Result of lifetime computation
- */
-struct LifetimeAnalysisResult {
-  std::vector<LifetimeInterval> lifetimes;
-  std::map<VarPtr, std::vector<VarPtr>> var_sharing_groups;
-  // var -> per-(scf.if, slot) phi family ids (see LifetimeAnalyzer).
-  std::map<const Var*, std::set<int>> phi_family_ids;
-  // var -> its individual [def, last_use] interval (with phi/loop extension), for
-  // the precise per-var pairwise interference check in the reuse packer.
-  std::map<const Var*, std::pair<int, int>> var_liveness;
-  /// Pipeline-stage membership per reuse-interval representative
-  /// (``LifetimeInterval::variable``), read from the defining ``Call``'s
-  /// ``pipeline_membership`` attr, parsed once into ``(group, stage)`` pairs so
-  /// the O(N²) reuse packer never re-parses strings. Empty for non-pipelined
-  /// tiles. Consumed by ``IdentifyReuseOpportunities`` to forbid cross-stage
-  /// buffer coalescing.
-  std::map<const Var*, std::vector<std::pair<int32_t, int32_t>>> pipeline_membership;
-  /// Subset of ``pipeline_membership`` keys whose tile is produced by a *load*
-  /// (``tile.load`` / ``tile.read``) rather than a compute op. Cross-stage reuse
-  /// is forbidden whenever *either* tile is a load (a load buffer must stay
-  /// private for ping-pong); compute↔compute cross-stage reuse is allowed so the
-  /// bulk of intermediates can still coalesce and fit the on-chip budget.
-  std::set<const Var*> pipeline_load_tiles;
-};
 
 /**
  * @brief Collect all Var nodes referenced in an expression.
@@ -1035,7 +1002,17 @@ class LifetimeAnalyzer : public IRVisitor {
     std::map<const Var*, std::set<int>> phi_family_ids;
   };
 
-  Result Analyze(const StmtPtr& func_body) {
+  Result Analyze(const StmtPtr& func_body, const std::vector<VarPtr>& entry_vars = {}) {
+    // Function parameters have no defining AssignStmt. Seed Tile parameters at
+    // the entry point so function-wide allocation planning includes their
+    // MemRefs and body uses extend their lifetimes normally.
+    for (const VarPtr& var : entry_vars) {
+      const auto tile_type = As<TileType>(var->GetType());
+      if (!tile_type || !tile_type->memref_.has_value()) continue;
+      ordered_defs_.push_back(var);
+      var_def_order_[var] = current_order_;
+    }
+
     // Phase 1: Walk IR tree
     if (func_body) {
       VisitStmt(func_body);
@@ -1316,12 +1293,13 @@ class LifetimeAnalyzer : public IRVisitor {
  * Walks ALL statements
  * including those inside nested control flow (IfStmt/ForStmt/WhileStmt bodies).
  */
-LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
+LifetimeAnalysisResult AnalyzeAllocationLifetimesImpl(const StmtPtr& func_body,
+                                                      const std::vector<VarPtr>& entry_vars = {}) {
   std::vector<LifetimeInterval> lifetimes;
 
   // Step 1: Walk full IR tree to collect variable defs, uses, and ordering
   LifetimeAnalyzer analyzer;
-  auto result = analyzer.Analyze(func_body);
+  auto result = analyzer.Analyze(func_body, entry_vars);
 
   if (result.ordered_defs.empty()) {
     return {lifetimes, {}};
@@ -1366,8 +1344,6 @@ LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
       continue;
     }
 
-    const auto& memref = tile_type->memref_.value();
-
     std::vector<VarPtr> sharing_group;
     if (var_sharing_groups.count(var)) {
       sharing_group = var_sharing_groups[var];
@@ -1400,7 +1376,7 @@ LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
     INTERNAL_CHECK_SPAN(memory_space.has_value(), sharing_group[0]->span_)
         << "TileType with MemRef must have memory_space for reuse analysis";
     interval.memory_space = *memory_space;
-    interval.size = memref->size_;
+    interval.size = GetDefinedMemRef(representative_tile_type)->size_;
 
     lifetimes.push_back(interval);
 
@@ -1469,16 +1445,18 @@ LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
 // cross-shape / cross-dtype L0 reuse (#1595 / #1788).
 static bool IsNzLikeBlayout(TileLayout blayout) { return blayout == TileLayout::col_major; }
 
+static std::optional<bool> GetVecNzLayoutClass(const VarPtr& var) {
+  auto tile = As<TileType>(var->GetType());
+  if (!tile) return std::nullopt;
+  const auto space = tile->GetMemorySpace();
+  if (!space || *space != MemorySpace::Vec) return std::nullopt;
+  return IsNzLikeBlayout(tile_view_semantics::GetEffectiveTileView(*tile).blayout);
+}
+
 static bool AreVecNdNzCompatible(const VarPtr& var1, const VarPtr& var2) {
-  auto t1 = As<TileType>(var1->GetType());
-  auto t2 = As<TileType>(var2->GetType());
-  if (!t1 || !t2) return true;
-  const auto s1 = t1->GetMemorySpace();
-  const auto s2 = t2->GetMemorySpace();
-  if (!s1 || !s2 || *s1 != MemorySpace::Vec || *s2 != MemorySpace::Vec) return true;
-  const TileView v1 = tile_view_semantics::GetEffectiveTileView(*t1);
-  const TileView v2 = tile_view_semantics::GetEffectiveTileView(*t2);
-  return IsNzLikeBlayout(v1.blayout) == IsNzLikeBlayout(v2.blayout);
+  const auto class1 = GetVecNzLayoutClass(var1);
+  const auto class2 = GetVecNzLayoutClass(var2);
+  return !class1.has_value() || !class2.has_value() || class1 == class2;
 }
 
 /**
@@ -1523,10 +1501,7 @@ static bool IsLegalTileViewOp(const OpPtr& op) {
          IsOp(op, "tile.reinterpret_view") || IsOp(op, "tensor.slice");
 }
 
-struct HazardInputs {
-  std::unordered_set<const Var*> load_derived;  ///< tile.load outputs + view descendants
-  std::unordered_set<const Var*> reads_tpop;    ///< vars whose def consumes a tpop_from_aic value
-};
+using HazardInputs = AllocationHazardInputs;
 
 class HazardInputCollector : public IRVisitor {
  public:
@@ -1596,7 +1571,7 @@ class HazardInputCollector : public IRVisitor {
 // the output from sharing a buffer with.  Enforcement resolves each operand to
 // the *physical buffer* it ends up on (following both reuse-map reassignment and
 // VIEW inheritance) and blocks the output from landing there — see the use site.
-using ForbidAliasMap = std::map<const Var*, std::vector<VarPtr>>;
+using ForbidAliasMap = AllocationForbidAliasMap;
 
 // Resolve a tile Var to its MemRef base pointer (nullptr if it is not a tile or
 // has no MemRef yet).  View ops share their source's base, so a view and its
@@ -1624,15 +1599,25 @@ class ForbidAliasCollector : public IRVisitor {
   }
 
   void VisitStmt_(const AssignStmtPtr& op) override {
+    // Multi-result calls are assigned to a tuple temporary and unpacked by
+    // subsequent TupleGetItem assignments. Carry the call's semantic
+    // no-alias inputs onto every physical tile result; the tuple temporary
+    // itself has no allocation interval to constrain.
+    if (const auto get_item = As<TupleGetItemExpr>(op->value_)) {
+      if (const VarPtr tuple = AsVarLike(get_item->tuple_)) {
+        const auto pending = tuple_forbidden_.find(tuple.get());
+        if (pending != tuple_forbidden_.end()) RecordForOutput(op->var_, pending->second);
+      }
+    }
+
     if (auto call = As<Call>(op->value_); call && call->op_) {
       const auto& reg = OpRegistry::GetInstance();
       if (reg.IsRegistered(call->op_->name_)) {
         const auto& entry = reg.GetEntry(call->op_->name_);
-        auto rep_it = member_to_rep_.find(op->var_.get());
-        const Var* out_key = rep_it != member_to_rep_.end() ? rep_it->second : op->var_.get();
+        std::vector<VarPtr> forbidden_inputs;
         auto forbid_arg = [&](size_t i) {
           if (i < call->args_.size()) {
-            if (auto v = AsVarLike(call->args_[i])) forbidden_[out_key].push_back(v);
+            if (auto v = AsVarLike(call->args_[i])) forbidden_inputs.push_back(v);
           }
         };
         if (!entry.IsInplaceSafe()) {
@@ -1655,6 +1640,7 @@ class ForbidAliasCollector : public IRVisitor {
           auto in_t = As<TileType>(call->args_[0]->GetType());
           if (out_t && in_t && out_t->dtype_.GetBit() > in_t->dtype_.GetBit()) forbid_arg(0);
         }
+        RecordForOutput(op->var_, forbidden_inputs);
         // tile.transpose is registered not_inplace_safe(), so its output is
         // already forbidden from aliasing any input above (pto.ttrans writes
         // dst directly from src on the scalar path — dst == src corrupts).
@@ -1666,7 +1652,21 @@ class ForbidAliasCollector : public IRVisitor {
   ForbidAliasMap Take() { return std::move(forbidden_); }
 
  private:
+  void RecordForOutput(const VarPtr& output, const std::vector<VarPtr>& forbidden_inputs) {
+    if (!output || forbidden_inputs.empty()) return;
+    if (As<TupleType>(output->GetType())) {
+      tuple_forbidden_[output.get()] = forbidden_inputs;
+      return;
+    }
+    if (!As<TileType>(output->GetType())) return;
+    const auto rep_it = member_to_rep_.find(output.get());
+    const Var* out_key = rep_it != member_to_rep_.end() ? rep_it->second : output.get();
+    auto& recorded = forbidden_[out_key];
+    recorded.insert(recorded.end(), forbidden_inputs.begin(), forbidden_inputs.end());
+  }
+
   ForbidAliasMap forbidden_;
+  std::map<const Var*, std::vector<VarPtr>> tuple_forbidden_;
   std::map<const Var*, const Var*> member_to_rep_;  ///< sharing-group member -> representative
 };
 
@@ -1851,6 +1851,39 @@ void ValidateDeclaredAllocs(const StmtPtr& body, const std::set<const Var*>& pin
              "slots, declare separate allocations, or bind only tiles whose lifetimes do not overlap.";
     }
   }
+}
+
+/// Collect the full byte extent of allocations declared by the author.
+///
+/// InitMemRef hoists every alloc to the function body's top level. When an
+/// allocation exists, prepending it forms a SeqStmts; a function with no
+/// allocation may legitimately retain a singleton body such as ReturnStmt.
+/// A multi-slot declaration is larger than any one member MemRef, so DSA-RP
+/// must take the extent from the alloc statement rather than reconstruct it
+/// from members.
+std::map<const Var*, uint64_t> CollectPinnedAllocSizes(const StmtPtr& body, const Span& span,
+                                                       const std::string& consumer) {
+  INTERNAL_CHECK_SPAN(body, span) << consumer << " expected a non-null function body";
+
+  std::map<const Var*, uint64_t> pinned_allocations;
+  auto collect = [&](const StmtPtr& stmt) {
+    auto base = GetPinnedAllocBase(stmt);
+    if (!base) return;
+    auto assign = As<AssignStmt>(stmt);
+    auto call = assign ? As<Call>(assign->value_) : nullptr;
+    auto size = call && call->args_.size() >= 2 ? As<ConstInt>(call->args_[1]) : nullptr;
+    INTERNAL_CHECK_SPAN(size && size->value_ > 0, stmt->span_)
+        << consumer << " expected declared allocation '" << base->name_hint_
+        << "' to have a positive constant byte extent after InitMemRef";
+    pinned_allocations.emplace(base.get(), static_cast<uint64_t>(size->value_));
+  };
+
+  if (auto top_level = As<SeqStmts>(body)) {
+    for (const auto& stmt : top_level->stmts_) collect(stmt);
+  } else {
+    collect(body);
+  }
+  return pinned_allocations;
 }
 
 std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
@@ -3071,25 +3104,38 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
     new_body = applier.VisitStmt(new_body);
   }
 
-  // Under memory_planner=PtoAS the whole MemoryReuse pass is skipped, and with it
-  // YieldFixupMutator (its Step 4). That mutator is not an optimization: when a
+  // Under memory_planner=PtoAS or DsaRP the whole MemoryReuse pass is skipped.
+  // DsaRP must therefore run the correctness normalizations from MemoryReuse
+  // Steps 3.75 through 4.5 in the same order. They are not optimizations: when a
+  // peeled accumulator if-phi or
   // loop yields a value living in a different buffer than its iter_arg/return_var,
   // it inserts the `tile.move` that writes the result back into the carry. Without
   // it the carry is never updated and the loop silently becomes a no-op — the
   // `[N, 1]` col-vector carry of an online softmax is the shape that hits this,
   // because its branch producer runs on a `[1, N]` view in its own buffer.
   //
-  // Run it here so both planners reconcile carries by the same mechanism. Under
-  // PyPTO it stays where it is: Step 4 must run *after* the reuse decisions, which
-  // can themselves create fresh mismatches.
+  // Run it here so both alternative planners reconcile carries. Under the
+  // legacy PyPTO planner it stays where it is: Step 4 must run *after* reuse
+  // decisions, which can themselves create fresh mismatches.
   //
-  // Only the ForStmt half: PTO codegen already re-points a branch-local producer
-  // at the if-phi handle, and copies in whatever it declines to re-point
-  // (#1956/#1985). An IR-level `tile.move` there would displace that copy-free
-  // path with an extra buffer plus a `pto.tmov`. Loop carries have no such
-  // codegen path, so they still need the move.
+  // PTOAS needs only the ForStmt YieldFixup half: addr-less codegen already
+  // re-points a branch-local producer at the if-phi handle. DSA-RP emits
+  // explicit addresses, so it must first coalesce peeled accumulator if-phis,
+  // then materialize both IfStmt and ForStmt fixups, and finally repair bare-Var
+  // identity copies before lifetime analysis and placement.
   const auto* ctx = PassContext::Current();
-  if (ctx != nullptr && ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS) {
+  if (ctx != nullptr && ctx->GetMemoryPlanner() == MemoryPlanner::DsaRP) {
+    TopDownRetargeter acc_coalescer;
+    auto acc_rewrites = acc_coalescer.CoalesceAccumulatorIfPhis(new_body);
+    if (!acc_rewrites.empty()) {
+      RetypeApplier applier(std::move(acc_rewrites));
+      new_body = applier.VisitStmt(new_body);
+    }
+
+    YieldFixupMutator yield_fixup(/*fixup_if_stmts=*/true);
+    new_body = yield_fixup.VisitStmt(new_body);
+    new_body = NormalizeIdentityCopyBuffersMutator().VisitStmt(new_body);
+  } else if (ctx != nullptr && ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS) {
     YieldFixupMutator yield_fixup(/*fixup_if_stmts=*/false);
     new_body = yield_fixup.VisitStmt(new_body);
   }
@@ -3113,7 +3159,7 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   StmtPtr new_body = func->body_;
 
   // Step 1: Compute lifetimes by walking full IR tree
-  auto analysis_result = ComputeLifetimes(new_body);
+  auto analysis_result = AnalyzeAllocationLifetimes(new_body);
 
   if (analysis_result.lifetimes.empty()) {
     LOG_DEBUG << "No TileType variables found in function '" << func->name_ << "', skipping memory reuse";
@@ -3125,18 +3171,10 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   // forms the hazardous in-place sharing (folds in the former
   // LegalizePTOBufferReuse responsibility).  Off-910B the inputs stay empty and
   // reuse behaviour is unchanged.
-  HazardInputs hazard;
-  if (NeedsLoadTpopHazardGuard(func)) {
-    HazardInputCollector collector;
-    collector.VisitStmt(new_body);
-    hazard = collector.Take();
-  }
-
-  // Per-operand no-alias map (e.g. tile.sel's mask/tmp must not share the
-  // output's buffer). Op-semantic, not backend-gated, so always collected.
-  ForbidAliasCollector forbid_collector(analysis_result.var_sharing_groups);
-  forbid_collector.VisitStmt(new_body);
-  ForbidAliasMap forbid_alias = forbid_collector.Take();
+  const AllocationConstraintAnalysis constraint_analysis =
+      AnalyzeAllocationConstraints(func, analysis_result, "MemoryReuse");
+  const HazardInputs& hazard = constraint_analysis.target_hazard_inputs;
+  const ForbidAliasMap& forbid_alias = constraint_analysis.forbid_alias;
 
   // Per-space reserved end (the SpaceFootprint reserved_start for the exact fit check). Only meaningful
   // with a configured backend; empty otherwise ⇒ reserved_start defaults to 0.
@@ -3156,16 +3194,7 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   // that shape must not fail open: an empty `pinned_bases` silently disables both
   // the packer isolation and the co-liveness check below, handing the author back
   // exactly the coalescing the binding was written to prevent.
-  auto top_level = As<SeqStmts>(new_body);
-  INTERNAL_CHECK_SPAN(top_level, func->span_)
-      << "MemoryReuse expects a top-level SeqStmts body (InitMemRef normalizes it), got "
-      << (new_body ? new_body->TypeName() : "null");
-  std::set<const Var*> pinned_bases;
-  for (const auto& stmt : top_level->stmts_) {
-    if (auto base = GetPinnedAllocBase(stmt)) pinned_bases.insert(base.get());
-  }
-
-  ValidateDeclaredAllocs(new_body, pinned_bases, analysis_result.var_liveness);
+  const std::set<const Var*>& pinned_bases = constraint_analysis.declared_allocation_bases;
 
   std::vector<Diagnostic> hints;
   auto reuse_map = IdentifyReuseOpportunities(
@@ -3229,6 +3258,45 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
 }
 
 }  // namespace
+
+AllocationConstraintAnalysis AnalyzeAllocationConstraints(const FunctionPtr& func,
+                                                          const LifetimeAnalysisResult& lifetimes,
+                                                          const char* consumer) {
+  AllocationConstraintAnalysis result;
+  result.declared_allocation_sizes = CollectPinnedAllocSizes(func->body_, func->span_, consumer);
+  for (const auto& [base, size] : result.declared_allocation_sizes) {
+    static_cast<void>(size);
+    result.declared_allocation_bases.insert(base);
+  }
+  ValidateDeclaredAllocs(func->body_, result.declared_allocation_bases, lifetimes.var_liveness);
+
+  for (const LifetimeInterval& interval : lifetimes.lifetimes) {
+    if (const auto layout_class = GetVecNzLayoutClass(interval.variable)) {
+      result.vec_nz_layout_class.emplace(interval.variable.get(), *layout_class);
+    }
+  }
+
+  result.needs_load_tpop_hazard_guard = NeedsLoadTpopHazardGuard(func);
+  if (result.needs_load_tpop_hazard_guard) {
+    HazardInputCollector collector;
+    collector.VisitStmt(func->body_);
+    result.target_hazard_inputs = collector.Take();
+  }
+
+  ForbidAliasCollector forbid_collector(lifetimes.var_sharing_groups);
+  forbid_collector.VisitStmt(func->body_);
+  result.forbid_alias = forbid_collector.Take();
+  return result;
+}
+
+LifetimeAnalysisResult AnalyzeAllocationLifetimes(const StmtPtr& func_body) {
+  return AnalyzeAllocationLifetimesImpl(func_body);
+}
+
+LifetimeAnalysisResult AnalyzeAllocationLifetimes(const FunctionPtr& func) {
+  INTERNAL_CHECK(func != nullptr) << "Cannot analyze allocation lifetimes for a null function";
+  return AnalyzeAllocationLifetimesImpl(func->body_, func->params_);
+}
 
 namespace pass {
 Pass MaterializeSemanticAliases() {

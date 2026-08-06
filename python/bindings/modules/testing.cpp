@@ -18,15 +18,23 @@
  */
 
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/string.h>
+#include <nanobind/stl/shared_ptr.h>  // NOLINT(misc-include-cleaner) -- registers shared_ptr casters
+#include <nanobind/stl/string.h>      // NOLINT(misc-include-cleaner) -- registers std::string casters
 
 #include <cassert>
 #include <string>
+#include <utility>
 
 #include "../module.h"
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/function.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/transforms/dsa/allocation_plan.h"
+#include "pypto/ir/transforms/dsa/reuse_penalty_recognizer.h"
 
 namespace nb = nanobind;
 
@@ -93,6 +101,59 @@ namespace python {
   INTERNAL_CHECK_SPAN(false, span) << message;
 }
 
+/**
+ * @brief Return DSA-RP recognizer output without running placement.
+ *
+ * This intentionally lives in the internal testing module: production callers
+ * consume the same recognizer through MemRefDsaAdapter, while unit tests need
+ * to distinguish edge construction from solver tie-breaking.
+ */
+nb::list RecognizeDsaReusePenaltiesForTesting(const ir::FunctionPtr& func) {
+  const ir::dsa_adapter::AllocationPlan plan = ir::dsa_adapter::BuildDsaAllocationPlan(func);
+  const auto penalties =
+      ir::dsa_adapter::RecognizeReusePenalties(func, plan, *backend::BackendConfig::GetBackend());
+
+  nb::list result;
+  for (const auto& penalty : penalties) {
+    INTERNAL_CHECK(penalty.first_interval < plan.intervals.size());
+    INTERNAL_CHECK(penalty.second_interval < plan.intervals.size());
+    nb::dict edge;
+    edge["first_interval"] = penalty.first_interval;
+    edge["second_interval"] = penalty.second_interval;
+    edge["first_name"] = plan.intervals[penalty.first_interval].variable->name_hint_;
+    edge["second_name"] = plan.intervals[penalty.second_interval].variable->name_hint_;
+    edge["cost"] = penalty.cost;
+    result.append(std::move(edge));
+  }
+  return result;
+}
+
+/**
+ * @brief Return exact backend pipe inference for a Call, or None.
+ */
+nb::object TryInferPipeForTesting(const ir::CallPtr& call) {
+  const auto pipe = backend::BackendConfig::GetBackend()->TryInferPipe(call);
+  if (!pipe) return nb::none();
+  return nb::int_(static_cast<int>(*pipe));
+}
+
+/**
+ * @brief Return an operation's registered execution-memory-access evidence.
+ */
+std::string GetExecutionMemoryAccessEvidenceForTesting(const std::string& op_name) {
+  const auto& registry = ir::OpRegistry::GetInstance();
+  CHECK(registry.IsRegistered(op_name)) << "Unknown operation '" << op_name << "'";
+  switch (registry.GetEntry(op_name).GetExecutionMemoryAccessEvidence()) {
+    case ir::ExecutionMemoryAccessEvidence::Unknown:
+      return "unknown";
+    case ir::ExecutionMemoryAccessEvidence::Functional:
+      return "functional";
+    case ir::ExecutionMemoryAccessEvidence::NoAccess:
+      return "no_access";
+  }
+  INTERNAL_UNREACHABLE << "Unknown execution-memory-access evidence";
+}
+
 // ============================================================================
 // Module binding
 // ============================================================================
@@ -130,6 +191,15 @@ void BindTesting(nb::module_& m) {
   testing.def("raise_internal_error_with_span", &raise_internal_error_with_span, nb::arg("message"),
               nb::arg("filename"), nb::arg("line"), nb::arg("col"),
               "Raise an InternalError with IR source span for testing");
+
+  testing.def("recognize_dsa_reuse_penalties", &RecognizeDsaReusePenaltiesForTesting, nb::arg("function"),
+              "Return recognized DSA-RP edges without running placement");
+
+  testing.def("try_infer_pipe", &TryInferPipeForTesting, nb::arg("call"),
+              "Return the exact backend pipe for a Call, or None");
+
+  testing.def("get_execution_memory_access_evidence", &GetExecutionMemoryAccessEvidenceForTesting,
+              nb::arg("op_name"), "Return an operation's execution-memory-access evidence");
 }
 
 }  // namespace python

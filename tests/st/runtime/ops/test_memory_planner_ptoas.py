@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""End-to-end runtime tests for ``compile(memory_planner=MemoryPlanner.PTOAS)``.
+"""End-to-end runtime tests for PyPTO's selectable memory planners.
 
 Under ``PTOAS`` the pipeline skips PyPTO's opportunistic ``MemoryReuse`` and
 ``AllocateMemoryAddr`` and lets the ptoas ``PlanMemory`` pass own lifetime reuse
@@ -15,8 +15,9 @@ and address assignment at ``--pto-level=level2``. ``MaterializeSemanticAliases``
 still runs, so semantics-required aliasing (loop-carried accumulators, in-place
 ops) is preserved as a shared ``tile_buf`` handle.
 
-Each kernel is run under **both** planners against the same golden — a PTOAS
-result that matches the PYPTO result proves the must-alias handoff is correct.
+Each kernel is run under PYPTO, DSA-RP, and PTOAS against the same golden.
+Matching results prove that each planner preserves the required semantic
+aliases while assigning physical storage.
 The loop-carried accumulator is the regression case: without
 ``MaterializeSemanticAliases`` the addr-less allocs would be planned into
 distinct ptoas buffers and the accumulation would be silently lost.
@@ -51,8 +52,12 @@ from pypto.backend.pto_backend import PartialCodegenError
 from pypto.pypto_core.passes import MemoryPlanner
 
 
-def _planner_tag(mp: MemoryPlanner | None) -> str:
-    return "ptoas" if mp == MemoryPlanner.PTOAS else "pypto"
+def _planner_tag(mp: MemoryPlanner) -> str:
+    return {
+        MemoryPlanner.PYPTO: "pypto",
+        MemoryPlanner.DSA_RP: "dsa_rp",
+        MemoryPlanner.PTOAS: "ptoas",
+    }[mp]
 
 
 # ---------------------------------------------------------------------------
@@ -577,11 +582,11 @@ class MultiBufferAccCase(PTOTestCase):
 # ---------------------------------------------------------------------------
 
 
-_PLANNERS = [MemoryPlanner.PYPTO, MemoryPlanner.PTOAS]
+_PLANNERS = [MemoryPlanner.PYPTO, MemoryPlanner.DSA_RP, MemoryPlanner.PTOAS]
 
 
 class TestMemoryPlannerPtoas:
-    """PTOAS memory planner produces correct on-device results (matches PYPTO)."""
+    """Selectable memory planners produce matching on-device results."""
 
     @pytest.mark.parametrize("planner", _PLANNERS, ids=_planner_tag)
     def test_elementwise_add(self, test_runner, planner):
@@ -604,12 +609,14 @@ class TestMemoryPlannerPtoas:
         result = test_runner.run(ColVecIfPhiCarryCase(planner))
         assert result.passed, f"colvec if-phi carry ({_planner_tag(planner)}) failed: {result.error}"
 
-    def test_multi_buffer_colive_slots_run_under_pypto(self, test_runner):
-        # Two co-live slots are a legal program — the baked-address path runs it
-        # correctly. This is the control for the PTOAS refusal below: what is being
-        # rejected there is the lowering, not the source.
-        result = test_runner.run(MultiBufferCoLiveCase(MemoryPlanner.PYPTO))
-        assert result.passed, f"multi-buffer co-live (pypto) failed: {result.error}"
+    @pytest.mark.parametrize("planner", [MemoryPlanner.PYPTO, MemoryPlanner.DSA_RP], ids=_planner_tag)
+    def test_multi_buffer_colive_slots_run_under_pypto_planners(self, test_runner, planner):
+        # Two co-live slots are a legal program — both PyPTO-owned address
+        # planners preserve the declared region and its per-slot offsets. This
+        # controls the PTOAS refusal below: the unsupported part is that
+        # lowering, not the source program.
+        result = test_runner.run(MultiBufferCoLiveCase(planner))
+        assert result.passed, f"multi-buffer co-live ({_planner_tag(planner)}) failed: {result.error}"
 
     def test_multi_buffer_colive_slots_rejected_under_ptoas(self):
         # ptoas 0.54 emits the per-slot WAR pair only for the first multi_tile_get
