@@ -243,8 +243,8 @@ assert torch.allclose(out, a + b, rtol=1e-5, atol=1e-5)
 ```
 
 直接调用一个 `@pl.jit` 函数会一次做完全部事情：按实参的形状与 dtype 特化、编译、缓存、派发。
-后续用相同形状调用会复用缓存的编译产物。`examples/hello_world.py` 就是这个模式，只是写在
-tile 级。
+后续用相同形状调用会复用缓存的编译产物。`examples/beginner/01_hello_world.py` 就是这个模式，
+只是写在 tile 级。
 
 ## Edge Cases
 
@@ -273,4 +273,4 @@ tile 级。
 - [语言指南](language/index.md) —— 完整表面：tile 级写法、`pl.load` / `pl.store`、内存空间，以及 `@pl.jit` 所特化成的 `@pl.function` / `@pl.program` 形态。
 - [算子](ops/index.md) —— `pl.*`、`pl.tensor.*`、`pl.tile.*` 三个命名空间的算子全貌。
 - [在设备上运行](00-getting_started.md) —— 常驻设备张量、显式派发、性能基准、分布式执行。
-- `examples/kernels/` —— 同一套 `@pl.jit` 写法下的 tile 级 kernel。
+- `examples/beginner/` 与 `examples/intermediate/` —— 同一套 `@pl.jit` 写法下的 tile 级 kernel。
