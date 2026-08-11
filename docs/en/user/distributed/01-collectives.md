@@ -218,7 +218,18 @@ only.
 ## Runnable Examples
 
 Every collective above has a runnable counterpart under
-`tests/st/distributed/` (paths below are relative to that directory):
+`tests/st/distributed/` (paths below are relative to that directory). The
+[tutorials](05-tutorials.md) are the user-facing counterparts that
+build each collective by hand before the builtin is revealed:
+
+| Collective | Tutorial step | Hand-rolled first? |
+| ---------- | ------------- | ------------------ |
+| barrier | [09-barrier](09-barrier.md) | yes (step 04, then reveal) |
+| allreduce | planned — steps 08–11 | yes (mesh, two-phase, ring, then reveal) |
+| broadcast | planned — step 12 | yes |
+| allgather | planned — step 13 | yes |
+| reduce_scatter | planned — step 14 | yes |
+| all_to_all | planned — step 15 | yes |
 
 | Collective | InCore hand-rolled | InCore composite | HOST builtin |
 | ---------- | ------------------ | ---------------- | ------------ |

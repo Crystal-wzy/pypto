@@ -415,6 +415,82 @@ jobs:
       if: needs.changes.outputs.docs_only == 'true'
       run: echo "Every changed path is documentation — no build, no tests."
 
+  examples-tests:
+    # The distributed examples ladder (doc-plan 02) — every example must compile
+    # AND run with a passing golden on the simulator (a2a3sim), so the teaching
+    # material cannot silently rot.
+    #
+    # No container: runs host-native on the shared CPU pool through the same
+    # setup-ci-job as codegen-tests / pypto-lib-model, so the ptoas / pto-isa /
+    # simpler builds reuse the persistent host caches (ccache, pip, ptoas)
+    # instead of rebuilding in an ephemeral container on every PR.
+    needs: [changes, toolchain, pre-commit, clang-tidy]
+    if: needs.changes.outputs.docs_only != 'true'
+    # Checkout + test only — no write scopes needed on GITHUB_TOKEN.
+    permissions:
+      contents: read
+    runs-on: [self-hosted, linux, arm64, cpu]
+    defaults:
+      run:
+        working-directory: examples-checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/examples-checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/examples-checkout/pto-isa
+      PTOAS_VERSION: ${{ needs.toolchain.outputs.ptoas_version }}
+      PTOAS_SHA256: ${{ needs.toolchain.outputs.ptoas_sha256_aarch64 }}
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      # The cache *paths* (CCACHE_DIR / PIP_CACHE_DIR) and CCACHE_NAMESPACE are
+      # derived by setup-ci-job from the runner config's CI_CACHE_ROOT.
+      CCACHE_UMASK: '000'
+    steps:
+      - name: Fetch composite action definitions
+        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
+        # but this job checks the repo out into ./examples-checkout —
+        # sparse-fetch just the action defs at the workspace root first
+        # (clean: false leaves sibling subdir checkouts on this persistent
+        # runner untouched).
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: examples-checkout
+          needs-device: 'false'
+          pip-cache-name: pip-examples
+          pto-isa-commit: ${{ needs.toolchain.outputs.pto_isa_commit }}
+
+      - name: Run distributed examples on the simulator
+        run: |
+          source activate.sh
+          set -e
+          for ex in examples/distributed/*.py; do
+            case "$ex" in */__init__.py) continue ;; esac
+            echo "=== $ex ==="
+            python "$ex" -p a2a3sim -d 0,1
+          done
+          # Alternate modes documented in the walkthroughs — every documented
+          # invocation must be CI-validated too, or the teaching material rots.
+          echo "=== examples/distributed/04_barrier.py --use-builtin ==="
+          python examples/distributed/04_barrier.py -p a2a3sim -d 0,1 --use-builtin
+          echo "=== examples/distributed/05_remote_load_store.py --mode store ==="
+          python examples/distributed/05_remote_load_store.py -p a2a3sim -d 0,1 --mode store
+          echo "=== examples/distributed/06_put_get.py --mode get ==="
+          python examples/distributed/06_put_get.py -p a2a3sim -d 0,1 --mode get
+          # Step 07 is rank-count-agnostic: the P=3 and P=4 legs are the
+          # committed >=3-rank coverage for the general ring pattern (P=2 ran
+          # in the default-mode loop above).
+          echo "=== examples/distributed/07_dynamic_rank_count.py -d 0,1,2 ==="
+          python examples/distributed/07_dynamic_rank_count.py -p a2a3sim -d 0,1,2
+          echo "=== examples/distributed/07_dynamic_rank_count.py -d 0,1,2,3 ==="
+          python examples/distributed/07_dynamic_rank_count.py -p a2a3sim -d 0,1,2,3
+
   codegen-tests:
     # Codegen-only: verifies IR → kernel/orch C++ generation without going
     # on-board. --codegen-only skips assembly (ptoas), pto-isa, simpler and
