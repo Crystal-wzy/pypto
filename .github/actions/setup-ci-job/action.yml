@@ -20,9 +20,17 @@ description: >-
   runs). That is where the absolute paths live — not in git — so no workflow names
   one and a differently-laid-out host needs no repo change. The runner must set:
 
-    CONDA_ROOT     conda install to layer the per-job venv on (all runners)
+    CONDA_ROOT     conda install to layer the per-job venv on (toolchain: conda)
     CI_CACHE_ROOT  dir CI may keep its caches in (created if absent; all runners)
     CANN_ROOT      CANN toolkit — device runners only (needs-device)
+
+  The bundle (toolchain: bundle) deliberately has no entry here: its location is
+  not a free choice, so there is nothing for a host to declare. The prefix
+  /opt/pypto/toolchain/<version> is compiled into the bundle's gcc and python, so
+  a bundle unpacked anywhere else is subtly broken. A host that needs the bytes on
+  another filesystem symlinks /opt/pypto at it, or moves `pypto-toolchain`'s
+  install root in its own pypto-env.conf — both of which the tool resolves, and
+  this action follows it there by asking the tool rather than by naming a path.
 
   Beyond those, the host is expected to provide (by name, not by path): a conda
   env `py310` under CONDA_ROOT, and task-submit / npu-smi / ccache / git / curl on
@@ -76,6 +84,19 @@ inputs:
       nothing and keeps ccache in the default namespace.
     required: false
     default: ''
+  toolchain:
+    description: >-
+      Where the Python and GCC come from. 'conda' is the historical path: a
+      per-machine conda env under CONDA_ROOT, layered with a
+      --system-site-packages venv. 'bundle' uses the pinned pypto-toolchain
+      bundle that `pypto-toolchain` has selected on the host, which is
+      byte-identical on every host and carries its own ccache and uv.
+
+      Default stays 'conda' so a runner that has not been provisioned yet keeps
+      working: the two can coexist while the fleet is migrated one label at a
+      time, and any job can be reverted on its own.
+    required: false
+    default: 'conda'
   unset-ring:
     description: >-
       When 'true', activate.sh unsets PTO2_RING_* — the dist HCCL tests break with
@@ -99,6 +120,7 @@ runs:
         INSTALL_TOOLCHAIN: ${{ inputs.install-toolchain }}
         PTO_ISA_COMMIT_IN: ${{ inputs.pto-isa-commit }}
         PIP_CACHE_NAME: ${{ inputs.pip-cache-name }}
+        TOOLCHAIN_IN: ${{ inputs.toolchain }}
       run: |
         set -uo pipefail
         # A device job that installs the toolchain must have a pto-isa commit to
@@ -107,9 +129,23 @@ runs:
           echo "::error::install-toolchain=true requires pto-isa-commit (pass needs.toolchain.outputs.pto_isa_commit)"
           exit 1
         fi
+        # Both bootstrap steps below are gated on an exact `toolchain` match, so
+        # an unknown value silently skips both and the first symptom is an
+        # unrelated "activate.sh: No such file" ten minutes into the build.
+        # Reject it here, where the message can still name the real cause.
+        case "${TOOLCHAIN_IN:-conda}" in
+          conda|bundle) ;;
+          *)
+            echo "::error::toolchain must be 'conda' or 'bundle', got '$TOOLCHAIN_IN'"
+            exit 1
+            ;;
+        esac
         # Prerequisites CI does not create, so they must already be there. The
         # codegen job needs no Ascend env, so CANN_ROOT is device-jobs-only.
-        required="CONDA_ROOT"
+        required=""
+        if [ "${TOOLCHAIN_IN:-conda}" = "conda" ]; then
+          required="CONDA_ROOT"
+        fi
         if [ "$NEEDS_DEVICE" = "true" ]; then
           required="$required CANN_ROOT"
         fi
@@ -262,6 +298,7 @@ runs:
         git checkout ${{ inputs.pto-isa-commit }}
 
     - name: Bootstrap conda + per-job venv + write activate.sh
+      if: ${{ inputs.toolchain == 'conda' }}
       # Per-job venv layered on the conda env; activate.sh lets each later step
       # (and every task-submit child) enter the env with a single
       # `source activate.sh`. For device jobs it also sources set_env.sh, which
@@ -322,6 +359,111 @@ runs:
           printf '%s\n' 'unset PTO2_RING_HEAP PTO2_RING_TASK_WINDOW PTO2_RING_DEP_POOL' >> activate.sh
         fi
 
+    - name: Enter the toolchain bundle + per-job venv + write activate.sh
+      if: ${{ inputs.toolchain == 'bundle' }}
+      # Same contract as the conda step it replaces: a per-job venv and an
+      # activate.sh that any later step, and any task-submit child, enters with
+      # one `source activate.sh`. What changes is where Python and GCC come from.
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      env:
+        NEEDS_DEVICE: ${{ inputs.needs-device }}
+        UNSET_RING: ${{ inputs.unset-ring }}
+      run: |
+        # Assert what this build needs rather than a bundle version, so the
+        # fleet can be upgraded without editing this file. ccache >= 4.8 is a
+        # correctness requirement: below it CCACHE_NAMESPACE is silently
+        # ignored, and that is how the compile cache is scoped to the pinned
+        # pto-isa commit (issue #1139).
+        pypto-toolchain verify \
+          --require python=3.10 --require 'gcc>=15' --require 'ccache>=4.8'
+        # Enter the bundle through the same tool that just verified it, rather
+        # than by naming a path. `export` re-emits the selected bundle's own
+        # activate.sh, resolved through the install root and `current` symlink
+        # verify resolved — so "the bundle we checked" and "the bundle we build
+        # with" cannot become two different bundles.
+        #
+        # A repo-side root override would reintroduce exactly that split, and
+        # would promise a portability the bundle does not have: the prefix
+        # /opt/pypto/toolchain/<version> is compiled into its gcc and python
+        # (cc1plus carries the string, sysconfig reports it to every extension
+        # build), so a bundle unpacked elsewhere is subtly broken. Relocation is
+        # a symlink at /opt/pypto, or the install root in the host's own
+        # pypto-env.conf; the tool resolves both and this step follows it.
+        bundle_env="$(pypto-toolchain export)" || exit 1
+        eval "$bundle_env"
+        # activate.sh exports PYPTO_TOOLCHAIN as the versioned prefix, and the
+        # generated per-job file below is written around it — so a silent empty
+        # here would surface much later as a venv built by the host python.
+        if [ -z "${PYPTO_TOOLCHAIN:-}" ]; then
+          echo "::error::pypto-toolchain export did not set PYPTO_TOOLCHAIN"
+          exit 1
+        fi
+
+        rm -rf venv
+        # No --system-site-packages. Nothing outside the venv is depended on
+        # now, which also retires the trap that flag created: with it, a failed
+        # install in the venv was masked by a copy of pypto in the base env.
+        python3.10 -m venv venv
+
+        # PYPTO_TOOLCHAIN is written in as a literal, exactly as the conda roots
+        # were: activate.sh is also sourced by task-submit children, whose env
+        # snapshot is truncated and carries neither GITHUB_ENV nor this value.
+        echo "_PYPTO_TOOLCHAIN=$PYPTO_TOOLCHAIN" > activate.sh
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          echo "_PYPTO_CANN_ROOT=$CANN_ROOT" >> activate.sh
+        fi
+        # Ordering matters. CANN's set_env.sh prepends its own directories to
+        # LD_LIBRARY_PATH, so the bundle is sourced AFTER it to keep the
+        # bundle's libstdc++ first — which is what the conda path did by
+        # prepending $CONDA_PREFIX/lib last. ptoas needs GLIBCXX_3.4.29 and the
+        # host libstdc++ stops at 3.4.28, so losing that order breaks ptoas.
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          printf '%s\n' 'source "$_PYPTO_CANN_ROOT/set_env.sh"' >> activate.sh
+        fi
+        cat >> activate.sh <<'EOF'
+        source "$_PYPTO_TOOLCHAIN/activate.sh"
+        # BASH_SOURCE, not $GITHUB_WORKSPACE: a task-submit child's truncated
+        # env snapshot may not carry the workspace path.
+        _PYPTO_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        source "$_PYPTO_ENV_DIR/venv/bin/activate"
+        EOF
+        if [ "$UNSET_RING" = "true" ]; then
+          printf '%s\n' 'unset PTO2_RING_HEAP PTO2_RING_TASK_WINDOW PTO2_RING_DEP_POOL' >> activate.sh
+        fi
+
+        # Prove the file works before ten minutes of building depend on it. This
+        # is a self-test of the file assembled just above — which `verify` cannot
+        # cover, since it is generated here and did not exist when verify ran —
+        # not a second opinion about the bundle: verify and the activation above
+        # now resolve the same one. A fault here is a bug in this step's own
+        # composition (wrong venv, lost PATH order), and it is worth catching at
+        # second ten rather than as a compile error at minute ten.
+        ( source activate.sh
+          command -v python3.10 g++-15 ccache uv >/dev/null
+          python3.10 -c 'import sys; assert sys.version_info[:2]==(3,10)'
+          gxx_version=$(g++-15 -dumpversion)
+          gxx_major=${gxx_version%%.*}
+          case "$gxx_major" in
+            ''|*[!0-9]*)
+              echo "::error::cannot read a g++-15 major version from '$gxx_version'"
+              exit 1 ;;
+          esac
+          if [ "$gxx_major" -lt 15 ]; then
+            echo "::error::g++-15 reports $gxx_version, need >= 15"
+            exit 1
+          fi
+          # Probe the behaviour, not the version string. `namespace` is a
+          # ccache 4.x key; 3.x drops CCACHE_NAMESPACE with no error and no
+          # warning, so the cache silently stops being scoped to the pinned
+          # pto-isa commit and #1139 comes back as a moving segfault.
+          if ! ccache -p | grep -q 'namespace'; then
+            echo "::error::this ccache ignores CCACHE_NAMESPACE (needs >= 4.8)"
+            echo "ccache: $(command -v ccache) $(ccache --version | head -1)"
+            exit 1
+          fi )
+        echo "toolchain: $(source activate.sh >/dev/null 2>&1; g++-15 -dumpversion) / $(source activate.sh >/dev/null 2>&1; python3.10 -V 2>&1)"
+
     - name: Show ccache stats (before)
       shell: bash
       run: ccache -s || true
@@ -336,6 +478,32 @@ runs:
         rm -rf ./build ./_skbuild ./runtime/build ./runtime/_skbuild
         python -m pip install --upgrade pip
         pip install scikit-build-core nanobind cmake ninja
+        # torch first, and explicitly the CPU build. These are Ascend hosts, and
+        # left to resolve `torch>=2.0.0` on its own pip now selects a version
+        # whose aarch64 wheel drags in the entire CUDA stack — torch 427 MB,
+        # cudnn 444 MB, cusparselt 221 MB and more, none of it usable here.
+        #
+        # The conda path never hit this: its base env already carried a torch,
+        # so with --system-site-packages pip saw the requirement satisfied and
+        # skipped it. Isolating the venv removed that accident, and with it the
+        # only thing that was pinning torch at all. Installing it up front means
+        # the dependency is already satisfied when pypto's metadata is resolved.
+        #
+        # The version is pinned to what the conda fleet already carries, so this
+        # migration changes the toolchain and nothing else. Unpinned, pip took
+        # the newest (2.13.0) and tests/st/codegen/torch/
+        # test_torch_codegen_paged_attention.py started failing its golden
+        # compare at max abs diff 7.35e-02 against a 5e-2 tolerance — a pure-CPU
+        # torch-vs-torch comparison over bf16 inputs, so a torch upgrade moves it
+        # with no PyPTO change involved. Bumping this pin is a deliberate,
+        # separate decision; it must not ride along on an infrastructure change.
+        #
+        # It is also a no-op on the conda path, where torch is already visible.
+        TORCH_PIN='torch==2.10.0'
+        if ! pip install "$TORCH_PIN" --index-url https://download.pytorch.org/whl/cpu; then
+          echo "note: download.pytorch.org unreachable — falling back to PyPI"
+          pip install "$TORCH_PIN"
+        fi
         pip install --no-build-isolation .[dev]
         # simpler (./runtime) is only needed on the codegen -> device path; the
         # --codegen-only job skips it (install-toolchain=false).
