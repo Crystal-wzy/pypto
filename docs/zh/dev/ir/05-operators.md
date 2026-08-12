@@ -175,6 +175,26 @@ A5 会把左侧显式 FP4→FP8 tile cast 展开为 FP4→BF16→FP32→FP8E4M3F
 | `#pto.layout` / mx load | `mx_a_zz` / `mx_b_nn` / …；本阶段用 **host ZZ/NN**（AZZ2ZZ） |
 | 本阶段覆盖 | `pto.tmatmul.mx` / `.acc` / `.bias` + `pto.tget_scale_addr` |
 
+### 仅 Tile 的 GEMV 家族（A2/A3）
+
+仅 tile 的 GEMV 家族逻辑形状为 `[1, N]`，但物理形状遵循 Cube 指令的对齐契约：
+Acc 结果使用 16 个物理行，物理列数沿用 RHS tile（并须满足目标平台通常的
+C0 对齐要求），bias 使用相同的物理列数；
+各自的 `valid_shape` 仍保留逻辑 `[K, N]`、`[1, N]` 和 `[1, N]` 区域。
+lhs 的物理行数和逻辑行数都必须恰好为 1。
+单行 Mat load 使用 `blayout=row_major` 和 `slayout=none_box`，从而选择
+PTO-ISA 的行向量提取路径。
+
+rhs 的逻辑 K 必须覆盖 lhs 的逻辑 K。支持的 dtype 三元组为
+`INT8 x INT8 -> INT32`，以及同类型 `FP16`、`BF16` 或 `FP32` 输入到
+`FP32`；`gemv_acc` 的 `acc` 使用对应输出 dtype，`gemv_bias` 的 `bias`
+也必须使用相同的输出 dtype，且 bias 的 valid shape 必须覆盖逻辑输出
+`[1, N]`；物理 N 一致时，bias 的 valid N 可以更宽。
+
+`tile.gemv`、`tile.gemv_acc` 和 `tile.gemv_bias` 的 `acc_phase` 可设为
+`"unspecified"`（默认值）、`"partial"` 或 `"final"`。后续仍有 K 分块时
+使用 `"partial"`，最后一个分块使用 `"final"`。
+
 ## Python 用法
 
 ```python
