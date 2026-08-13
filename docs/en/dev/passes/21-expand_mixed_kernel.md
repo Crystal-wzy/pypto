@@ -308,8 +308,18 @@ Phase 4 — Normalize hand-written mixed Group ABIs:
 | MIXED | `tile.move` crossing cube↔vector memory | Leaf cross-side move — also recorded in the `boundary_moves` map (see below) |
 | CUBE or VECTOR | `tile.move` (same-side) | By source tile's `memory_space` |
 | VECTOR | All other `tile.*` ops (`tile.add`, `tile.exp`, `tile.sub`, etc.) | Always VECTOR (op name) |
+| VECTOR | `pld.tile.put`, `pld.tile.get`, `pld.tensor.put`, `pld.tensor.get` | Declared `set_core_affinity(VECTOR)` — TPUT/TGET stream through a VEC staging tile, which ptoas enforces |
 | SHARED | Non-tile ops, function calls, control flow, scalar ops | — |
+| SHARED | `pld.system.notify`, `pld.system.wait` | Core-agnostic by ISA (pure scalar/GM), so no affinity is declared. `notify` also declares `set_no_duplicate()` (both `NotifyOp` forms) — a cube-lane copy can release the peer before the vector lane's TPUT lands the data; `wait` does not, since it *blocks* and its cube-lane copy is load-bearing |
 | MIXED | Compound statements containing both CUBE and VECTOR children | — |
+| VECTOR | any call stamped `attrs["core_placement"] = "aiv"` | Region placement — outranks every rule above |
+
+**Region placement outranks inference.** A call stamped
+`attrs["core_placement"] = "aiv"` resolves to `VECTOR`, keeping a
+`pld.system.notify` off the cube lane. The stamp, its carve-outs and its lifetime
+are documented at [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md); this
+pass reads it, then **strips** it. It does not make the op run *once* — see
+[Scopes and Placement](../../user/language/04-scopes.md).
 
 **CV boundary detection**: A `tile.move` is a CV boundary when its source tile memory and target memory are on different core sides. Cube-side memory: Mat, Left, Right, Acc, Bias. Vector-side memory: Vec. Same-side moves (e.g. Mat→Left) are classified by their source memory as usual. Boundary leaf moves are tagged `MIXED` for affinity purposes and are also recorded in a separate `boundary_moves` map; the cross-core direction (Cube→Vector vs Vector→Cube) is recovered via `ClassifyMoveDirection` at the call sites that need it (`CollectCVBoundaryMoves`, `BuildCoreBody`).
 
