@@ -39,7 +39,7 @@ def add(
     out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
 ):
     with pl.at(level=pl.Level.CORE_GROUP):
-        out = pl.assemble(out, pl.add(a, b), [0, 0])
+        out[:] = pl.add(a, b)
     return out
 
 compiled = add.compile()
@@ -84,7 +84,7 @@ def add_then_square(
 ):
     with pl.at(level=pl.Level.CORE_GROUP):
         s = pl.add(a, b)
-        out = pl.assemble(out, pl.mul(s, s), [0, 0])
+        out[:] = pl.mul(s, s)
     return out
 ```
 
@@ -105,7 +105,7 @@ def accumulate(
         t = pl.add(a, a)
         for i in pl.range(3):
             t = pl.add(t, a)      # 跨迭代携带
-        out = pl.assemble(out, pl.mul(t, t), [0, 0])
+        out[:] = pl.mul(t, t)
     return out
 ```
 
@@ -131,7 +131,7 @@ def add_kernel(
     b: pl.Tensor[[128, 128], pl.FP32],
     out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
 ):
-    out = pl.assemble(out, pl.add(a, b), [0, 0])
+    out[:] = pl.add(a, b)
     return out
 
 @pl.jit
@@ -246,7 +246,7 @@ assert torch.allclose(out, a + b, rtol=1e-5, atol=1e-5)
 后续用相同形状调用会复用缓存的编译产物。`examples/beginner/01_hello_world.py` 就是这个模式，
 只是写在 tile 级。
 
-## Edge Cases
+## 边界情况
 
 > **致命陷阱：** `@pl.jit` 是**解析**函数体，不是执行它。函数体里的 `print()` 或 `assert`
 > 在运行期永远不会执行，用调试器单步进去看到的是解析过程而不是计算过程。调试请读

@@ -32,7 +32,7 @@ def square_tensor(
     out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
 ):
     # 张量级：命名整个数组。放置与搬运是编译器的事。
-    out = pl.assemble(out, pl.mul(x, x), [0, 0])
+    out[:] = pl.mul(x, x)
     return out
 
 @pl.jit.incore
@@ -245,7 +245,7 @@ def mm(
 混合 kernel 与跨核流水这些概念正是由这个形态而来，参见
 [集群架构](../reference/pto-isa/00-cluster_architecture.md)。
 
-## Edge Cases
+## 边界情况
 
 > **致命陷阱：** Orchestration 函数里的语句顺序不约束执行顺序。如果两次派发必须按序执行，
 > 这个次序必须被表达出来 —— 通过依赖，或通过编译器能看见的缓冲区关系。只依赖源码顺序，

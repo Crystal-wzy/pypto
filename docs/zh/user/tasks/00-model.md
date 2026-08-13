@@ -21,7 +21,7 @@ import pypto.language as pl
 
 @pl.jit.incore
 def twice(x: pl.Tensor[[256, 128], pl.FP32], out: pl.Out[pl.Tensor[[256, 128], pl.FP32]]):
-    out = pl.assemble(out, pl.add(x, x), [0, 0])
+    out[:] = pl.add(x, x)
     return out
 
 @pl.jit
@@ -73,7 +73,7 @@ OverlapMap 基于缓冲区工作，所以它推出的恰好是那些**本身就�
 
 所以 `deps=` 在普通 auto 作用域里就能用，作为补齐推导够不着那条边的精修工具。把推导**关掉**是另一个决定，而且更重 —— 那是 [`pl.manual_scope`](01-scopes.md)。
 
-## Edge Cases
+## 边界情况
 
 > **致命陷阱：** 如果没有任何东西表达先后，两个任务就可能重叠 —— 结果是一个偶发复现、一上调试器或一加打印就消失的竞态。语句相邻不是证据，"我跑了一次是对的"也不是。
 

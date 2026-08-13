@@ -23,7 +23,7 @@ def add_kernel(
     b: pl.Tensor[[128, 128], pl.FP32],
     out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
 ):
-    out = pl.assemble(out, pl.add(a, b), [0, 0])
+    out[:] = pl.add(a, b)
     return out
 
 @pl.jit
@@ -99,13 +99,13 @@ def host_orch(
 ```python
 @pl.jit
 def bad(x: pl.Tensor[[64, 64], pl.FP32], out: pl.Out[pl.Tensor[[64, 64], pl.FP32]]):
-    out = pl.assemble(out, pl.add(x, x), [0, 0])        # ✗ Misplaced tensor op ... should be inside InCore block
+    out[:] = pl.add(x, x)        # ✗ Misplaced tensor op ... should be inside InCore block
     return out
 
 @pl.jit
 def good(x: pl.Tensor[[64, 64], pl.FP32], out: pl.Out[pl.Tensor[[64, 64], pl.FP32]]):
     with pl.at(level=pl.Level.CORE_GROUP):
-        out = pl.assemble(out, pl.add(x, x), [0, 0])    # ✓
+        out[:] = pl.add(x, x)    # ✓
     return out
 ```
 
@@ -200,7 +200,7 @@ print("artifacts in:", compiled.output_dir)
 
 手写的 C++ kernel 可以像普通函数一样被调用。见 [集成手写 C++ Kernel](../../dev/language/01-external-kernels.md)。
 
-## Edge Cases
+## 边界情况
 
 > **致命陷阱：** 验证新的 `@pl.jit` 示例要用完整的 `compile()`，不能只用 `lower()`。`lower()` 在 Pass 之后就停下，所以上面那条"Orchestration 体内放算子"的错误根本不会触发 —— kernel 看上去通过了，直到有人真正去跑它才失败。
 
