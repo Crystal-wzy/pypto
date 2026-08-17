@@ -3045,6 +3045,213 @@ class TestGmLocalTensorConversion:
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_mixed_tile_and_scalar_store_to_same_gm_tensor_rejected(self):
+        """DMA and scalar stores to one GM tensor have no coherence guarantee."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                dst: pl.Tensor[[64], pl.INT32],
+                val: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[64], pl.INT32]:
+                fill = pl.full([32], dtype=pl.INT32, value=-1)
+                dst[0:32] = fill
+                for i in pl.range(4):
+                    pl.tensor.write(dst, [i], val)
+                return dst
+
+        with pytest.raises(ValueError, match="mixes MTE3 and scalar stores"):
+            passes.convert_tensor_to_tile_ops()(Before)
+
+    def test_full_tensor_init_and_dynamic_scalar_updates_use_bulk_stores(self):
+        """Full GM initializations and later scalar overrides are staged in UB."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                dst_pos: pl.Tensor[[1, 32], pl.INT32],
+                dst_index: pl.Tensor[[1, 32], pl.INT32],
+                values: pl.Tensor[[32], pl.INT32],
+                count: pl.Scalar[pl.INDEX],
+            ) -> pl.Scalar[pl.INDEX]:
+                pos_fill = pl.full([1, 32], dtype=pl.INT32, value=0)
+                dst_pos[0:1, 0:32] = pos_fill
+                index_fill = pl.full([1, 32], dtype=pl.INT32, value=-1)
+                dst_index[0:1, 0:32] = index_fill
+                for i in pl.range(32):
+                    if i < count:
+                        value = pl.tensor.read(values, [i])
+                        pl.tensor.write(dst_pos, [0, i], value)
+                        pl.tensor.write(dst_index, [0, i], pl.cast(i, pl.INT32))
+                return count
+
+        after = passes.convert_tensor_to_tile_ops()(Before)
+        kernel = _require_function(after, "main_incore_0")
+        assert len(_find_calls_to(kernel, "tile.store")) == 2
+        assert len(_find_calls_to(kernel, "tile.full")) == 2
+        assert len(_find_calls_to(kernel, "tile.write")) == 2
+        assert _find_first_call_to(kernel, "tensor.write") is None
+
+    def test_full_tensor_init_with_intervening_read_remains_rejected(self):
+        """A GM read makes delaying the initial bulk store observable."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                dst: pl.Tensor[[32], pl.INT32],
+            ) -> pl.Scalar[pl.INT32]:
+                fill = pl.full([32], dtype=pl.INT32, value=-1)
+                dst[0:32] = fill
+                old = pl.tensor.read(dst, [0])
+                pl.tensor.write(dst, [1], old)
+                return old
+
+        with pytest.raises(ValueError, match="mixes MTE3 and scalar stores"):
+            passes.convert_tensor_to_tile_ops()(Before)
+
+    def test_constant_scalar_fill_loop_uses_bulk_store(self):
+        """A contiguous constant GM fill uses MTE3 instead of scalar D-cache stores."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                dst: pl.Tensor[[16, 1], pl.FP32],
+                aux: pl.Tensor[[16, 1], pl.FP32],
+                valid: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                if valid > 0:
+                    fill = pl.full([16, 1], dtype=pl.FP32, value=1.0)
+                    aux_fill = pl.full([16, 1], dtype=pl.FP32, value=2.0)
+                    dst[0:16, 0:1] = fill
+                    aux[0:16, 0:1] = aux_fill
+                else:
+                    for i in pl.range(16):
+                        pl.tensor.write(dst, [i, 0], pl.const(0.0, pl.FP32))
+                        pl.tensor.write(aux, [i, 0], pl.const(-1.0, pl.FP32))
+                return dst
+
+        after = passes.convert_tensor_to_tile_ops()(Before)
+        kernel = _require_function(after, "main_incore_0")
+        assert len(_find_calls_to(kernel, "tile.store")) == 4
+        assert len(_find_calls_to(kernel, "tile.full")) == 4
+        assert len(_find_calls_to(kernel, "tile.reshape")) == 2
+        assert _find_first_call_to(kernel, "tensor.write") is None
+
+    def test_unaligned_constant_scalar_fill_loop_still_rejected(self):
+        """A constant fill smaller than one MTE3 row stays on the scalar path."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self, dst: pl.Tensor[[16, 1], pl.FP32], valid: pl.Scalar[pl.INT32]
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                if valid > 0:
+                    fill = pl.full([16, 1], dtype=pl.FP32, value=1.0)
+                    dst[0:16, 0:1] = fill
+                else:
+                    for i in pl.range(4):
+                        pl.tensor.write(dst, [i, 0], pl.const(0.0, pl.FP32))
+                return dst
+
+        with pytest.raises(ValueError, match="mixes MTE3 and scalar stores"):
+            passes.convert_tensor_to_tile_ops()(Before)
+
+    def test_shifted_multi_write_fill_loop_still_rejected(self):
+        """Bulk rewriting must not reorder overlapping scalar write patterns."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self, dst: pl.Tensor[[17, 1], pl.FP32], valid: pl.Scalar[pl.INT32]
+            ) -> pl.Tensor[[17, 1], pl.FP32]:
+                if valid > 0:
+                    fill = pl.full([16, 1], dtype=pl.FP32, value=1.0)
+                    dst[0:16, 0:1] = fill
+                else:
+                    for i in pl.range(16):
+                        pl.tensor.write(dst, [i, 0], pl.const(0.0, pl.FP32))
+                        pl.tensor.write(dst, [i + 1, 0], pl.const(-1.0, pl.FP32))
+                return dst
+
+        with pytest.raises(ValueError, match="mixes MTE3 and scalar stores"):
+            passes.convert_tensor_to_tile_ops()(Before)
+
+    def test_tile_and_scalar_stores_to_distinct_gm_tensors_allowed(self):
+        """The coherence restriction is per underlying GM tensor."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                dma_dst: pl.Tensor[[32], pl.INT32],
+                scalar_dst: pl.Tensor[[32], pl.INT32],
+                val: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[32], pl.INT32]:
+                fill = pl.full([32], dtype=pl.INT32, value=-1)
+                dma_dst[0:32] = fill
+                pl.tensor.write(scalar_dst, [0], val)
+                return dma_dst
+
+        passes.convert_tensor_to_tile_ops()(Before)
+
+    def test_mixed_store_through_tensor_view_rejected(self):
+        """A GM tensor.view preserves the parameter's store identity."""
+        tensor_type = ir.TensorType([32], DataType.INT32)
+        ib = IRBuilder()
+        with ib.function("view_alias", type=ir.FunctionType.InCore) as f:
+            dst = f.param("dst", tensor_type)
+            val = f.param("val", ir.ScalarType(DataType.INT32))
+            f.return_type(tensor_type)
+            viewed = ib.let("viewed", tensor_ops.view(dst, [32]))
+            src = ib.let("src", tile_ops.load(dst, [0], [32]))
+            stored = ib.let("stored", tile_ops.store(src, [0], viewed))
+            ib.let("scalar_stored", tensor_ops.write(dst, [0], val))
+            ib.return_stmt(stored)
+        program = ir.Program([f.get_result()], "ViewAliasMixedStores", ir.Span.unknown())
+
+        with pytest.raises(ValueError, match="mixes MTE3 and scalar stores"):
+            passes.convert_tensor_to_tile_ops()(program)
+
+    @pytest.mark.parametrize("loop_kind", ["for", "while"])
+    def test_mixed_store_through_loop_carried_alias_rejected(self, loop_kind: str):
+        """Later loop iterations inherit tensor origins yielded by the body."""
+        tensor_type = ir.TensorType([32], DataType.INT32)
+        ib = IRBuilder()
+        with ib.function(f"{loop_kind}_alias", type=ir.FunctionType.InCore) as f:
+            dma_dst = f.param("dma_dst", tensor_type)
+            scalar_dst = f.param("scalar_dst", tensor_type)
+            val = f.param("val", ir.ScalarType(DataType.INT32))
+            f.return_type(tensor_type)
+            src = ib.let("src", tile_ops.load(dma_dst, [0], [32]))
+            loop_var = ib.var("i", ir.ScalarType(DataType.INDEX))
+            loop_context = (
+                ib.for_loop(loop_var, 0, 2, 1)
+                if loop_kind == "for"
+                else ib.while_loop(ir.ConstBool(True, ir.Span.unknown()))
+            )
+            with loop_context as loop:
+                carried = loop.iter_arg("carried", dma_dst)
+                final = loop.return_var("final")
+                ib.let("stored", tile_ops.store(src, [0], carried))
+                ib.emit(ir.YieldStmt([scalar_dst], ir.Span.unknown()))
+            ib.let("scalar_stored", tensor_ops.write(scalar_dst, [0], val))
+            ib.return_stmt(final)
+        program = ir.Program([f.get_result()], f"{loop_kind.title()}AliasMixedStores", ir.Span.unknown())
+
+        with pytest.raises(ValueError, match="mixes MTE3 and scalar stores"):
+            passes.convert_tensor_to_tile_ops()(program)
+
     def test_local_tensor_write_to_tile_write(self):
         """tensor.write to a local_tensor (result of tensor.add) converts to tile.write."""
 
