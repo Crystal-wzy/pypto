@@ -256,10 +256,129 @@ _KERNEL_HEADER = """\
 
 {subblock_override}#include <pto/pto-inst.hpp>
 #include "tensor.h"
+{deferred_completion_include}
 {spmd_override}
 
 using namespace pto;
 
+"""
+
+_DEFERRED_COMPLETION_ADAPTER = """\
+// --- Deferred completion adapter ---
+// ABI precondition: supported Simpler dispatchers provide kernel_entry with a
+// valid LocalContext whose AsyncCtx owns a live deferred-completion slab.
+// get_async_ctx intentionally follows that scheduler ABI directly.
+//
+// Provenance: every construct below except the address arithmetic and the
+// `expected` range check is runtime policy owned by
+// `runtime/src/{arch}/runtime/{rt}/runtime/pto_async_kernel_api.h` and its
+// siblings — AsyncCtx decoding, the slab-validity predicate, the PTO2_ERROR_*
+// codes, and the flush discipline. That header's public surface is
+// get_async_ctx / async_ctx_is_deferred / register_completion_condition /
+// send_notification / save_expected_notification_counter; the `pto2::detail`
+// calls on the error paths are deliberate, because no public entry point can
+// publish an arbitrary error code and the writeback is mandatory for the
+// scheduler to observe it.
+//
+// The __has_include guard on that header only proves it exists, not that it
+// still matches. This static_assert is the sole automatic drift detector, and
+// it anchors kMaxDeferredConditionsPerWaiter in
+// include/pypto/ir/transforms/utils/scope_outline_utils.h, which bounds the
+// same budget at compile time without access to any runtime header.
+static_assert(MAX_COMPLETIONS_PER_TASK == 64,
+    "PyPTO's DeferredWaitContractValidator hard-codes 64 conditions per waiter; "
+    "update kMaxDeferredConditionsPerWaiter in scope_outline_utils.h to match");
+
+static __aicore__ void pypto_register_counter_completion(
+    __gm__ int64_t* raw_args,
+    __gm__ int32_t* counter_base,
+    int64_t element_offset,
+    int64_t expected)
+{
+    AsyncCtx ctx = get_async_ctx(raw_args);
+    if (!async_ctx_is_deferred(ctx)) {
+        // A supported dispatcher always supplies a live task token and slab.
+        // If the token is corrupted but the slab pointers remain coherent,
+        // publish a scheduler-visible error instead of returning as an
+        // ordinary completed task. defer_flush validates the token, so mark
+        // only this local AsyncCtx copy valid after recording the error.
+        if (ctx.completion_count != nullptr && ctx.completion_error_code != nullptr) {
+            *ctx.completion_count = 0;
+            *ctx.completion_error_code = PTO2_ERROR_ASYNC_COMPLETION_INVALID;
+            ctx.task_token.raw = 0;
+            pto2::detail::defer_flush(ctx);
+            return;
+        }
+#if defined(__CPU_SIM)
+        __builtin_trap();
+#else
+        trap();
+#endif
+    }
+
+    const bool slab_is_valid =
+        ctx.completion_count != nullptr &&
+        ctx.completion_error_code != nullptr &&
+        ctx.completion_entries != nullptr &&
+        ctx.completion_capacity > 0 &&
+        ctx.completion_capacity <= static_cast<uint32_t>(MAX_COMPLETIONS_PER_TASK);
+    if (!slab_is_valid) {
+        // A valid token with malformed slab metadata must never retire as a
+        // successful ordinary task. If the count/error cache line is usable,
+        // publish INVALID with a zero count; otherwise there is no safe path
+        // to notify the scheduler, so fail the kernel immediately.
+        if (ctx.completion_count != nullptr && ctx.completion_error_code != nullptr) {
+            *ctx.completion_count = 0;
+            *ctx.completion_error_code = PTO2_ERROR_ASYNC_COMPLETION_INVALID;
+            pto2::detail::defer_flush(ctx);
+            return;
+        }
+#if defined(__CPU_SIM)
+        __builtin_trap();
+#else
+        trap();
+#endif
+    }
+
+    constexpr int64_t kMaxExpected = 0x7fffffffLL;
+    if (counter_base == nullptr || element_offset < 0 || expected < 0 || expected > kMaxExpected) {
+        pto2::detail::defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_flush(ctx);
+        return;
+    }
+
+    constexpr uint64_t kElementBytes = sizeof(int32_t);
+    constexpr uint64_t kMaxAddress = ~static_cast<uint64_t>(0);
+    const uint64_t base = reinterpret_cast<uint64_t>(counter_base);
+    const uint64_t offset = static_cast<uint64_t>(element_offset);
+    if ((base & (kElementBytes - 1u)) != 0u || offset > (kMaxAddress - base) / kElementBytes) {
+        pto2::detail::defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_flush(ctx);
+        return;
+    }
+
+    // Token construction, registration, and writeback are exactly the runtime's
+    // public helper, so call it rather than restating its five token fields.
+    // Its only failure is slab overflow, which it records itself as
+    // ASYNC_WAIT_OVERFLOW — the accurate code, where REGISTRATION_FAILED
+    // belongs to the mailbox drain layer. The other two rejections
+    // register_completion_condition can make (invalid token, null slab
+    // pointers) are already excluded above.
+    save_expected_notification_counter(
+        ctx,
+        reinterpret_cast<volatile __gm__ void*>(base + offset * kElementBytes),
+        static_cast<uint32_t>(expected));
+}
+
+"""
+
+_DEFERRED_COMPLETION_INCLUDE = """\
+#if defined(__has_include)
+#if !__has_include("pto_async_kernel_api.h")
+#error "pld.system.defer_wait requires a Simpler runtime that provides pto_async_kernel_api.h"
+#endif
+#endif
+#include "pto_async_kernel_api.h"
 """
 
 
@@ -548,6 +667,7 @@ _SPMD_BLOCK_OPS = frozenset(
 )
 _SUBBLOCK_OPS = frozenset({_ir_core.get_op("tile.get_subblock_idx").name})
 _SDMA_WORKSPACE_OPS = frozenset({_ir_core.get_op("prefetch.make_context").name})
+_DEFERRED_COMPLETION_OPS = frozenset({_ir_core.get_op("pld.system.defer_wait").name})
 
 
 def _function_uses_ops(func: _ir_core.Function, op_names: frozenset[str]) -> bool:
@@ -593,6 +713,11 @@ def _uses_sdma_workspace(func: _ir_core.Function) -> bool:
     return _function_uses_ops(func, _SDMA_WORKSPACE_OPS)
 
 
+def _uses_deferred_completion(func: _ir_core.Function) -> bool:
+    """Return whether the wrapper must expose the scheduler AsyncCtx."""
+    return _function_uses_ops(func, _DEFERRED_COMPLETION_OPS)
+
+
 def _requires_dual_aiv_dispatch(func: _ir_core.Function) -> bool:
     """Return whether the function must be dispatched on both AIV lanes."""
     split_mode = getattr(func, "split", None)
@@ -629,6 +754,7 @@ def _generate_kernel_header(
     uses_spmd: bool | None = None,
     uses_subblock: bool | None = None,
     uses_sdma: bool | None = None,
+    uses_deferred_completion: bool | None = None,
 ) -> str:
     """Generate the wrapper header, including split lane overrides when needed."""
     fixed_subblock_id = _get_fixed_subblock_id(func)
@@ -669,12 +795,16 @@ def _generate_kernel_header(
         uses_subblock = _uses_dynamic_subblock_id(func)
     if uses_sdma is None:
         uses_sdma = _uses_sdma_workspace(func)
+    if uses_deferred_completion is None:
+        uses_deferred_completion = _uses_deferred_completion(func)
     needs_intrinsic = uses_spmd or uses_subblock or uses_sdma
     spmd_override = '#include "intrinsic.h"\n' if needs_intrinsic else ""
+    deferred_completion_include = _DEFERRED_COMPLETION_INCLUDE if uses_deferred_completion else ""
 
     return _KERNEL_HEADER.format(
         func_name=func.name,
         subblock_override=subblock_override,
+        deferred_completion_include=deferred_completion_include,
         spmd_override=spmd_override,
     )
 
@@ -696,11 +826,13 @@ def _generate_kernel_wrapper(
     uses_spmd = group_uses_spmd or func_uses_spmd
     func_uses_subblock = _uses_dynamic_subblock_id(func)
     func_uses_sdma = _uses_sdma_workspace(func)
+    func_uses_deferred_completion = _uses_deferred_completion(func)
     header = _generate_kernel_header(
         func,
         uses_spmd=uses_spmd,
         uses_subblock=func_uses_subblock,
         uses_sdma=func_uses_sdma,
+        uses_deferred_completion=func_uses_deferred_completion,
     )
     ptoas_body = _preprocess_ptoas_output(ptoas_code)
     unpacking_code, var_names = _generate_arg_unpacking(func, uses_spmd=uses_spmd)
@@ -747,10 +879,13 @@ def _generate_kernel_wrapper(
             "get_dma_workspace(args, DMA_WORKSPACE_SDMA));\n\n"
         )
 
-    # PTOCodegen appends the SDMA workspace after user-derived arguments, then
-    # the synthetic i32 identity params in canonical order (block_idx,
-    # block_num, subblock_idx). Mirror that exact order here.
+    # PTOCodegen appends raw dispatch args for deferred completion after
+    # user-derived arguments, then the SDMA workspace and synthetic i32
+    # identity params in canonical order (block_idx, block_num, subblock_idx).
+    # Mirror that exact order here.
     call_args_list = list(var_names)
+    if func_uses_deferred_completion:
+        call_args_list.append("args")
     if func_uses_sdma:
         call_args_list.append("__pypto_sdma_workspace")
     if func_uses_spmd:
@@ -778,7 +913,11 @@ def _generate_kernel_wrapper(
         "}\n"
     )
 
-    return f"{header}\n// --- ptoas-generated code ---\n{ptoas_body}\n{wrapper_func}"
+    deferred_completion_adapter = _DEFERRED_COMPLETION_ADAPTER if func_uses_deferred_completion else ""
+    return (
+        f"{header}\n{deferred_completion_adapter}"
+        f"// --- ptoas-generated code ---\n{ptoas_body}\n{wrapper_func}"
+    )
 
 
 def _format_signature(directions: list[str]) -> str:
