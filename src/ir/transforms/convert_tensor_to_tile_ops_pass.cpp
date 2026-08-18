@@ -25,6 +25,7 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -1283,6 +1284,15 @@ ExprPtr GetWriteTargetExpr(const CallPtr& call) {
   if ((IsOp(call, "pld.tile.put") || IsOp(call, "pld.tile.get")) && !call->args_.empty()) {
     return call->args_[0];
   }
+  // pld.system.notify(target, peer, offsets, value, *, op): the TNOTIFY
+  // deposits `value` into the peer rank's slot of `target` (args_[0]), so the
+  // enclosing window param must be upgraded from In to Out/InOut — otherwise a
+  // later reader of the same signal gets no RAW edge. The op is side-effect-only
+  // (UnknownType result), so this entry only ever feeds AnalyzeCallAccess, never
+  // the result-aliasing path in GetAliasOrigins.
+  if (IsOp(call, "pld.system.notify") && !call->args_.empty()) {
+    return call->args_[0];
+  }
   // pld.tensor.allreduce(target, signal, *, op): the composite collective
   // writes the reduced value back into `target` (args_[0]) — the in-place
   // rebind idiom shared with `pl.store`. `signal` (args_[1]) is also
@@ -1467,6 +1477,27 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
     }
     if (auto write_target = GetWriteTargetExpr(call)) {
       MarkAccess(GetAliasOrigins(write_target, origin_map), has_write);
+    }
+    return;
+  }
+
+  if (IsOp(call, "pld.system.notify")) {
+    // pld.system.notify(target, peer, offsets, value, *, op): target (args_[0])
+    // is always written; peer/offsets/value are reads. NotifyOp::kAtomicAdd is
+    // additionally a read-modify-write of the target slot, so its distributed
+    // target dependency must be preserved even when the slot belongs to a peer
+    // rank. NotifyOp::kSet remains write-only.
+    for (size_t i = 1; i < call->args_.size(); ++i) {
+      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
+    }
+    if (auto write_target = GetWriteTargetExpr(call)) {
+      auto origins = GetAliasOrigins(write_target, origin_map);
+      const auto notify_op =
+          static_cast<NotifyOp>(call->GetKwarg<int>("op", static_cast<int>(NotifyOp::kAtomicAdd)));
+      if (notify_op == NotifyOp::kAtomicAdd) {
+        MarkAccess(origins, has_read);
+      }
+      MarkAccess(origins, has_write);
     }
     return;
   }
