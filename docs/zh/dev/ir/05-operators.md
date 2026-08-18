@@ -338,6 +338,22 @@ UINT32 + INT32 → INT32 (signed precedence)
 
 `tensor.view` 是只修改元数据的零拷贝 shape/layout 重新解释操作。它注册为 `TensorOp`，并在 `ConvertTensorToTileOps` 中作为 passthrough 处理；PTO in-core codegen 会将其降级为基于原始 base pointer 的 `pto.make_tensor_view`。目标 rank 至少为 1（DN 至少为 2）；编排层仅支持 ND shape 重新解释，且不能同时改变 layout。对部分有效的源张量进行 shape 重新解释时，仅支持把 packed ND 的 leading dimensions 折叠为 2D，或把连续前缀线性折叠为 `[1, product(shape)]`；两种形式都必须显式提供目标 `valid_shape`，并会保留源张量类型及其底层元数据。
 
+对于普通 `TensorType` 操作数，已支持的 Tensor-scalar 算术算子（`adds`、
+`subs`、`muls`、`divs`、`fmods` 以及 scalar `maximum` 或 `minimum`）和
+位运算/移位算子（`ands`、`ors`、`shls` 和 `shrs`）会创建新存储，但不能
+把 padding 凭空变成有效数据。因此结果保留 Tensor 操作数的 effective
+`valid_shape`，同时丢弃源别名、layout、stride 与 padding 元数据。这与已有的
+Tile-scalar 规则一致，确保 ragged tail 经 Tensor-to-Tile 下降后仍保持窄有效区。
+Scalar 比较与 XOR（`cmp` 和 `xors`）仍不在此规则的支持范围内。
+
+对于普通 Tensor-tensor 算术算子（`add`、`sub`、`mul`、`div`、`fmod`、
+`maximum` 和 `minimum`），当两个操作数的物理 shape 相同，且其 effective
+`valid_shape` 可证明相等时，结果同样保留该有效区域。`and`、`or`、`shl` 和
+`shr` 也采用这条 exact-region 规则。它不需要映射广播轴，并与相应 Tile
+结果契约一致；结果仍是新存储，因此不会继承别名、layout、stride 或 padding
+元数据。比较、XOR、`part_*`、广播、不同有效区域，以及直接使用 distributed
+window 的操作数不在这条规则范围内，因为它们当前的下降或合并契约需要单独处理。
+
 `pl.reinterpret_view(data, dtype, *, shape=None)` 会根据输入分派到等价的 `pl.tensor` 或 `pl.tile` 算子，并保持返回类型种类不变。它是覆盖完全相同字节的零拷贝视图，因此 `dtype` 必须不同，且仅支持有/无符号 8/16/32/64 位整数、FP16、BF16 与 FP32。省略 `shape` 时，ND/row-major 缩放最后一轴，DN/col-major 按源/目标字节宽度比例缩放倒数第二轴。显式 shape 必须字节数相等；除非能证明它与自动推导 shape 等价，否则必须完全静态。部分有效的 `valid_shape` 只能使用与自动推导结果等价的 shape。零值/null padding 元数据会保留，依赖 dtype 的 max/min padding 则会清除。初始可执行路径支持 packed ND in-core tensor 及 packed、flat（`none_box`）row/col-major tile；DN tensor 可做类型推导但 Tensor-to-Tile 下降会拒绝，编排层 tensor 暂不支持。
 
 **示例：**
