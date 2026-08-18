@@ -1452,6 +1452,7 @@ def _run_config_compile_kwargs(run_config: Any) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "strategy": run_config.strategy,
         "dump_passes": run_config.dump_passes,
+        "dump_ptoas_passes": run_config.dump_ptoas_passes,
         "profiling": run_config.compile_profiling,
         "diagnostic_phase": run_config.diagnostic_phase,
         "disabled_diagnostics": run_config.disabled_diagnostics,
@@ -2068,6 +2069,7 @@ class JITFunction:
         analyze_auto_scopes_for_deps = (
             run_config.analyze_auto_scopes_for_deps if run_config is not None else False
         )
+        dump_ptoas_passes = run_config.dump_ptoas_passes if run_config is not None else False
         # The planner decides whether physical addresses are baked into the
         # artifact, so it must split the cache: compiling one kernel under both
         # planners must not hand the second call the first one's artifact.
@@ -2087,6 +2089,7 @@ class JITFunction:
             strategy=strategy,
             distributed_config=distributed_config,
             analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+            dump_ptoas_passes=dump_ptoas_passes,
             memory_planner=memory_planner,
             enable_pypto_l0c_double_buffer=_resolve_enable_pypto_l0c_double_buffer(),
         )
