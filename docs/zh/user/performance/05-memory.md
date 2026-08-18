@@ -62,18 +62,51 @@ ring   0    1    2    3 ── 3 ── 3 ── 3   ← 更深的作用域全�
 
 于是一个有好几层嵌套循环的 kernel，会把它最内层、通常也是数量最多的那批任务集中到单独一个环上，而那正是会溢出的那个环。把嵌套压平，或者把作用域上提、别让每一层深的都被包一次，就能重新摊开。
 
+下面这些 kernel 每次 CI 都会被执行，所以它们是真货而不是草图。它们共用这段准备：
+
+<!-- doctest: setup -->
+```python
+import pypto.language as pl
+import torch
+from pypto.runtime import RunConfig
+
+N, TR, TC = 4, 64, 128
+ROWS = N * TR
+
+torch.manual_seed(0)
+A = torch.randn(ROWS, TC, dtype=torch.float32)
+
+
+def check(kernel, cfg):
+    out = torch.zeros(ROWS, TC, dtype=torch.float32)
+    kernel(A, out, config=cfg)
+    torch.testing.assert_close(out, A * 2.0 + 1.0, rtol=1e-4, atol=1e-4)
+```
+
 ## 手工再平衡
 
 退出编译器放置，把作用域放到活所在的地方：
 
+深度才是关键：阶段 1 待在外层作用域，阶段 2 再往里嵌一层，于是二者落在不同的环上。两个**同级**作用域做不到这一点 —— `ring_idx` 只由深度决定。
+
+<!-- doctest: run -->
 ```python
-@pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
-def orch(self, a, out):
-    with pl.scope():
-        # ... 阶段 1 的任务，ring 0
-        with pl.scope():
-            ...   # 阶段 2 的任务，ring 1 —— 与阶段 1 独立回收
-        return out
+@pl.jit(auto_scope=False)
+def manual_placement(a: pl.Tensor, out: pl.Out[pl.Tensor]):
+    with pl.scope():                       # depth 0 — phase 1's tasks, ring 0
+        for i in pl.range(N):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                t = pl.load(a, [i * TR, 0], [TR, TC])
+                pl.store(pl.mul(t, 2.0), [i * TR, 0], out)
+        with pl.scope():                   # depth 1 — phase 2 moves to ring 1
+            with pl.at(level=pl.Level.CORE_GROUP):
+                for i in pl.range(N):
+                    t = pl.load(out, [i * TR, 0], [TR, TC])
+                    pl.store(pl.add(t, 1.0), [i * TR, 0], out)
+    return out
+
+
+check(manual_placement, RunConfig(platform="__PLATFORM__"))
 ```
 
 `@pl.jit`、`@pl.jit.host`、`@pl.jit.inline` 接受 `auto_scope=False`；`.incore` 与 `.opaque` 拒绝它 —— 它们被外提成独立 kernel，没有可供作用域存在的编排函数体。
@@ -117,12 +150,25 @@ python runtime/simpler_setup/tools/scope_stats_plot.py \
 | `ring_heap` | **字节** | 2 的幂，`>= 1024` |
 | `ring_dep_pool` | 依赖边条目 | 落在 `[4, INT32_MAX]` |
 
+<!-- doctest: run -->
 ```python
-cfg = RunConfig(
-    platform="a2a3",
+sized = RunConfig(
+    platform="__PLATFORM__",
     ring_task_window=[8192, 16384, 131072, 524288],
     ring_heap=[134217728, 268435456, 268435456, 536870912],
 )
+
+
+@pl.jit
+def scaled(a: pl.Tensor, out: pl.Out[pl.Tensor]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        for i in pl.range(N):
+            t = pl.load(a, [i * TR, 0], [TR, TC])
+            pl.store(pl.add(pl.mul(t, 2.0), 1.0), [i * TR, 0], out)
+    return out
+
+
+check(scaled, sized)
 ```
 
 字段留空（默认 `None`）会回落到运行时的 `PTO2_RING_*` 环境变量或它的编译期默认值，所以你也可以不改源码来做实验。

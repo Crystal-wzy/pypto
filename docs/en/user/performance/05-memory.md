@@ -79,18 +79,51 @@ numerous — tasks on a single ring, which is exactly the ring that overflows. F
 nesting, or hoisting scopes so the deep levels are not each wrapped, spreads them back
 out.
 
+<!-- doctest: setup -->
+```python
+import pypto.language as pl
+import torch
+from pypto.runtime import RunConfig
+
+N, TR, TC = 4, 64, 128
+ROWS = N * TR
+
+torch.manual_seed(0)
+A = torch.randn(ROWS, TC, dtype=torch.float32)
+
+
+def check(kernel, cfg):
+    out = torch.zeros(ROWS, TC, dtype=torch.float32)
+    kernel(A, out, config=cfg)
+    torch.testing.assert_close(out, A * 2.0 + 1.0, rtol=1e-4, atol=1e-4)
+```
+
 ## Rebalancing by hand
 
 Opt out of compiler placement and put the scopes where the work is:
 
+The depths are the whole point: phase 1 sits in the outer scope, phase 2 one level deeper,
+so they land on different rings. Two *sibling* scopes would not do this — `ring_idx` is a
+function of depth alone.
+
+<!-- doctest: run -->
 ```python
-@pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
-def orch(self, a, out):
-    with pl.scope():
-        # ... phase 1 tasks, ring 0
-        with pl.scope():
-            ...   # phase 2 tasks, ring 1 — reclaimed independently of phase 1
-        return out
+@pl.jit(auto_scope=False)
+def manual_placement(a: pl.Tensor, out: pl.Out[pl.Tensor]):
+    with pl.scope():                       # depth 0 — phase 1's tasks, ring 0
+        for i in pl.range(N):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                t = pl.load(a, [i * TR, 0], [TR, TC])
+                pl.store(pl.mul(t, 2.0), [i * TR, 0], out)
+        with pl.scope():                   # depth 1 — phase 2 moves to ring 1
+            with pl.at(level=pl.Level.CORE_GROUP):
+                for i in pl.range(N):
+                    t = pl.load(out, [i * TR, 0], [TR, TC])
+                    pl.store(pl.add(t, 1.0), [i * TR, 0], out)
+    return out
+
+
+check(manual_placement, RunConfig(platform="__PLATFORM__"))
 ```
 
 `@pl.jit`, `@pl.jit.host` and `@pl.jit.inline` accept `auto_scope=False`; `.incore` and
@@ -149,12 +182,25 @@ rings 0..3 independently, where a `0` entry leaves that ring at its default:
 | `ring_heap` | **Bytes** | Power of two, `>= 1024` |
 | `ring_dep_pool` | Dependency-edge entries | In `[4, INT32_MAX]` |
 
+<!-- doctest: run -->
 ```python
-cfg = RunConfig(
-    platform="a2a3",
+sized = RunConfig(
+    platform="__PLATFORM__",
     ring_task_window=[8192, 16384, 131072, 524288],
     ring_heap=[134217728, 268435456, 268435456, 536870912],
 )
+
+
+@pl.jit
+def scaled(a: pl.Tensor, out: pl.Out[pl.Tensor]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        for i in pl.range(N):
+            t = pl.load(a, [i * TR, 0], [TR, TC])
+            pl.store(pl.add(pl.mul(t, 2.0), 1.0), [i * TR, 0], out)
+    return out
+
+
+check(scaled, sized)
 ```
 
 Leaving a field `None` (the default) defers to the runtime's `PTO2_RING_*` environment
