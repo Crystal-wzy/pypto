@@ -33,6 +33,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace codegen {
@@ -460,6 +461,87 @@ REGISTER_DISTRIBUTED_OP(tensor_slice, "tensor.slice") {
   std::ostringstream line;
   line << "tensors[\"" << lhs << "\"] = tensors[\"" << input_name << "\"][" << indices.str() << "]";
   codegen.Emit(line.str());
+  dist_codegen.MarkDeclared(lhs);
+  return "";
+}
+
+// ============================================================================
+// tensor.assemble — write a source tensor into a target tensor slice.
+//
+// IR form:
+//   result = tensor.assemble(target, source, offset, *, atomic)
+//
+// The operation is SSA-functional but writes in place: ``result`` aliases
+// ``target`` after the source's valid region has been copied into the target
+// window. HOST orchestrators have no atomic-combine instruction, so atomic add
+// is rejected instead of being silently reduced to a plain Python assignment.
+// ============================================================================
+REGISTER_DISTRIBUTED_OP(tensor_assemble, "tensor.assemble") {
+  auto& dist_codegen = dynamic_cast<DistributedCodegen&>(codegen);
+
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+      << "Internal error: tensor.assemble expects 3 arguments";
+
+  const int atomic = op->GetKwarg<int>("atomic", static_cast<int>(ir::AtomicType::kNone));
+  CHECK_SPAN(atomic == static_cast<int>(ir::AtomicType::kNone), op->span_)
+      << "pl.assemble(..., atomic=pl.AtomicType.Add) is only supported inside an InCore function. "
+         "This assemble is in a HOST orchestrator, where no atomic-combine instruction exists. Move it "
+         "inside the scope that produces the partial result.";
+
+  const std::string target_name = codegen.GetExprAsCode(op->args_[0]);
+  const std::string source_name = codegen.GetExprAsCode(op->args_[1]);
+  const std::string lhs = codegen.GetCurrentResultTarget();
+  CHECK(!target_name.empty()) << "tensor.assemble target must resolve to a non-empty Python name";
+  CHECK(!source_name.empty()) << "tensor.assemble source must resolve to a non-empty Python name";
+  CHECK(!lhs.empty()) << "tensor.assemble in a HOST orchestrator must have an assignment target";
+
+  auto target_type = ir::As<ir::TensorType>(op->args_[0]->GetType());
+  auto source_type = ir::As<ir::TensorType>(op->args_[1]->GetType());
+  CHECK_SPAN(target_type && source_type, op->span_)
+      << "tensor.assemble in a HOST orchestrator currently supports plain Tensor operands only";
+
+  auto offset_tuple = As<MakeTuple>(op->args_[2]);
+  INTERNAL_CHECK_SPAN(offset_tuple, op->span_) << "Internal error: tensor.assemble offset must be MakeTuple";
+  const size_t target_rank = target_type->shape_.size();
+  const size_t source_rank = source_type->shape_.size();
+  CHECK_SPAN(offset_tuple->elements_.size() == target_rank, op->span_)
+      << "tensor.assemble in a HOST orchestrator requires offset rank to match target rank";
+  CHECK_SPAN(source_rank <= target_rank, op->span_)
+      << "tensor.assemble in a HOST orchestrator requires source rank not to exceed target rank";
+
+  const std::vector<ExprPtr> source_valid_shape = ir::GetValidShape(source_type);
+  const size_t leading_target_rank = target_rank - source_rank;
+  std::ostringstream target_indices;
+  std::ostringstream source_indices;
+  for (size_t i = 0; i < target_rank; ++i) {
+    if (i > 0) {
+      target_indices << ", ";
+    }
+    const std::string offset_i = codegen.GetExprAsCode(offset_tuple->elements_[i]);
+    const std::string extent_i =
+        i < leading_target_rank ? "1" : codegen.GetExprAsCode(source_valid_shape[i - leading_target_rank]);
+    auto offset_const = As<ConstInt>(offset_tuple->elements_[i]);
+    if (offset_const && offset_const->value_ == 0) {
+      target_indices << "0:" << extent_i;
+    } else {
+      target_indices << offset_i << ":" << offset_i << " + " << extent_i;
+    }
+  }
+  for (size_t i = 0; i < source_rank; ++i) {
+    if (i > 0) {
+      source_indices << ", ";
+    }
+    source_indices << "0:" << codegen.GetExprAsCode(source_valid_shape[i]);
+  }
+
+  std::string source_expr = "tensors[\"" + source_name + "\"]";
+  if (source_rank > 0) {
+    source_expr += "[" + source_indices.str() + "]";
+  }
+  codegen.Emit("tensors[\"" + target_name + "\"][" + target_indices.str() + "] = " + source_expr);
+  if (lhs != target_name) {
+    codegen.Emit("tensors[\"" + lhs + "\"] = tensors[\"" + target_name + "\"]");
+  }
   dist_codegen.MarkDeclared(lhs);
   return "";
 }

@@ -159,12 +159,15 @@ class TestDistributedCodegen:
 
         @pl.program
         class Input:
+            @pl.function(level=pl.Level.POD, role=pl.Role.SubWorker)
+            def worker(x: pl.Tensor[[64], pl.FP32]):
+                pass
+
             @pl.function(level=pl.Level.POD, role=pl.Role.Orchestrator)
             def orch_with_loop(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                y: pl.Tensor[[64], pl.FP32] = x
                 for i in pl.range(0, 4):
-                    y = pl.add(y, x)
-                return y
+                    self.worker(x)
+                return x
 
         program = passes.convert_to_ssa()(Input)
         cg = codegen.DistributedCodegen()
@@ -172,6 +175,8 @@ class TestDistributedCodegen:
 
         assert "for " in code
         assert "in range(" in code
+        assert "submit_sub" in code
+        assert 'sub_ids["worker"]' in code
 
     def test_python_imports(self):
         """Generated code contains required Python imports."""
