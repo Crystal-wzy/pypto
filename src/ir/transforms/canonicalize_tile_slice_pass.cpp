@@ -78,6 +78,29 @@
 /// a dynamic row is safe when its known multiple times the base row stride is
 /// aligned, and a dynamic column is safe when its known multiple times the
 /// element storage width is aligned.
+/// Last, the pass **rejects** the col-major (``Acc`` / L0C) dual of the #2010
+/// contiguity condition when the slice is a matmul *accumulator*.  Here there is
+/// no repair to apply — an ``Acc`` window cannot be copied out and back, because
+/// nothing in the memory graph points into ``Acc`` — so the only correct
+/// response is a diagnostic.  In L0C's NZ layout block ``(r_b, c_b)`` of an
+/// ``[M, N]`` tile sits at ``(c_b * M/16 + r_b) * fractal``, so a window is
+/// contiguous only when it spans the parent's full row extent or occupies a
+/// single 16-column block.  A row slice of a multi-block-column accumulator is
+/// therefore strided, and the MAD cannot express a destination stride: pto-isa's
+/// ``TMATMUL_ACC_IMPL`` forwards the destination as a bare ``.data()`` pointer
+/// and derives ``m`` from the *left operand*, so ``TileRes::Rows`` — the only
+/// carrier of the parent stride — is discarded at the intrinsic boundary.  ptoas
+/// preserves it faithfully up to that point (``getSubviewPhysicalType`` keeps the
+/// parent shape and narrows via ``valid``); the information is lost in the last
+/// call.  Without this guard the kernel silently computes wrong results, with
+/// only the first 16 columns of each row tile correct.
+///
+/// Tracked upstream as hw-native-sys/pto-isa#253.  **This guard is scoped to
+/// that defect, not to a property of the DSL** — a row window of an ``Acc`` tile
+/// is a legitimate thing to write, and the IR expresses it correctly all the way
+/// down.  If pto-isa gains a destination stride (or otherwise passes
+/// ``TileRes::Rows`` into ``mad``), the shape becomes representable and this
+/// rejection must be relaxed or deleted, not kept as a permanent DSL rule.
 ///
 /// After all consumers are rewritten the now-dead ``tile.slice`` is dropped.
 /// Chained slices (a slice of a slice) are peeled, accumulating the offset.
@@ -109,6 +132,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/storage_size.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
@@ -203,15 +227,20 @@ int64_t KnownMultipleModuloAlignment(const ExprPtr& expr,
 /// peeled base/offset.  `known` holds slices collected so far; a slice whose
 /// source is itself a recorded slice is peeled through it (offsets summed), so
 /// `base` is always a non-slice tile.
-std::optional<SliceInfo> ParseCanonicalSlice(const AssignStmtPtr& assign,
-                                             const std::unordered_map<const Var*, SliceInfo>& known,
-                                             const std::unordered_map<const Var*, ExprPtr>& known_consts) {
+std::optional<SliceInfo> ParseSliceWindow(const AssignStmtPtr& assign,
+                                          const std::unordered_map<const Var*, SliceInfo>& known,
+                                          const std::unordered_map<const Var*, ExprPtr>& known_consts,
+                                          bool require_canonical) {
   if (!assign || !assign->var_) return std::nullopt;
   auto call = As<Call>(assign->value_);
   if (!call || !call->op_ || !IsOp(call, "tile.slice")) return std::nullopt;
-  // Only canonical 3-arg slices (input, shape, offset).  A slice carrying
-  // valid_shape / drop_dims is not a plain window and is left untouched.
-  if (call->args_.size() != 3) return std::nullopt;
+  // Rewriting is restricted to canonical 3-arg slices (input, shape, offset): a
+  // slice carrying valid_shape / drop_dims is not a plain window, so the
+  // canonicalization rules below do not apply to it.  The Acc safety check has
+  // no such restriction — it only needs the physical base and offset, and a
+  // non-canonical slice miscompiles exactly the same way — so it parses with
+  // `require_canonical = false`.
+  if (require_canonical ? call->args_.size() != 3 : call->args_.size() < 3) return std::nullopt;
 
   auto src = AsVarLike(call->args_[0]);
   if (!src) return std::nullopt;
@@ -237,6 +266,106 @@ std::optional<SliceInfo> ParseCanonicalSlice(const AssignStmtPtr& assign,
   return SliceInfo{base, off_row, off_col, memory_space, is_mat};
 }
 
+/// Rewrite-eligible slices only — the input to every canonicalization below.
+std::optional<SliceInfo> ParseCanonicalSlice(const AssignStmtPtr& assign,
+                                             const std::unordered_map<const Var*, SliceInfo>& known,
+                                             const std::unordered_map<const Var*, ExprPtr>& known_consts) {
+  return ParseSliceWindow(assign, known, known_consts, /*require_canonical=*/true);
+}
+
+/// Number of columns in one L0C fractal box (1024 B / 4 B per INT32|FP32 = 16x16).
+constexpr int64_t kAccBlockCols = 16;
+
+/// Reject a matmul accumulator that is a *strided* window of a col-major (`Acc`)
+/// tile.  See the file header for the full derivation; the short form is that
+/// the MAD writes its `[m, n]` destination compactly from a bare pointer, so a
+/// window is only representable when it spans the parent's full row extent or
+/// occupies a single 16-column block.
+///
+/// Scoped by the op registry's `set_output_reuses_input` — the declared,
+/// op-level statement of "argument `i` is the in-place destination" — so it
+/// covers `tile.matmul_acc` / `tile.gemv_acc` / `tile.matmul_mx_acc` without
+/// naming them, and any future accumulator op for free.  The `col_major` +
+/// `kAccFractal` gate excludes the Vec-resident in-place ops (`tile.scatter`,
+/// `tile.fillpad_inplace`), whose row-major counterpart of this rule is handled
+/// by the rewrite paths above.
+///
+/// Silent on anything it cannot prove: a symbolic extent, a non-`Acc` layout, or
+/// an accumulator that is not a recorded slice all fall through untouched.  The
+/// guard exists to convert a known-wrong lowering into a diagnostic, not to
+/// second-guess shapes it cannot evaluate.
+///
+/// Provisional: this rejects a shape the IR models correctly, purely because
+/// pto-isa's MAD cannot write it (hw-native-sys/pto-isa#253).  Revisit when that
+/// issue closes — if the intrinsic learns the destination stride, drop the
+/// `view_rows != parent_rows` rejection below and keep only whatever the fixed
+/// hardware still cannot express.
+void CheckAccumulatorSliceContiguous(const AssignStmtPtr& assign,
+                                     const std::unordered_map<const Var*, SliceInfo>& slices) {
+  auto call = As<Call>(assign->value_);
+  if (!call || !call->op_) return;
+  auto& reg = OpRegistry::GetInstance();
+  if (!reg.IsRegistered(call->op_->name_)) return;
+  auto declared = reg.GetEntry(call->op_->name_).GetOutputReusesInputArg();
+  if (!declared.has_value() || *declared >= call->args_.size()) return;
+
+  auto acc = AsVarLike(call->args_[*declared]);
+  if (!acc) return;
+  auto slice = slices.find(acc.get());
+  if (slice == slices.end()) return;
+
+  auto view = As<TileType>(acc->GetType());
+  auto parent = As<TileType>(slice->second.base->GetType());
+  if (!view || !parent || view->shape_.size() != 2 || parent->shape_.size() != 2) return;
+
+  // Only the col-major L0C orientation loses its stride at the MAD boundary.
+  // Accept either statement of it: the memory space (set explicitly in tile
+  // programming) or the block layout (which `tile.slice` inherits from source).
+  const auto parent_view = tile_view_semantics::GetEffectiveTileView(*parent);
+  const bool is_acc = parent->memory_space_.has_value() && *parent->memory_space_ == MemorySpace::Acc;
+  if (!is_acc && parent_view.blayout != TileLayout::col_major) return;
+  if (parent_view.fractal != tile_view_semantics::kAccFractal) return;
+
+  auto view_rows = As<ConstInt>(view->shape_[0]);
+  auto view_cols = As<ConstInt>(view->shape_[1]);
+  auto parent_rows = As<ConstInt>(parent->shape_[0]);
+  if (!view_rows || !view_cols || !parent_rows) return;
+
+  if (view_rows->value_ == parent_rows->value_) return;  // spans the full row extent
+
+  // A narrow window is safe only when it lies *inside* one 16-column block:
+  // there is then no second block column for the MAD's compact write to
+  // mis-stride. Width alone is not enough — a [16, 16] window at column offset
+  // 8 of a [32, 32] accumulator straddles two blocks and corrupts the parent
+  // exactly like a wider one. A dynamic offset cannot be proven and is
+  // rejected rather than assumed.
+  if (view_cols->value_ <= kAccBlockCols) {
+    auto off_col = As<ConstInt>(slice->second.off_col);
+    if (off_col && off_col->value_ >= 0 &&
+        off_col->value_ / kAccBlockCols == (off_col->value_ + view_cols->value_ - 1) / kAccBlockCols) {
+      return;
+    }
+  }
+
+  // The parent's column extent is only needed to describe the tile; keep it out
+  // of the decision so a symbolic N is still rejected rather than dereferenced.
+  auto parent_cols = As<ConstInt>(parent->shape_[1]);
+  const std::string parent_cols_text = parent_cols ? std::to_string(parent_cols->value_) : std::string("?");
+
+  CHECK_SPAN(false, call->span_)
+      << call->op_->name_ << ": the accumulator is a " << view_rows->value_ << "x" << view_cols->value_
+      << " row window of a " << parent_rows->value_ << "x" << parent_cols_text
+      << " Acc (L0C) tile, which is not contiguous in L0C's block layout and cannot be a matmul "
+         "destination — the hardware MAD writes its result compactly and has no destination stride, "
+         "so only the first "
+      << kAccBlockCols << " columns of each row tile would be correct.\n"
+      << "Slice the accumulator along columns instead, so each window spans every row: allocate "
+      << view_rows->value_ << "x" << (parent_rows->value_ / view_rows->value_) * view_cols->value_
+      << " and use tile.slice(acc, [" << view_rows->value_ << ", " << view_cols->value_ << "], [0, i * "
+      << view_cols->value_
+      << "]). That is the same L0C memory, addressed in the order the hardware writes it.";
+}
+
 /// Phase 1 — collect every canonical `tile.slice` definition in the function,
 /// keyed by its result Var.  AssignStmts are visited in program order, so a
 /// chained slice's source is always already recorded.
@@ -244,6 +373,12 @@ class SliceCollector : public IRVisitor {
  public:
   std::unordered_map<const Var*, SliceInfo> slices;
   std::unordered_map<const Var*, ExprPtr> scalar_defs;
+  /// Every `tile.slice` window, canonical or not.  `slices` drives the
+  /// rewrites and is therefore restricted to the canonical 3-arg form; the Acc
+  /// safety check needs the physical base and offset of *any* window, since a
+  /// slice carrying an explicit valid_shape reaches the MAD with exactly the
+  /// same broken stride.
+  std::unordered_map<const Var*, SliceInfo> windows;
 
  protected:
   void VisitStmt_(const AssignStmtPtr& op) override {
@@ -256,9 +391,14 @@ class SliceCollector : public IRVisitor {
         if (it != known_consts_.end()) known_consts_.emplace(op->var_.get(), it->second);
       }
     }
+    if (auto window = ParseSliceWindow(op, windows, known_consts_, /*require_canonical=*/false)) {
+      windows.emplace(op->var_.get(), *window);
+    }
     if (auto info = ParseCanonicalSlice(op, slices, known_consts_)) {
       slices.emplace(op->var_.get(), *info);
+      return;
     }
+    CheckAccumulatorSliceContiguous(op, windows);
   }
 
  private:

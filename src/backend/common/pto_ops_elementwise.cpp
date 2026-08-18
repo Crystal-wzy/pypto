@@ -969,10 +969,27 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   // guarantees that the output shares the MemRef of the accumulator input
   // (via set_output_reuses_input), so we use the result buffer (dst) as the
   // accumulator operand instead of the IR-level input arg.
-  auto make_acc_codegen = [](const std::string& pto_op) {
-    return [pto_op](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
+  //
+  // The optional `init_cond` operand (args_[3]) makes the accumulator's initial
+  // value conditional: where it holds, `dst` is overwritten with `lhs @ rhs`
+  // rather than accumulated into.  The ISA carries this as one bit of the MAD's
+  // Xt register, but the `pto.*` tile ops expose it only as the choice between
+  // the accumulating and the non-accumulating op, so a runtime predicate lowers
+  // to a branch over the two.  No phi is needed: both arms write `dst` in place.
+  // `supports_init_cond` must track the op's own type deduction: `tile.gemv_acc`
+  // still accepts exactly 3 arguments, so accepting a 4th here would only create
+  // an unreachable branch behind a `CHECK` that fires earlier in deduction.
+  auto make_acc_codegen = [](const std::string& pto_op, const std::string& init_pto_op,
+                             bool supports_init_cond) {
+    return [pto_op, init_pto_op, supports_init_cond](const ir::CallPtr& op,
+                                                     codegen::CodegenBase& codegen_base) -> std::string {
       auto& codegen = AsPto(codegen_base);
-      CHECK(op->args_.size() == 3) << pto_op << " requires 3 arguments: acc, lhs, rhs";
+      const size_t max_args = supports_init_cond ? 4 : 3;
+      CHECK(op->args_.size() == 3 || (supports_init_cond && op->args_.size() == 4))
+          << pto_op << " requires 3 arguments (acc, lhs, rhs)"
+          << (supports_init_cond ? " or 4 with init_cond" : "") << ", but got " << op->args_.size();
+      INTERNAL_CHECK(op->args_.size() <= max_args)
+          << "Internal error: " << pto_op << " arity exceeds what this codegen accepts";
 
       std::string dst = codegen.GetCurrentResultTarget();
       std::string lhs = codegen.GetExprAsCode(op->args_[1]);
@@ -980,24 +997,69 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
       std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
       std::string lhs_type = codegen.GetExprTypeAnnotation(op->args_[1]);
       std::string rhs_type = codegen.GetExprTypeAnnotation(op->args_[2]);
+      const std::string acc_phase = GemvAccPhaseAttr(op);
 
-      std::ostringstream acc_inst;
-      acc_inst << pto_op << " ins(" << dst << ", " << lhs << ", " << rhs;
-      std::vector<std::string> ins_type_parts;
-      for (const auto& t : {dst_type, lhs_type, rhs_type}) {
-        if (!t.empty()) ins_type_parts.push_back(t);
-      }
-      if (!ins_type_parts.empty()) {
-        acc_inst << " : ";
-        for (size_t i = 0; i < ins_type_parts.size(); ++i) {
-          if (i > 0) acc_inst << ", ";
-          acc_inst << ins_type_parts[i];
+      // ins() carries the accumulator only on the accumulating form; the
+      // initializing form reads lhs/rhs alone and writes dst from scratch.
+      auto build = [&](bool initializing) {
+        std::vector<std::string> operands = {lhs, rhs};
+        std::vector<std::string> types = {lhs_type, rhs_type};
+        if (!initializing) {
+          operands.insert(operands.begin(), dst);
+          types.insert(types.begin(), dst_type);
         }
+        std::ostringstream inst;
+        inst << (initializing ? init_pto_op : pto_op) << " ins(";
+        for (size_t i = 0; i < operands.size(); ++i) {
+          if (i > 0) inst << ", ";
+          inst << operands[i];
+        }
+        // Type annotations must be all present or all absent: the `: t0, t1, ...`
+        // clause is positional, so emitting a filtered subset would bind the
+        // remaining types to the wrong operands. Mirrors make_mx_acc_codegen.
+        const bool any_type_present =
+            std::any_of(types.begin(), types.end(), [](const std::string& t) { return !t.empty(); });
+        const bool all_types_present =
+            std::all_of(types.begin(), types.end(), [](const std::string& t) { return !t.empty(); });
+        INTERNAL_CHECK(!any_type_present || all_types_present)
+            << "Internal error: " << (initializing ? init_pto_op : pto_op)
+            << " operand type annotations must all be present or all absent, got a partial set";
+        if (all_types_present) {
+          inst << " : ";
+          for (size_t i = 0; i < types.size(); ++i) {
+            if (i > 0) inst << ", ";
+            inst << types[i];
+          }
+        }
+        inst << ") outs(" << dst;
+        if (!dst_type.empty()) inst << " : " << dst_type;
+        inst << ")" << acc_phase;
+        return inst.str();
+      };
+
+      if (op->args_.size() == 3) {
+        codegen.Emit(build(/*initializing=*/false));
+        return "";
       }
-      acc_inst << ") outs(" << dst;
-      if (!dst_type.empty()) acc_inst << " : " << dst_type;
-      acc_inst << ")" << GemvAccPhaseAttr(op);
-      codegen.Emit(acc_inst.str());
+
+      // A literal predicate picks one arm outright; only a runtime one branches.
+      if (auto init_const = As<ir::ConstInt>(op->args_[3])) {
+        codegen.Emit(build(/*initializing=*/init_const->value_ != 0));
+        return "";
+      }
+
+      // Resolve the condition before opening the region so any instruction its
+      // evaluation emits lands outside (and so dominates) both arms.
+      std::string cond = codegen.GetExprAsCode(op->args_[3]);
+      codegen.EmitStructural("scf.if " + cond + " {");
+      codegen.IncreaseIndent();
+      codegen.Emit(build(/*initializing=*/true));
+      codegen.DecreaseIndent();
+      codegen.EmitStructural("} else {");
+      codegen.IncreaseIndent();
+      codegen.Emit(build(/*initializing=*/false));
+      codegen.DecreaseIndent();
+      codegen.EmitStructural("}");
       return "";
     };
   };
@@ -1047,11 +1109,11 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     };
   };
 
-  reg("tile.matmul_acc", make_acc_codegen("pto.tmatmul.acc"));
+  reg("tile.matmul_acc", make_acc_codegen("pto.tmatmul.acc", "pto.tmatmul", /*supports_init_cond=*/true));
   reg("tile.gemv", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeGemvCodegenPTO("pto.tgemv", 2, op, codegen);
   });
-  reg("tile.gemv_acc", make_acc_codegen("pto.tgemv.acc"));
+  reg("tile.gemv_acc", make_acc_codegen("pto.tgemv.acc", "pto.tgemv", /*supports_init_cond=*/false));
   reg("tile.matmul_mx_acc", make_mx_acc_codegen("pto.tmatmul.mx.acc"));
   reg("tile.gemv_bias", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeGemvCodegenPTO("pto.tgemv.bias", 3, op, codegen);
