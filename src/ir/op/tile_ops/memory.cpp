@@ -1394,6 +1394,10 @@ REGISTER_OP("tile.move")
     .set_attr<MemorySpace>("target_memory")
     .set_attr<TileLayout>("blayout")
     .set_attr<TileLayout>("slayout")
+    // PTO TMOV requires distinct source and destination addresses. Keep memory
+    // planners from placing the result on any input buffer; baked-address PTO
+    // codegen also validates this invariant for explicit or hand-built aliases.
+    .not_inplace_safe()
     .set_output_memory_from_kwarg("target_memory", MemorySpace::Vec)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
