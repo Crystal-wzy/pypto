@@ -141,6 +141,18 @@ class ScopeIsolationError(ParserError):
     pass
 
 
+_CHECK_TAIL_MARKER = "Check failed: "
+
+# What a check with no ``<<`` payload leaves behind once its tail is stripped. ``CHECK`` is
+# the *user*-error macro (see .claude/rules/error-checking.md); ``INTERNAL_CHECK`` is the
+# bug-class one, and this helper runs on messages from both. So the wording must not read
+# as "you found a compiler bug" -- it says the check was silent and names the escape hatch.
+_UNSPECIFIED_CHECK_MESSAGE = (
+    "The operation was rejected by a backend check that reported no message "
+    "(re-run with PTO_BACKTRACE=1 to see which check failed)"
+)
+
+
 def concise_error_message(exc: Exception) -> str:
     """Extract a concise user-facing message from an exception.
 
@@ -148,6 +160,12 @@ def concise_error_message(exc: Exception) -> str:
     useful for debugging but noisy in parser error reports. The full details
     remain accessible via PTO_BACKTRACE=1 which shows the Python traceback
     containing the original exception with all C++ information.
+
+    A check that fired without a ``<<`` message leaves nothing behind once its tail
+    is stripped; that reports as :data:`_UNSPECIFIED_CHECK_MESSAGE` rather than as an
+    empty string, because an empty bold ``Error:`` header is strictly worse than the
+    C++ noise it replaced. An exception that was simply raised with an empty message
+    keeps its empty message -- only a stripped check tail earns the fallback.
     """
     msg = str(exc)
     # Strip "C++ Traceback ..." block appended by GetFullMessage()
@@ -158,14 +176,29 @@ def concise_error_message(exc: Exception) -> str:
     pos = msg.find("\n\nNo stack trace available")
     if pos != -1:
         msg = msg[:pos]
-    # Strip "Check failed: <expr> at <file>:<line>" appended by CHECK macro
-    if msg.startswith("Check failed: "):
-        msg = "Internal backend check failed"
+    # Strip the "Check failed: <expr> at <file>:<line>" tail that FatalLogger::~FatalLogger
+    # (core/logging.h:600-606) glues onto every CHECK. It is always the last line; whatever
+    # precedes it is the ``<<`` payload the op wrote for the user. FatalLogger emits the
+    # "\n" unconditionally, so a message-less check puts the rfind hit at 0 -- that
+    # truncation is what empties the message, handled by the fallback below.
+    stripped_check_tail = False
+    if msg.startswith(_CHECK_TAIL_MARKER):
+        msg = ""
+        stripped_check_tail = True
     else:
-        pos = msg.rfind("\nCheck failed: ")
+        pos = msg.rfind("\n" + _CHECK_TAIL_MARKER)
         if pos != -1:
             msg = msg[:pos]
-    return msg.strip()
+            stripped_check_tail = True
+    msg = msg.strip()
+    # Gate on the tail actually having been removed, not on "something was there before":
+    # `GetFullMessage()` always appends a traceback (or the "no stack trace" note), so a
+    # bare `pypto::ValueError("")` under PTO_BACKTRACE=1 also strips to empty -- and calling
+    # that a silent backend check would name a check that never ran, while telling the user
+    # to enable a flag they already have on.
+    if not msg and stripped_check_tail:
+        return _UNSPECIFIED_CHECK_MESSAGE
+    return msg
 
 
 __all__ = [
