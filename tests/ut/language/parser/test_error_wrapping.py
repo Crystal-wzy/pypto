@@ -15,9 +15,11 @@ subclasses with source location information, rather than escaping as raw
 tracebacks.
 """
 
+import pypto
 import pypto.language as pl
 import pytest
 from pypto import ir
+from pypto.language.op import tensor_ops as _dsl_tensor
 from pypto.language.parser.diagnostics import (
     InvalidOperationError,
     ParserError,
@@ -179,6 +181,134 @@ class TestTypeMismatchReassignment:
                 t = pl.create_tensor([16, 16], dtype=pl.FP32)  # noqa: F841
                 t = pl.create_tensor([4, 4], dtype=pl.FP32)  # different shape  # noqa: F841
                 return x
+
+
+class TestBugClassErrorsAreNotWrapped:
+    """Bug-class exceptions must escape the parser with type and traceback intact.
+
+    The parser wraps stray exceptions as user-facing ParserErrors so a bad kernel gets
+    a source-located diagnostic. A failed internal invariant is not a bad kernel - it is
+    a PyPTO bug, and wrapping it hides both the `InternalError` type and the C++ stack
+    trace that diagnoses it. Every broad `except Exception` on the parse path therefore
+    lets `BUG_CLASS_EXCEPTIONS` through first.
+    """
+
+    @staticmethod
+    def _raise_internal(*args, **kwargs):
+        raise pypto.InternalError("Internal error: synthetic pass bug")
+
+    def test_internal_error_from_op_is_not_wrapped(self, monkeypatch):
+        """`_dispatch_op` re-raises rather than producing an InvalidOperationError."""
+        monkeypatch.setattr(_dsl_tensor, "cast", self._raise_internal)
+
+        with pytest.raises(pypto.InternalError, match="synthetic pass bug"):
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.BF16]:
+                result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
+                return result
+
+    def test_assertion_error_from_op_is_not_wrapped(self, monkeypatch):
+        """The other arm of BUG_CLASS_EXCEPTIONS.
+
+        A bare `AssertionError` is bug-class for the same reason `InternalError` is, and
+        pytest's own machinery depends on it propagating - wrapping one would turn a
+        failed assertion anywhere under the parser into a confusing kernel diagnostic.
+        """
+
+        def _raise_assertion(*args, **kwargs):
+            raise AssertionError("synthetic failed assertion")
+
+        monkeypatch.setattr(_dsl_tensor, "cast", _raise_assertion)
+
+        with pytest.raises(AssertionError, match="synthetic failed assertion") as exc_info:
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.BF16]:
+                result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
+                return result
+
+        assert not isinstance(exc_info.value, ParserError)
+
+    def test_internal_error_is_not_a_parser_error(self, monkeypatch):
+        """Guards the specific regression: it must not be catchable as ParserError."""
+        monkeypatch.setattr(_dsl_tensor, "cast", self._raise_internal)
+
+        with pytest.raises(pypto.InternalError) as exc_info:
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.BF16]:
+                result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
+                return result
+
+        assert not isinstance(exc_info.value, ParserError)
+
+    def test_internal_error_survives_program_parsing(self, monkeypatch):
+        """The @pl.program wrapper passes it through too, not just @pl.function."""
+        monkeypatch.setattr(_dsl_tensor, "cast", self._raise_internal)
+
+        with pytest.raises(pypto.InternalError, match="synthetic pass bug"):
+
+            @pl.program
+            class BadProgram:
+                @pl.function
+                def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.BF16]:
+                    result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
+                    return result
+
+    def test_internal_error_from_closure_eval_is_not_wrapped(self, monkeypatch):
+        """`ExprEvaluator.eval_expr` re-raises instead of producing a ParserTypeError.
+
+        A compile-time closure expression can call into PyPTO and trip an internal
+        invariant; wrapping that as "Failed to evaluate expression" erases both the type
+        and the trace.
+        """
+
+        class _Boom:
+            @property
+            def value(self):
+                raise pypto.InternalError("Internal error: synthetic pass bug")
+
+        boom = _Boom()
+
+        with pytest.raises(pypto.InternalError, match="synthetic pass bug"):
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                result: pl.Tensor[[64], pl.FP32] = pl.tensor.adds(x, boom.value)
+                return result
+
+    def test_ordinary_eval_failure_is_still_wrapped(self):
+        """The passthrough must not leak ordinary eval failures past the diagnostics."""
+
+        class _BadValue:
+            @property
+            def value(self):
+                raise ValueError("not a compile-time constant")
+
+        bad = _BadValue()
+
+        with pytest.raises(ParserError):
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                result: pl.Tensor[[64], pl.FP32] = pl.tensor.adds(x, bad.value)
+                return result
+
+    def test_user_errors_are_still_wrapped(self, monkeypatch):
+        """The passthrough must not leak ordinary user errors past the diagnostic layer."""
+
+        def _raise_value(*args, **kwargs):
+            raise ValueError("Invalid rounding mode 99")
+
+        monkeypatch.setattr(_dsl_tensor, "cast", _raise_value)
+
+        with pytest.raises(InvalidOperationError, match="Invalid rounding mode"):
+
+            @pl.function
+            def bad_kernel(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.BF16]:
+                result: pl.Tensor[[64], pl.BF16] = pl.tensor.cast(x, target_type=pl.BF16)
+                return result
 
 
 if __name__ == "__main__":

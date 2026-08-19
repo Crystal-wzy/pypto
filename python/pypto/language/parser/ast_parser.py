@@ -35,6 +35,7 @@ from pypto.pypto_core import arith as _arith
 
 from ._dsl_invoker import invoke_dsl
 from .diagnostics import (
+    BUG_CLASS_EXCEPTIONS,
     InvalidOperationError,
     ParserError,
     ParserSyntaxError,
@@ -8242,6 +8243,9 @@ class ASTParser:
             return self._attach_op_attrs(invoke_dsl(op_func, args, kwargs, span), attrs)
         except ParserError:
             raise
+        except BUG_CLASS_EXCEPTIONS:
+            # Compiler bug, not a bad kernel - surface it with its type and trace intact.
+            raise
         except (TypeError, ValueError) as e:
             # Wrapper may have prefixed its message (``pl.<op>:`` from
             # ``_raise_type_dispatch_error`` or ``pl.<module>.<op>:``) or raised
@@ -8401,6 +8405,9 @@ class ASTParser:
         try:
             return self._attach_op_attrs(op_func(*args, **kwargs, span=span), attrs)
         except ParserError:
+            raise
+        except BUG_CLASS_EXCEPTIONS:
+            # Compiler bug, not a bad kernel - surface it with its type and trace intact.
             raise
         except Exception as e:
             raise InvalidOperationError(
@@ -8716,6 +8723,11 @@ class ASTParser:
             value = self.expr_evaluator.eval_expr(attr)
             if isinstance(value, ir.MemorySpace):
                 return ir.ConstInt(value.value, DataType.INDEX, self.span_tracker.get_span(attr))
+        except BUG_CLASS_EXCEPTIONS:
+            # This eval is speculative, so its failure is normally not worth reporting - but a
+            # failed internal invariant is, and swallowing it here would replace the diagnostic
+            # with the unrelated "standalone attribute access" error raised below.
+            raise
         except Exception:
             pass
         # This might be accessing a DataType enum or similar
