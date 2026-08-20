@@ -230,7 +230,7 @@ class MaterializeValidShapeSymbolsMutator : public IRMutator {
     const auto* plan = LookupPlan(call->op_);
     if (plan == nullptr) return call;
 
-    auto new_args = PrependValidShapeArgs(*plan, call->args_, call->span_);
+    auto new_args = PrependValidShapeArgs(*plan, call->op_->name_, call->args_, call->span_);
     auto attrs = call->attrs_;
     if (call->HasArgDirections()) {
       attrs = WithArgDirectionsAttr(
@@ -249,7 +249,7 @@ class MaterializeValidShapeSymbolsMutator : public IRMutator {
     const auto* plan = LookupPlan(submit->op_);
     if (plan == nullptr) return submit;
 
-    auto new_args = PrependValidShapeArgs(*plan, submit->args_, submit->span_);
+    auto new_args = PrependValidShapeArgs(*plan, submit->op_->name_, submit->args_, submit->span_);
     auto attrs = submit->attrs_;
     if (submit->HasArgDirections()) {
       attrs = WithArgDirectionsAttr(
@@ -273,6 +273,7 @@ class MaterializeValidShapeSymbolsMutator : public IRMutator {
   /// Read each symbol's value out of the matching actual argument's valid_shape,
   /// and place the values at the front to mirror ExtendFunctionSignature.
   [[nodiscard]] std::vector<ExprPtr> PrependValidShapeArgs(const FunctionValidShapePlan& plan,
+                                                           const std::string& callee_name,
                                                            const std::vector<ExprPtr>& old_args,
                                                            const Span& span) const {
     std::vector<ExprPtr> leading;
@@ -280,21 +281,33 @@ class MaterializeValidShapeSymbolsMutator : public IRMutator {
     for (const auto& symbol : plan.symbols) {
       ExprPtr value = nullptr;
       for (const auto& [param_idx, dim_idx] : symbol.slots) {
-        // Submit passes a positional prefix of the callee params, so a slot past
-        // the supplied args has no actual to read.
+        // A *missing* argument is legal DSL, so this stays user-facing.
+        // ``Submit::args_`` need not cover every callee param (see
+        // include/pypto/ir/expr.h), and omitting a trailing ``pl.Out`` is
+        // ordinary source — but a runtime-allocated output does not exist yet
+        // at the call site, so it carries no valid_shape to read the extent
+        // from. That is a real limitation of this lowering, not a compiler
+        // bug, and the user can act on it.
         CHECK_SPAN(param_idx < old_args.size(), span)
-            << "MaterializeValidShapeSymbols: call does not supply argument " << param_idx
-            << ", which declares valid_shape symbol '" << symbol.symbol->name_hint_ << "'";
+            << "MaterializeValidShapeSymbols: kernel '" << callee_name << "' declares valid_shape symbol '"
+            << symbol.symbol->name_hint_ << "' on parameter " << param_idx
+            << ", but this call does not supply that argument, so there is no actual to "
+               "read the extent from. Pass the argument explicitly (a runtime-allocated pl.Out "
+               "parameter has no caller-side valid_shape), or bind the symbol from a physical "
+               "dimension or a Scalar[INDEX] parameter.";
+        // The next two are different in kind: a *wrong-typed* or *wrong-rank*
+        // actual bound to a tensor param is rejected when the call is parsed,
+        // so reaching them means a compiler bug rather than bad user input.
         auto tensor_type = AsTensorTypeLike(old_args[param_idx]->GetType());
-        CHECK_SPAN(tensor_type, span)
-            << "MaterializeValidShapeSymbols: argument " << param_idx << " for valid_shape symbol '"
-            << symbol.symbol->name_hint_ << "' must be a tensor, got "
+        INTERNAL_CHECK_SPAN(tensor_type, span)
+            << "Internal error: MaterializeValidShapeSymbols: argument " << param_idx
+            << " for valid_shape symbol '" << symbol.symbol->name_hint_ << "' must be a tensor, got "
             << old_args[param_idx]->GetType()->TypeName();
         const auto& actual_valid = GetEffectiveTensorValidShape(*tensor_type);
-        CHECK_SPAN(dim_idx < actual_valid.size(), span)
-            << "MaterializeValidShapeSymbols: argument " << param_idx << " has valid_shape rank "
-            << actual_valid.size() << ", too short to supply '" << symbol.symbol->name_hint_
-            << "' at position " << dim_idx;
+        INTERNAL_CHECK_SPAN(dim_idx < actual_valid.size(), span)
+            << "Internal error: MaterializeValidShapeSymbols: argument " << param_idx
+            << " has valid_shape rank " << actual_valid.size() << ", too short to supply '"
+            << symbol.symbol->name_hint_ << "' at position " << dim_idx;
         const ExprPtr& candidate = actual_valid[dim_idx];
         // The same symbol declared in two slots must be given one value; binding
         // it from the first slot alone would silently drop the disagreement.
