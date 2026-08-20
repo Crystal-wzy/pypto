@@ -100,6 +100,7 @@ plugins:
             Home: 首页
             User Manual: 用户手册
             Reference: 参考
+            API Reference: API 参考
             Developer: 开发者
             Runtime: 运行时
             PTO ISA: PTO ISA
@@ -110,10 +111,18 @@ plugins:
             Backend: 后端
             Debug: 调试
             Distributed: 分布式
-  # Renders `pl.*` / `pypto.runtime.*` API pages from source docstrings. No
-  # generated pages are wired into the nav yet -- that lands with the Reference
-  # chapter (see issue #2120); the handler is configured here so the contract
-  # (Google-style docstrings) is fixed from day one.
+  # Both locales render the same API bodies, so every mkdocstrings identifier has
+  # two anchors -- one under `/user/api/`, one under `/zh/user/api/`. Without
+  # `resolve_closest` autorefs cannot pick between them ("Multiple primary URLs
+  # found for ..."), which `--strict` turns into a build failure the moment
+  # anything cross-references the identifier -- the operator catalog does, 142
+  # times per locale. Resolving to the closest anchor is also what a reader wants:
+  # a link on a zh page lands on the zh page.
+  - autorefs:
+      resolve_closest: true
+  # Renders API pages from source docstrings. The `pl.*` namespaces are wired
+  # into the nav under `en/user/api/`; `pypto.runtime.*` is not rendered yet
+  # (see issue #2120).
   - mkdocstrings:
       handlers:
         python:
@@ -217,6 +226,15 @@ nav:
           - en/user/tools/00-debugging.md
           - en/user/tools/01-torch-codegen.md
           - en/user/tools/02-memory-map.md
+      - API Reference:
+          - en/user/api/index.md
+          - en/user/api/language.md
+          - en/user/api/tile.md
+          - en/user/api/tensor.md
+          - en/user/api/system.md
+          - en/user/api/array.md
+          - en/user/api/prefetch.md
+          - en/user/api/optimizations.md
       - Appendix:
           - en/user/appendix/index.md
           - en/user/appendix/00-feature-matrix.md
