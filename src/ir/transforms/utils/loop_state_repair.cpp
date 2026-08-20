@@ -21,6 +21,7 @@
 
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
+#include "pypto/ir/kind_traits.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/utils/dead_code_elimination.h"
@@ -119,37 +120,115 @@ StmtPtr FilterYieldStmt(const StmtPtr& stmt, const std::vector<size_t>& kept_ind
   });
 }
 
-StmtPtr FixDanglingYieldStmt(const StmtPtr& stmt, const std::vector<IterArgPtr>& iter_args,
-                             const std::unordered_set<const Var*>& defined_vars) {
-  return TransformLastStmt(stmt, [&](const StmtPtr& s) -> StmtPtr {
-    auto yield_stmt = std::dynamic_pointer_cast<const YieldStmt>(s);
-    if (!yield_stmt) return s;
+/// Return the trailing `YieldStmt` of `stmts`, or nullptr if absent.
+std::shared_ptr<const YieldStmt> TrailingYield(const std::vector<StmtPtr>& stmts) {
+  if (stmts.empty()) return nullptr;
+  return std::dynamic_pointer_cast<const YieldStmt>(stmts.back());
+}
 
-    std::vector<ExprPtr> new_values;
-    for (size_t i = 0; i < yield_stmt->value_.size(); ++i) {
-      var_collectors::VarDefUseCollector collector;
-      collector.VisitExpr(yield_stmt->value_[i]);
-      bool has_undefined = std::any_of(collector.var_uses.begin(), collector.var_uses.end(),
-                                       [&](const Var* ref) { return !defined_vars.count(ref); });
-      if (has_undefined && i < iter_args.size()) {
-        new_values.push_back(iter_args[i]);
-      } else {
-        new_values.push_back(yield_stmt->value_[i]);
+/// Per-slot fallback for one scope's trailing yield: `carriers[i]` is the
+/// iter_arg that carries yield slot `i`, or null when no carry backs it.
+///
+/// A loop body's own trailing yield is positionally aligned with the loop's
+/// `iter_args_`, so there `carriers == iter_args`. A nested IfStmt's branch
+/// yields are aligned with that IfStmt's `return_vars_` instead — a different
+/// index space — so their fallbacks are derived per IfStmt rather than
+/// inherited positionally.
+using SlotCarriers = std::vector<VarPtr>;
+
+/// Fallbacks for one IfStmt's branch yields, read off the branches themselves.
+///
+/// Slot `i` of either branch yield binds `return_vars_[i]`, so the value the
+/// *other* branch gives that same phi is the incoming value a branch whose own
+/// producer was pruned should fall back to. Only an iter_arg qualifies: it is
+/// bound by the enclosing loop header and therefore in scope in both branches,
+/// whereas a branch-local var is not. Two branches naming different iter_args
+/// at one slot leave it null — that phi merges two distinct carries and no
+/// single one stands for it.
+///
+/// Reading the branches keeps the fallback independent of what the loop's
+/// trailing yield happens to name, so an intervening alias between the IfStmt
+/// and that yield does not hide the carry.
+SlotCarriers BranchCarriers(const std::shared_ptr<const IfStmt>& if_stmt,
+                            const std::vector<StmtPtr>& then_stmts,
+                            const std::optional<std::vector<StmtPtr>>& else_stmts) {
+  const size_t num_slots = if_stmt->return_vars_.size();
+  SlotCarriers slots(num_slots, nullptr);
+  std::vector<bool> conflicting(num_slots, false);
+
+  auto absorb = [&](const std::vector<StmtPtr>& branch_stmts) {
+    const auto yield_stmt = TrailingYield(branch_stmts);
+    if (!yield_stmt) return;
+    for (size_t i = 0; i < num_slots && i < yield_stmt->value_.size(); ++i) {
+      auto iter_arg = As<IterArg>(yield_stmt->value_[i]);
+      if (!iter_arg) continue;
+      if (!slots[i]) {
+        slots[i] = iter_arg;
+      } else if (slots[i].get() != iter_arg.get()) {
+        conflicting[i] = true;
       }
     }
-    return std::make_shared<YieldStmt>(new_values, yield_stmt->span_);
-  });
+  };
+  absorb(then_stmts);
+  if (else_stmts.has_value()) absorb(*else_stmts);
+
+  for (size_t i = 0; i < num_slots; ++i) {
+    if (conflicting[i]) slots[i] = nullptr;
+  }
+  return slots;
+}
+
+/// Replace every value of `yield_stmt` that references an undefined Var with
+/// the iter_arg carrying that slot. Slots with no known carrier are left alone.
+StmtPtr ReplaceDanglingYieldValues(const std::shared_ptr<const YieldStmt>& yield_stmt,
+                                   const SlotCarriers& carriers,
+                                   const std::unordered_set<const Var*>& defined_vars) {
+  std::vector<ExprPtr> new_values;
+  new_values.reserve(yield_stmt->value_.size());
+  for (size_t i = 0; i < yield_stmt->value_.size(); ++i) {
+    var_collectors::VarDefUseCollector collector;
+    collector.VisitExpr(yield_stmt->value_[i]);
+    bool has_undefined = std::any_of(collector.var_uses.begin(), collector.var_uses.end(),
+                                     [&](const Var* ref) { return !defined_vars.count(ref); });
+    if (has_undefined && i < carriers.size() && carriers[i]) {
+      new_values.push_back(carriers[i]);
+    } else {
+      new_values.push_back(yield_stmt->value_[i]);
+    }
+  }
+  return std::make_shared<YieldStmt>(new_values, yield_stmt->span_);
+}
+
+std::vector<StmtPtr> FixDanglingYieldsInScope(const std::vector<StmtPtr>& stmts, const SlotCarriers& carriers,
+                                              const std::unordered_set<const Var*>& defined_vars) {
+  std::vector<StmtPtr> result;
+  result.reserve(stmts.size());
+  for (const auto& stmt : stmts) {
+    if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
+      auto then_stmts = FlattenBody(if_stmt->then_body_);
+      std::optional<std::vector<StmtPtr>> else_stmts;
+      if (if_stmt->else_body_.has_value()) else_stmts = FlattenBody(*if_stmt->else_body_);
+
+      const auto branch_carriers = BranchCarriers(if_stmt, then_stmts, else_stmts);
+      auto new_then = FixDanglingYieldsInScope(then_stmts, branch_carriers, defined_vars);
+      std::optional<std::vector<StmtPtr>> new_else;
+      if (else_stmts.has_value()) {
+        new_else = FixDanglingYieldsInScope(*else_stmts, branch_carriers, defined_vars);
+      }
+      result.push_back(RebuildIfStmt(if_stmt, new_then, new_else));
+    } else if (auto yield_stmt = std::dynamic_pointer_cast<const YieldStmt>(stmt)) {
+      result.push_back(ReplaceDanglingYieldValues(yield_stmt, carriers, defined_vars));
+    } else {
+      result.push_back(stmt);
+    }
+  }
+  return result;
 }
 
 std::vector<StmtPtr> FixDanglingLoopBodyYields(const std::vector<StmtPtr>& stmts,
                                                const std::vector<IterArgPtr>& iter_args,
                                                const std::unordered_set<const Var*>& defined_vars) {
-  std::vector<StmtPtr> result;
-  result.reserve(stmts.size());
-  for (const auto& stmt : stmts) {
-    result.push_back(FixDanglingYieldStmt(stmt, iter_args, defined_vars));
-  }
-  return result;
+  return FixDanglingYieldsInScope(stmts, SlotCarriers(iter_args.begin(), iter_args.end()), defined_vars);
 }
 
 void PullDefinitionChain(const Var* var_ptr, const std::unordered_map<const Var*, StmtPtr>& def_map,
@@ -355,6 +434,10 @@ std::vector<StmtPtr> FixupDanglingYieldValues(const std::vector<StmtPtr>& stmts)
       body_def_collector.VisitStmt(body);
       auto all_defined = defined_so_far;
       all_defined.insert(body_def_collector.var_defs.begin(), body_def_collector.var_defs.end());
+      // iter_args are bound by the loop header, not by a body statement, so the
+      // body walk above never sees them. Without this a yield that just passes a
+      // carry through would be misread as dangling and rewritten.
+      for (const auto& iter_arg : iter_args) all_defined.insert(iter_arg.get());
 
       auto body_stmts = FixupDanglingYieldValues(FlattenBody(body));
       body_stmts = FixDanglingLoopBodyYields(body_stmts, iter_args, all_defined);
@@ -383,12 +466,6 @@ std::vector<StmtPtr> FixupDanglingYieldValues(const std::vector<StmtPtr>& stmts)
 }
 
 namespace {
-
-/// Return the trailing `YieldStmt` of `stmts`, or nullptr if absent.
-std::shared_ptr<const YieldStmt> TrailingYield(const std::vector<StmtPtr>& stmts) {
-  if (stmts.empty()) return nullptr;
-  return std::dynamic_pointer_cast<const YieldStmt>(stmts.back());
-}
 
 /// True when every Var referenced by `expr` is in `defined`.
 bool ExprRefsAllDefined(const ExprPtr& expr, const std::unordered_set<const Var*>& defined) {
