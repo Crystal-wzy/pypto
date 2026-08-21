@@ -440,7 +440,13 @@ std::optional<OrderedLoopOffsets> GetOrderedLoopOffsets(const ExprPtr& expr, con
   auto affine = ParseAffineInLoop(expr, loop->loop_var_.get());
   auto loop_step = GetConstIntValue(loop->step_);
   if (!affine.has_value() || !loop_step.has_value()) return std::nullopt;
-  if (affine->coeff * *loop_step >= 0) {
+  // Only the *sign* of `coeff * step` decides the order, and the operand signs
+  // decide the sign on their own -- so read it off them instead of evaluating a
+  // product that can overflow int64 (`ParseAffineInLoop` can return INT64_MAX,
+  // and a one-trip loop with step 2 still reaches here). Exactly equivalent to
+  // `coeff * step >= 0` for every representable pair, so no path changes.
+  const bool ascending = affine->coeff == 0 || *loop_step == 0 || (affine->coeff > 0) == (*loop_step > 0);
+  if (ascending) {
     return OrderedLoopOffsets{*first_offset, *last_offset};
   }
   return OrderedLoopOffsets{*last_offset, *first_offset};
@@ -711,6 +717,48 @@ struct ExtractedInputAccessSet {
   std::vector<InputWindowUse> uses;
 };
 
+/// Per-statement count of `Var`/`IterArg` references to one parameter, for
+/// every statement in a subtree, computed in a single traversal.
+///
+/// `ExtractInputAccessSet` asks "how many times does this subtree touch
+/// `param`?" at every statement it walks. Answering each question with its own
+/// `CountVarRefsInStmt` scan re-reads the whole remaining subtree once per
+/// nesting level, so a chain of N nested loops costs O(N^2). Precomputing the
+/// answers bottom-up costs one traversal and makes each lookup O(1).
+class ParamRefIndex : public IRVisitor {
+ public:
+  explicit ParamRefIndex(const Var* target) : target_(target) {}
+
+  /// Reference count of `stmt`'s whole subtree; 0 for a statement not indexed.
+  [[nodiscard]] size_t Count(const StmtPtr& stmt) const {
+    auto it = counts_.find(stmt.get());
+    return it == counts_.end() ? 0 : it->second;
+  }
+
+  void VisitStmt(const StmtPtr& stmt) override {
+    if (!stmt) return;
+    const size_t before = hits_;
+    IRVisitor::VisitStmt(stmt);
+    counts_[stmt.get()] = hits_ - before;
+  }
+
+ protected:
+  void VisitExpr_(const VarPtr& op) override {
+    if (op.get() == target_) ++hits_;
+    IRVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const IterArgPtr& op) override {
+    if (op.get() == target_) ++hits_;
+    IRVisitor::VisitExpr_(op);
+  }
+
+ private:
+  const Var* target_;
+  size_t hits_ = 0;
+  std::unordered_map<const Stmt*, size_t> counts_;
+};
+
 ExtractedInputAccessSet ExtractInputAccessSet(const StmtPtr& root, const Var* param,
                                               std::unordered_map<const Var*, ExprPtr> subst = {}) {
   ExtractedInputAccessSet result;
@@ -721,6 +769,11 @@ ExtractedInputAccessSet ExtractInputAccessSet(const StmtPtr& root, const Var* pa
   constexpr int64_t kMaxEnumeratedLoopTripCount = 256;
   constexpr size_t kMaxEnumeratedInputUses = 512;
   arith::Analyzer analyzer;
+
+  // One traversal answers every "does this subtree read `param`?" question
+  // below, including the repeats a trip-enumerated body would otherwise force.
+  ParamRefIndex ref_index(param);
+  ref_index.VisitStmt(root);
 
   auto simplify_with_subst = [&](const ExprPtr& expr) -> ExprPtr {
     return analyzer.Simplify(transform_utils::Substitute(expr, subst));
@@ -735,7 +788,7 @@ ExtractedInputAccessSet ExtractInputAccessSet(const StmtPtr& root, const Var* pa
     }
 
     if (auto assign = As<AssignStmt>(stmt)) {
-      size_t refs = CountVarRefsInStmt(assign, param);
+      size_t refs = ref_index.Count(assign);
       if (refs != 0) {
         auto use = MatchExpandedInputWindowUse(assign, param, refs, subst);
         if (!use.has_value()) {
@@ -762,11 +815,21 @@ ExtractedInputAccessSet ExtractInputAccessSet(const StmtPtr& root, const Var* pa
         return;
       }
 
+      // A body that never mentions `param` records nothing however many trips
+      // it is unrolled for, so enumerating it is pure cost -- and nested loops
+      // multiply that cost by their trip counts. Skip it, exactly as the
+      // unknown-trip-count branch below already does. Any scalar defs the body
+      // would have contributed are loop-local and get restored after the trip
+      // loop anyway, so this cannot change the extracted access set. The
+      // lookup is O(1): `ref_index` answered it during its single pass.
+      const bool body_reads_param = ref_index.Count(loop->body_) != 0;
+
       auto trip_count = GetKnownPositiveTripCount(loop);
       if (!trip_count.has_value() || *trip_count < 0 || *trip_count > kMaxEnumeratedLoopTripCount) {
-        if (CountVarRefsInStmt(loop->body_, param) != 0) result.unsupported_ref = true;
+        if (body_reads_param) result.unsupported_ref = true;
         return;
       }
+      if (!body_reads_param) return;
 
       auto saved_subst = subst;
       for (int64_t trip = 0; trip < *trip_count; ++trip) {
@@ -784,7 +847,7 @@ ExtractedInputAccessSet ExtractInputAccessSet(const StmtPtr& root, const Var* pa
       return;
     }
 
-    size_t refs = CountVarRefsInStmt(stmt, param);
+    size_t refs = ref_index.Count(stmt);
     if (refs != 0) result.unsupported_ref = true;
   };
 
@@ -1403,6 +1466,9 @@ std::optional<CalleeRewriteAnalysis> AnalyzeAggregateWindowLoop(
   }
 
   if (!yield_stmt) return std::nullopt;
+  // Mirror the nested-loop guard above: indexing the yield by iter-arg index is
+  // only safe once the outer yield is known to carry one value per carry.
+  if (yield_stmt->value_.size() != loop->return_vars_.size()) return std::nullopt;
 
   const auto function_use_index = BuildVarUseIndex(func->body_);
   const auto loop_use_index = BuildVarUseIndex(loop);

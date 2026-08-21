@@ -61,7 +61,6 @@ struct WindowRewriteContext {
   }
 
   size_t next_scalar_temp_id = 0;
-  std::unordered_map<std::string, std::unordered_map<size_t, VarPtr>> output_dynamic_extent_dims_by_func;
 };
 
 struct OutputRewriteInfo {
@@ -148,6 +147,8 @@ TypePtr SubstituteTypeExprs(const TypePtr& type, const std::unordered_map<const 
 std::optional<int64_t> CheckedAdd(int64_t lhs, int64_t rhs);
 std::optional<int64_t> CheckedSub(int64_t lhs, int64_t rhs);
 std::optional<int64_t> CheckedMul(int64_t lhs, int64_t rhs);
+/// `|value|`, or nullopt for INT64_MIN, whose magnitude is not representable.
+std::optional<int64_t> CheckedAbs(int64_t value);
 bool AddLinearCoeff(LinearIndexExpr* expr, const Var* var, int64_t coeff);
 std::optional<LinearIndexExpr> ParseLinearIndexExpr(const ExprPtr& expr);
 std::optional<int64_t> ConstantDiffIfSameLinearBase(const ExprPtr& lhs, const ExprPtr& rhs);
