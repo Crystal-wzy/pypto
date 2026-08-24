@@ -3858,7 +3858,7 @@ class TestSyncAllCodegen:
                 out: pl.Tensor[[16, 16], pl.FP32],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 tile: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
-                pl.system.syncall(core_type="aiv_only")
+                pl.system.syncall(core_type=pl.KernelType.AIV)
                 updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(tile, [0, 0], out)
                 return updated
 
@@ -3881,7 +3881,12 @@ class TestSyncAllCodegen:
                 ws: pl.Tensor[[16], pl.INT32],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 tile: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
-                pl.system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=4)
+                pl.system.syncall(
+                    mode=pl.SyncAllMode.SOFT,
+                    core_type=pl.KernelType.AIV,
+                    gm_workspace=ws,
+                    used_cores=4,
+                )
                 updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(tile, [0, 0], out)
                 return updated
 
@@ -3906,7 +3911,12 @@ class TestSyncAllCodegen:
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel_syncall_soft(self, ws: pl.Tensor[[4, 4], pl.INT32]) -> pl.Tensor[[4, 4], pl.INT32]:
-                pl.system.syncall(mode="soft", core_type="mix", gm_workspace=ws, used_cores=0)
+                pl.system.syncall(
+                    mode=pl.SyncAllMode.SOFT,
+                    core_type=pl.KernelType.MIX,
+                    gm_workspace=ws,
+                    used_cores=0,
+                )
                 return ws
 
         mlir = self._generate_mlir(Prog)
@@ -3927,7 +3937,12 @@ class TestSyncAllCodegen:
                 ws: pl.Tensor[[16], pl.INT32],
                 participants: pl.Scalar[pl.INT32],
             ) -> pl.Tensor[[16], pl.INT32]:
-                pl.system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=participants)
+                pl.system.syncall(
+                    mode=pl.SyncAllMode.SOFT,
+                    core_type=pl.KernelType.AIV,
+                    gm_workspace=ws,
+                    used_cores=participants,
+                )
                 return ws
 
         mlir = self._generate_mlir(Prog)
@@ -3943,7 +3958,12 @@ class TestSyncAllCodegen:
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel_syncall_soft(self, ws: pl.Tensor[[15], pl.INT32]) -> pl.Tensor[[15], pl.INT32]:
-                pl.system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=0)
+                pl.system.syncall(
+                    mode=pl.SyncAllMode.SOFT,
+                    core_type=pl.KernelType.AIV,
+                    gm_workspace=ws,
+                    used_cores=0,
+                )
                 return ws
 
         with pytest.raises(ValueError, match="at least 16 INT32 elements"):
