@@ -348,7 +348,7 @@ lane 的——lane `L` 持有 `clamp(V - L*half, 0, half)`——因此哪种模�
 | 行（非切分轴） | `LeftRight` | 两 lane 相同、静态 | TPOP `valid_row` 操作数 | 支持 |
 | 列（切分轴） | `LeftRight` | 逐 lane | 无 | **拒绝** |
 | 列为运行期值 | 任意 | 两 lane 相同、动态 | 无（`treshape` 不带操作数） | **拒绝** |
-| 行为运行期值 | `UpDown` | 逐 lane、动态 | TPOP `valid_row` 操作数、偶数 code | 支持（见下方说明） |
+| 行为运行期值 | `UpDown` | 逐 lane、动态 | 边界算子保留整 box + 第一个消费者的 `valid_shape` | 支持（见下方说明） |
 | 行逐 lane **且**列收窄 | `UpDown` | 两者 | 无（`treshape` 会同时重写两个轴） | **拒绝** |
 
 `ReshapeSplitAxis` 只能对切分轴做 ceil 折半，因为 lane 索引不属于 op 的类型函数。
@@ -365,15 +365,26 @@ store 保护——它的消费者由折半遍历重建，而非本遍历。
   被解引用，偶数 code 依然精确）。box 分区对 ragged 边界并不保证这一点——16 行 box 上
   `V = 13` 会得到 8 与 5——这正是下文均分分区要解决的问题；均分不适用时，
   `ShardSplitCode` 会报错并给出可行的取值。
-- **运行期的切分轴 valid extent 沿用偶数 code。** split code 是编译期属性，而两个 lane
-  需要哪一个看起来取决于它们的**运行期** extent：16 宽的轴上 valid 15 会让两 lane 变成 8 与 7。
-  该路径发偶数 code，这也是设备实测接受的行为——
-  `tests/st/runtime/cross_core/test_cross_core_split_parity.py` 在 a2a3 上对
-  `VC = 1, 7, 8, 9, 15` 逐元素比对 `output[:VR, :VC]` 并通过，且仅把 golden 在 lane 1 的列上
-  扰动即会失败，说明该校验确实覆盖了这段数据。而按 pto-isa 的 pop 源码推理会得出 lane 1 落位
-  错误；究竟哪一种才是契约，已在
-  [pto-isa#263](https://github.com/hw-native-sys/pto-isa/issues/263) 上向属主提问。在有答复之前，
-  编码遵循实测行为。
+- **运行期的切分轴 valid extent 弹出完整 box。** split code 是编译期属性，而两个 lane
+  需要哪一个取决于它们的**运行期** extent：16 行的轴上 valid 12 会让两 lane 变成 8 与 4，
+  valid 16 则是 8 与 8，没有哪个 code 对两者都正确。因此边界算子干脆不携带逐 lane
+  extent——`LocalizeExplicitBoundaryValid` 给它完整 box
+  （`split_axis::WithFullSplitAxisValid`），并把 lane 的 extent 放到第一个消费者上。
+  这与偶数 code 恰好配套：生产者搬运的是完整物理 box，lane 1 的数据段就落在 box 的一半处，
+  偶数 code 正好指向那里，与运行期 extent 无关。已在 a2a3 上对 16 行边界的 1..16 全部
+  extent 验证。[pto-isa 的 pop](https://github.com/hw-native-sys/pto-isa/issues/263)
+  确实按被弹出 tile 自身的 extent 放置 lane 1，与其源码读法一致——此前得出相反结论的实测，
+  其探针两个操作数都是常量，乘积的每一行每一列都相同，落位错误因而无法分辨。
+- **手写 `tile.tpop_from_aic` 上的同类行 extent 仍会落位错误。** `SplitVectorKernel` 的
+  折半会把用户声明的 `valid_shape` 局部化到 pop 自身，而 pto-isa 正是从这里读取数据段偏移。
+  仅加宽 pop 并不能修复该路径：其消费者继承作者的声明，随后从完整来源写入部分目标，实测
+  结果更差。`tests/st/runtime/cross_core/test_cross_core_split_parity.py` 中标记 xfail
+  的参数记录了受影响的取值范围：`UP_DOWN` 下 `half < V < box`。
+- **被收窄的列 extent 在所有路径上一律拒绝。** 它根本没有承载者——槽位按生产者的物理列
+  间距写入，而 pop 依据 tile 自身的 `validCol` 重建读取几何——并且在 `LeftRight` 下它就是
+  切分轴，必须逐 lane 取值。该契约由 `CheckSplitBoundaryCarriesValid`
+  （`src/ir/op/tile_ops/cross_core.cpp`）统一持有：它既在边界算子的类型推导中运行，也由
+  `ShardSplitCode` 调用，因此手写的 `tile.tpush_to_aiv` / `tile.tpop_from_aic` 同样受其约束。
 - **空 lane 的 store 被保护。** ragged extent 覆盖不到的 lane，其 extent 为 `0`，而
   零行 `TSTORE` 超出 pto-isa 契约（`TSTORE_IMPL` 断言 `GetValidRow() > 0`）。store
   被加上运行时 `extent > 0` 判断；`tpop` 与 `tfree` 保持**无条件**——两个 lane 都占用
