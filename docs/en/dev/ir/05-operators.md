@@ -260,11 +260,11 @@ computes from lhs M/K and rhs N.
 
 #### Conditional accumulator initialization (`init_cond`)
 
-`tile.matmul_acc` and `tensor.matmul_acc` take an optional fourth operand,
-`init_cond`: a BOOL scalar that selects, per execution, whether the accumulator
-is *overwritten* with `lhs @ rhs` or accumulated into. It is the split-K
-`k == 0` idiom, and it removes the need either to zero the accumulator or to
-peel the first K step:
+`tile.matmul_acc`, `tile.batch_matmul_acc` and `tensor.matmul_acc` take an
+optional fourth operand, `init_cond`: a BOOL scalar that selects, per execution,
+whether the accumulator is *overwritten* with `lhs @ rhs` or accumulated into.
+It is the split-K `k == 0` idiom, and it removes the need either to zero the
+accumulator or to peel the first K step:
 
 ```python
 acc = pl.tile.create([16, N], pl.INT32, target_memory=pl.Mem.Acc)
@@ -272,6 +272,16 @@ for k0 in pl.pipeline(0, K, K_TILE, stage=2):
     ...
     acc = pl.tile.matmul_acc(acc, a_left, b_right, init_cond=(k0 == 0))
 ```
+
+The predicate's domain is exactly `matmul_acc`'s own: any operand shape that
+accumulates without a predicate accumulates with one. A `tensor.matmul_acc` with
+an operand of rank > 2 converts to `tile.batch_matmul_acc`, which forwards
+`init_cond` verbatim to every 2D `tile.matmul_acc` that `FlattenTileNdTo2D`
+unrolls it into — each of those is the sole writer of its own row band of the
+accumulator, so the predicate applies band by band. (Only `batch_count == 1`
+reaches codegen today; a larger batch is rejected in `FlattenTileNdTo2D` for a
+reason unrelated to the predicate — the per-batch accumulator would be a strided
+L0C row window, which the MAD cannot address.)
 
 The predicate is a positional operand rather than a registry kwarg because it
 may be loop-dependent; kwargs carry only compile-time constants. Registering it
@@ -324,9 +334,13 @@ a predicate, so the pass no longer generates an accumulator phi at all.
 
 One limitation, diagnosed rather than silently dropped:
 
-- **Rank > 2 is rejected.** The batched form expands into several
-  `tile.matmul_acc` calls inside `FlattenTileNdTo2D`, which has no place to
-  thread a per-call predicate. Loop over the batch dimension instead.
+- **`batch_count > 1` is rejected.** Not because of the predicate — this shape
+  fails identically without one. `FlattenTileNdTo2D` gives each batch a
+  `tile.slice` of the accumulator, and a row window of a multi-block-column
+  L0C tile is strided, which the MAD cannot address (pto-isa#253). Rank > 2 is
+  fine as long as the batch dims multiply to 1, which is the grouped-GEMM case
+  (`[1, N, K]` weights). For a genuine batch, loop over the batch dimension
+  instead.
 
 An oversized *predicated* `tile.matmul_acc` is K-tiled like the unpredicated
 one: the caller's predicate is ANDed with the emitted loop's own `ko == 0`, and

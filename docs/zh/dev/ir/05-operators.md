@@ -231,9 +231,10 @@ lhs M/K 与 rhs N 实际计算的较小矩形。
 
 #### 条件式累加器初始化（`init_cond`）
 
-`tile.matmul_acc` 与 `tensor.matmul_acc` 接受一个可选的第四操作数 `init_cond`：
-一个 BOOL 标量，用于逐次执行地选择累加器是被 `lhs @ rhs` **覆写**还是被累加。
-这就是 split-K 的 `k == 0` 惯用法，它同时省去了清零累加器与剥离首个 K 步的需要：
+`tile.matmul_acc`、`tile.batch_matmul_acc` 与 `tensor.matmul_acc` 接受一个可选的
+第四操作数 `init_cond`：一个 BOOL 标量，用于逐次执行地选择累加器是被 `lhs @ rhs`
+**覆写**还是被累加。这就是 split-K 的 `k == 0` 惯用法，它同时省去了清零累加器与
+剥离首个 K 步的需要：
 
 ```python
 acc = pl.tile.create([16, N], pl.INT32, target_memory=pl.Mem.Acc)
@@ -241,6 +242,14 @@ for k0 in pl.pipeline(0, K, K_TILE, stage=2):
     ...
     acc = pl.tile.matmul_acc(acc, a_left, b_right, init_cond=(k0 == 0))
 ```
+
+该谓词的适用范围与 `matmul_acc` 本身完全一致：凡是不带谓词能够累加的操作数形状，
+带谓词同样能够累加。操作数 rank > 2 的 `tensor.matmul_acc` 会转换为
+`tile.batch_matmul_acc`，后者将 `init_cond` 原样转发给 `FlattenTileNdTo2D` 展开出的
+每一个 2D `tile.matmul_acc` —— 其中每一个都是自己那条累加器行带的唯一写者，因此谓词
+按行带逐一生效。（目前只有 `batch_count == 1` 能走到 codegen；更大的 batch 会在
+`FlattenTileNdTo2D` 中被拒绝，原因与谓词无关 —— 逐 batch 的累加器会是一个跨步的 L0C
+行窗口，而 MAD 无法寻址它。）
 
 该谓词是位置操作数而非 registry kwarg，因为它可能依赖循环变量，而 kwarg 只承载
 编译期常量。作为操作数注册也意味着它像其他 SSA 值一样参与 use-def 链。
@@ -285,8 +294,11 @@ block 都会发出双倍 MAD。
 
 一项限制，以显式诊断而非静默丢弃的方式处理：
 
-- **拒绝 rank > 2**。批量形式在 `FlattenTileNdTo2D` 中会展开为多次
-  `tile.matmul_acc` 调用，无处安放逐调用的谓词。请改为在 batch 维上循环。
+- **拒绝 `batch_count > 1`**。这与谓词无关 —— 该形状在不带谓词时同样失败。
+  `FlattenTileNdTo2D` 会为每个 batch 取一份累加器的 `tile.slice`，而多 block
+  列 L0C tile 的行窗口是跨步的，MAD 无法寻址（pto-isa#253）。只要 batch 维之积
+  为 1，rank > 2 就是允许的 —— 这正是 grouped GEMM 的情形（`[1, N, K]` 权重）。
+  若确实需要多个 batch，请改为在 batch 维上循环。
 
 超尺寸的*带谓词* `tile.matmul_acc` 与无谓词形式一样会被做 K 切分：调用方的谓词与
 所生成循环自身的 `ko == 0` 做与运算，而剥离出的尾块保持无谓词的 3 操作数形式
