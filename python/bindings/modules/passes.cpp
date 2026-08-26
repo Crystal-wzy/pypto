@@ -133,7 +133,11 @@ void BindPass(nb::module_& m) {
              "Every atomic-add write into GM (tile.store / tensor.assemble / pld.tensor.put / "
              "pld.tile.put / pld.tensor.remote_store / pld.tile.remote_store) targets a dtype the "
              "backend store pipe can combine; a bf16 destination requires the Ascend910B (A2/A3) "
-             "profile");
+             "profile")
+      .value("AccCompactValid", IRProperty::AccCompactValid,
+             "Every tile.matmul_acc / tile.matmul_mx_acc accumulates into a CompactMode.normal "
+             "buffer when mad's pitch (ceil(lhs validRow/16)*16) differs from the accumulator's "
+             "physical row count, and no tile outside Left/Right/Acc carries a compact mode");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
