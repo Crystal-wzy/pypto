@@ -150,6 +150,25 @@ Ring allreduce currently supports only `ReduceOp.Sum` with `dtype=FP32`.
 with `mode="ring"`. Ring allreduce also supports at most 16 participating
 devices (`world_size <= 16`).
 
+The `builtin.tensor.allreduce_ring` kernel is **push-based**: data movement uses
+`pto::comm::TPUT` (remote write) — the reduce-scatter phase accumulates into the
+right neighbour's slot via `TPUT<AtomicAdd>`, and the allgather phase forwards
+each finalized chunk with a non-atomic `TPUT`, mirroring the in-tree `allgather`
+/ `all_to_all` host builtins.  Ordering is `pipe_barrier(PIPE_ALL)` around each
+transfer plus `dsb(DSB_DDR)` before every `TNOTIFY` (not
+`pto.fence.barrier_all`, which does not drain the MTE DMA pipe).  Cross-rank
+synchronisation uses the O(1) `NeighborBarrier` (notify/wait the two ring
+neighbours only) — safe on NPU because the TPUT write pipeline orders the data
+ahead of the signal, which the old pull model (TLOAD/TSTORE) did not.
+
+The ring kernel is **self-clearing**: after the final barrier its epilogue
+restores every used barrier row to zero (a local `TNOTIFY(-1, AtomicAdd)` on
+each credited cell — the two neighbour cells per round for `NeighborBarrier`,
+all P−1 cells for the `RoundBarrier` fallback), so a single signal buffer can
+be reused across back-to-back calls exactly like the other host builtins
+(#2279).  For `nranks == 2` both neighbours collapse onto one peer, so that
+single credited cell carries two +1s and is restored with two −1s.
+
 All window operands of a HOST collective — data and signal alike — must
 resolve to pairwise distinct `WindowBuffer` allocations. Two `pld.window()`
 views over the same `alloc_window_buffer` are a cross-process data race under
