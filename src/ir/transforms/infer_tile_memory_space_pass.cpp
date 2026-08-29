@@ -100,6 +100,18 @@ class DemandCollector : public IRVisitor {
     IRVisitor::VisitStmt_(op);
   }
 
+  void VisitStmt_(const ForStmtPtr& op) override {
+    RecordCarryEdges(op->iter_args_);
+    IRVisitor::VisitStmt_(op);
+  }
+
+  /// A `pl.while_` carry is the same construct as a `pl.range` carry -- same
+  /// iter_args_ / return_vars_ / body_ shape -- so it needs the same edge.
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    RecordCarryEdges(op->iter_args_);
+    IRVisitor::VisitStmt_(op);
+  }
+
   /// Propagate demand backward through OutputMemoryInheritsInput() ops.
   /// Edges `dst -> src` are captured in program order during the forward visit;
   /// since the inherit-input relation flows strictly backward (dst defined
@@ -118,8 +130,9 @@ class DemandCollector : public IRVisitor {
 
  private:
   std::map<VarPtr, MemorySpace> demands_;
-  // `dst -> src` edges for ops with OutputMemoryInheritsInput(), captured in
-  // program order. Walked in reverse in PropagateThroughInheritInputOps.
+  // `dst -> src` demand edges -- ops with OutputMemoryInheritsInput(), plus each
+  // loop carry's `iter_arg -> init` -- captured in program order. Walked in
+  // reverse in PropagateThroughInheritInputOps.
   std::vector<std::pair<VarPtr, VarPtr>> edges_;
   void RecordDirectDemands(const CallPtr& call) {
     auto& reg = OpRegistry::GetInstance();
@@ -129,7 +142,10 @@ class DemandCollector : public IRVisitor {
     for (size_t i = 0; i < spec->input_constraints.size() && i < call->args_.size(); ++i) {
       const auto& allowed = spec->input_constraints[i];
       if (allowed.empty()) continue;
-      auto var = As<Var>(call->args_[i]);
+      // AsVarLike (not As<Var>) so a loop-carried operand is matched — an
+      // IterArg has its own ObjectKind, so As<Var> returns null for it and the
+      // operand's demand goes unrecorded (kind_traits).
+      auto var = AsVarLike(call->args_[i]);
       if (!var) continue;
       // Preferred space: the first allowed entry. Backends are expected to list
       // the canonical choice first (e.g. tile.store uses {Vec, Acc} — a Vec
@@ -142,13 +158,34 @@ class DemandCollector : public IRVisitor {
     }
   }
 
+  /// Record one `iter_arg -> init` demand edge per loop carry.
+  ///
+  /// A loop carry is a demand edge like any other view chain: Phase 1 seeds each
+  /// iter-arg's space *from its init*, so whatever space the body demands of the
+  /// iter-arg is the space the init producer has to be placed in. This lets a
+  /// demand raised inside the body reach the producer outside the loop -- e.g. a
+  /// `tile.create` accumulator carried into `tile.matmul_acc` is then born in Acc
+  /// instead of defaulting to Vec.
+  ///
+  /// Emplaced before descending into the body so the reverse sweep still sees
+  /// strictly backward edges: the body's edges are appended after these and are
+  /// therefore swept first, by which time each iter-arg's own demand is known.
+  void RecordCarryEdges(const std::vector<IterArgPtr>& iter_args) {
+    for (const auto& iter_arg : iter_args) {
+      if (!iter_arg) continue;
+      if (auto init_var = AsVarLike(iter_arg->initValue_)) {
+        edges_.emplace_back(iter_arg, init_var);
+      }
+    }
+  }
+
   void RecordInheritInputEdge(const VarPtr& dst, const CallPtr& call) {
     if (!dst) return;
     auto& reg = OpRegistry::GetInstance();
     if (!reg.IsRegistered(call->op_->name_)) return;
     if (!reg.GetEntry(call->op_->name_).OutputMemoryInheritsInput()) return;
     for (const auto& arg : call->args_) {
-      auto var = As<Var>(arg);
+      auto var = AsVarLike(arg);
       if (!var) continue;
       if (!As<TileType>(var->GetType()) && !As<TensorType>(var->GetType())) continue;
       edges_.emplace_back(dst, var);
@@ -208,7 +245,7 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
         // Non-tile ops producing TileType: default to Vec
         var_memory_[op->var_] = MemorySpace::Vec;
       }
-    } else if (auto src_var = As<Var>(op->value_)) {
+    } else if (auto src_var = AsVarLike(op->value_)) {
       // Plain SSA alias `y = x`. Inherit x's memory space onto y so later
       // phases (MoveCollector, Phase 3) see a consistent memory_space on the
       // alias. The Python frontend emits these when eliding no-op
@@ -224,22 +261,39 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
   }
 
   void VisitStmt_(const ForStmtPtr& op) override {
-    // Seed each TileType iter-arg's memory space from its init value before
-    // analysing the body, so an inherit-input op in the body inherits the
-    // carried-in space instead of InheritFromInput falling through to a
-    // co-argument. Notably tile.assemble(target, source, offset) is
-    // output_inherits_input on its *target* (arg0); for a full-K Mat-scratch the
-    // target is the Mat scratch iter-arg, which is still unresolved when the body
-    // is analysed — without this seed InheritFromInput skips it and returns the
-    // Acc *source* (arg1), forcing the whole [M, N] scratch chain into Acc and
-    // overflowing L0c. The post-body override below still promotes a
-    // conservatively-Vec init that the body writes as Acc (matmul_acc accumulator).
-    // AsVarLike (not As<Var>) so an inner loop whose init is the outer iter-arg is
-    // also seeded. When the init carrier was never visited by the AssignStmt path
-    // (e.g. an IfStmt return var), it is absent from var_memory_ but still carries a
-    // memory_space_ in its TileType — fall back to that so the seed resolves
-    // regardless of the init's statement shape (mirrors the yield_memory lookup).
-    for (const auto& iter_arg : op->iter_args_) {
+    SeedIterArgsFromInit(op->iter_args_);
+    IRVisitor::VisitStmt_(op);
+    BackPropagateCarries(op->iter_args_, op->return_vars_, op->body_);
+  }
+
+  /// A `pl.while_` carry is the same construct as a `pl.range` carry -- same
+  /// iter_args_ / return_vars_ / body_ shape -- so it needs the same seeding and
+  /// back-propagation. Without them a while-carried tile reaches Phase 2 absent
+  /// from var_memory_, so its constraint check is skipped, no tile.move is
+  /// queued, and the operand keeps whatever space (or none) it arrived with.
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    SeedIterArgsFromInit(op->iter_args_);
+    IRVisitor::VisitStmt_(op);
+    BackPropagateCarries(op->iter_args_, op->return_vars_, op->body_);
+  }
+
+  /// Seed each TileType iter-arg's memory space from its init value before
+  /// analysing the body, so an inherit-input op in the body inherits the
+  /// carried-in space instead of InheritFromInput falling through to a
+  /// co-argument. Notably tile.assemble(target, source, offset) is
+  /// output_inherits_input on its *target* (arg0); for a full-K Mat-scratch the
+  /// target is the Mat scratch iter-arg, which is still unresolved when the body
+  /// is analysed — without this seed InheritFromInput skips it and returns the
+  /// Acc *source* (arg1), forcing the whole [M, N] scratch chain into Acc and
+  /// overflowing L0c. BackPropagateCarries still promotes a conservatively-Vec
+  /// init that the body writes as Acc (matmul_acc accumulator).
+  /// AsVarLike (not As<Var>) so an inner loop whose init is the outer iter-arg is
+  /// also seeded. When the init carrier was never visited by the AssignStmt path
+  /// (e.g. an IfStmt return var), it is absent from var_memory_ but still carries a
+  /// memory_space_ in its TileType — fall back to that so the seed resolves
+  /// regardless of the init's statement shape (mirrors the yield_memory lookup).
+  void SeedIterArgsFromInit(const std::vector<IterArgPtr>& iter_args) {
+    for (const auto& iter_arg : iter_args) {
       if (!As<TileType>(iter_arg->GetType())) continue;
       if (auto init_var = AsVarLike(iter_arg->initValue_)) {
         if (auto it = var_memory_.find(init_var); it != var_memory_.end()) {
@@ -250,16 +304,19 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
         }
       }
     }
+  }
 
-    IRVisitor::VisitStmt_(op);
+  /// Copy each yielded value's space onto the matching return_var, and force it
+  /// back onto the iter-arg and its init carrier. Shared by ForStmt and WhileStmt.
+  void BackPropagateCarries(const std::vector<IterArgPtr>& iter_args, const std::vector<VarPtr>& return_vars,
+                            const StmtPtr& body) {
+    if (return_vars.empty()) return;
 
-    if (op->return_vars_.empty()) return;
-
-    auto yield_stmt = GetLastYieldStmt(op->body_);
+    auto yield_stmt = GetLastYieldStmt(body);
     if (!yield_stmt) return;
 
-    for (size_t i = 0; i < op->return_vars_.size(); ++i) {
-      if (!As<TileType>(op->return_vars_[i]->GetType())) continue;
+    for (size_t i = 0; i < return_vars.size(); ++i) {
+      if (!As<TileType>(return_vars[i]->GetType())) continue;
       if (i >= yield_stmt->value_.size()) continue;
       // AsVarLike (not As<Var>) so a yielded IterArg is matched — the mirror of
       // the init seeding above. A carry held across the loop yields the IterArg
@@ -281,15 +338,15 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
       }
       if (!yield_memory.has_value()) continue;
 
-      var_memory_[op->return_vars_[i]] = *yield_memory;
+      var_memory_[return_vars[i]] = *yield_memory;
 
       // Back-propagation handles the accumulator pattern: a tile.create
       // conservatively defaults to Mem.Vec but the loop body writes a
       // different space (e.g. Acc from matmul_acc). Without this override the
       // final tile.store reads a Vec tile and ExpandMixedKernel misclassifies
       // the kernel as mixed, producing broken AIC/AIV IR.
-      if (i < op->iter_args_.size()) {
-        var_memory_[op->iter_args_[i]] = *yield_memory;
+      if (i < iter_args.size()) {
+        var_memory_[iter_args[i]] = *yield_memory;
         // Any TileType init carrier needs to agree with the promoted iter_arg,
         // whether or not the analyzer has already recorded it — e.g. an IfStmt
         // return_var used as the loop init is never visited by the AssignStmt
@@ -297,7 +354,7 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
         // AsVarLike (not As<Var>) for the same reason the seeding loop above uses
         // it: an inner loop's init is the enclosing loop's IterArg, and the two
         // share a buffer, so the promotion has to reach the outer carrier too.
-        if (auto init_var = AsVarLike(op->iter_args_[i]->initValue_);
+        if (auto init_var = AsVarLike(iter_args[i]->initValue_);
             init_var && As<TileType>(init_var->GetType())) {
           var_memory_[init_var] = *yield_memory;
         }
@@ -526,7 +583,11 @@ class MoveCollector : public IRVisitor {
       const auto& allowed_spaces = (*constraints)[i];
       if (allowed_spaces.empty()) continue;
 
-      auto var = As<Var>(call->args_[i]);
+      // AsVarLike: a loop-carried operand is an IterArg, which As<Var> skips.
+      // Skipping it queues no tile.move, so the op keeps an operand in a space
+      // its input_constraints forbid -- e.g. a Vec tile carried into
+      // tile.matmul's Right slot, which no target can execute.
+      auto var = AsVarLike(call->args_[i]);
       if (!var) continue;
       auto it = var_memory_.find(var);
       if (it == var_memory_.end()) continue;
@@ -710,7 +771,9 @@ class TileMemorySpaceMutator : public IRMutator {
     for (size_t i = 0; i < op->args_.size(); ++i) {
       bool substituted = false;
       if (constraints && i < constraints->size() && !(*constraints)[i].empty()) {
-        if (auto var = As<Var>(op->args_[i])) {
+        // AsVarLike so the substitution keys match the ones Phase 2 recorded and
+        // InsertMovesForConsumer created, IterArg operands included.
+        if (auto var = AsVarLike(op->args_[i])) {
           MoveKey key = {var, (*constraints)[i][0]};
           auto move_it = created_moves_.find(key);
           if (move_it != created_moves_.end()) {
@@ -938,7 +1001,9 @@ class TileMemorySpaceMutator : public IRMutator {
 
     for (size_t i = 0; i < constraints->size() && i < call->args_.size(); ++i) {
       if ((*constraints)[i].empty()) continue;
-      auto var = As<Var>(call->args_[i]);
+      // AsVarLike: must match the key Phase 2 recorded for an IterArg operand,
+      // otherwise the needed move is never emitted.
+      auto var = AsVarLike(call->args_[i]);
       if (!var) continue;
 
       MoveKey key = {var, (*constraints)[i][0]};
@@ -981,7 +1046,9 @@ class TileMemorySpaceMutator : public IRMutator {
                       const Span& span, std::optional<TileLayout> required_blayout = std::nullopt,
                       std::optional<TileLayout> required_slayout = std::nullopt) {
     auto mutated_producer = IRMutator::VisitExpr(original_var);
-    auto mutated_producer_var = As<Var>(mutated_producer);
+    // AsVarLike: an IterArg producer stays an IterArg through the mutator, and
+    // As<Var> would trip the check below on a perfectly valid loop carry.
+    auto mutated_producer_var = AsVarLike(mutated_producer);
     INTERNAL_CHECK_SPAN(mutated_producer_var, span)
         << "Internal error: inferred tile-memory producer is not a Var expression";
 
@@ -1138,7 +1205,10 @@ class TileMemoryInferredVerifier : public IRVisitor {
       const auto& allowed_spaces = (*constraints)[i];
       if (allowed_spaces.empty()) continue;
 
-      auto var = As<Var>(call->args_[i]);
+      // AsVarLike for the same reason the pass itself uses it: verifying a
+      // narrower set of operands than the pass places is how a violated
+      // constraint on a loop-carried operand stayed invisible.
+      auto var = AsVarLike(call->args_[i]);
       if (!var) continue;
       auto tile_type = As<TileType>(var->GetType());
       if (!tile_type || !tile_type->memory_space_.has_value()) continue;
