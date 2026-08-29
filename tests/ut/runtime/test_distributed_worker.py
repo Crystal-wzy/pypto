@@ -47,6 +47,7 @@ from pypto.runtime.bench import (
 from pypto.runtime.distributed_runner import (
     DistributedRunHandle,
     DistributedWorker,
+    ReadOnlyHostTensor,
     _assemble_chip_callables,
     _clear_dfx_dispatch_dirs,
     _collect_l3_swimlane,
@@ -964,6 +965,169 @@ class TestDeviceMemoryApi:
         with pytest.raises(ValueError, match="interior pointer"):
             rt.copy_to(ptr + 32, ctypes.addressof(host), 32)
         rt.free(ptr)
+        rt.close()
+
+    def test_copy_to_with_offset_writes_into_device_region(self, patched_setup):
+        rt = DistributedWorker(_fake_compiled([_param("a", [16, 16])], []))
+        ptr = rt.malloc(128)
+        host = (ctypes.c_ubyte * 16)()
+        for i in range(16):
+            host[i] = i
+        rt.copy_to(ptr, ctypes.addressof(host), 16, dst_offset=32)
+
+        call_args = patched_setup["worker"].copy_to.call_args
+        assert call_args.args[0] is rt._buffer_for_ptr(ptr)
+        assert call_args.args[1] != host
+        assert call_args.kwargs.get("dst_offset") == 32
+        assert call_args.kwargs["nbytes"] == 16
+        assert ctypes.string_at(call_args.args[1].base, 16) == ctypes.string_at(ctypes.addressof(host), 16)
+        patched_setup["worker"].release_buffer.assert_called_once_with(call_args.args[1])
+        rt.free(ptr)
+        rt.close()
+
+    def test_named_host_offsets_reuse_one_runtime_buffer(self, patched_setup):
+        rt = DistributedWorker(_fake_compiled([_param("a", [16, 16])], []))
+        ptr = rt.malloc(128)
+        host = (ctypes.c_ubyte * 64)()
+        host_ptr = ctypes.addressof(host)
+        rt._inherited_host_spans = (((host_ptr, host_ptr + 64), False),)
+
+        rt.copy_to(ptr, host_ptr, 16, dst_offset=4, src_offset=8)
+        first_copy = patched_setup["worker"].copy_to.call_args
+        rt.copy_to(ptr, host_ptr, 16, dst_offset=20, src_offset=24)
+        second_copy = patched_setup["worker"].copy_to.call_args
+        rt.copy_from(host_ptr + 40, ptr, 8)
+        reverse_copy = patched_setup["worker"].copy_from.call_args
+
+        first_host = first_copy.args[1]
+        second_host = second_copy.args[1]
+        reverse_host = reverse_copy.args[0]
+        assert first_host.base == second_host.base == reverse_host.base == host_ptr
+        assert first_host.nbytes == second_host.nbytes == reverse_host.nbytes == 64
+        assert first_host is second_host is reverse_host
+        assert (first_host.owner, first_host.buffer_id) == (second_host.owner, second_host.buffer_id)
+        assert (first_host.owner, first_host.buffer_id) == (reverse_host.owner, reverse_host.buffer_id)
+        assert first_host.access == second_host.access == reverse_host.access == "READWRITE"
+        assert first_copy.kwargs["src_offset"] == 8
+        assert second_copy.kwargs["src_offset"] == 24
+        assert reverse_copy.kwargs["dst_offset"] == 40
+        assert first_copy.kwargs["nbytes"] == second_copy.kwargs["nbytes"] == 16
+        assert reverse_copy.kwargs["nbytes"] == 8
+
+        rt.free(ptr)
+        rt.close()
+
+    def test_copy_to_with_offset_checks_parameters(self, patched_setup):
+        rt = DistributedWorker(_fake_compiled([_param("a", [16, 16])], []))
+        patched_setup["worker"].alloc_child_tensor.return_value = _FakeBuffer(0xDEAD0000, 64)
+        ptr = rt.malloc(64)
+        host = (ctypes.c_ubyte * 32)()
+        bad_offset: Any = "0"
+
+        with pytest.raises(ValueError, match="dst_offset must be a non-negative int"):
+            rt.copy_to(ptr, ctypes.addressof(host), 16, dst_offset=-1)
+        with pytest.raises(ValueError, match="dst_offset must be a non-negative int"):
+            rt.copy_to(ptr, ctypes.addressof(host), 16, dst_offset=bad_offset)
+        with pytest.raises(ValueError, match="src_offset must be a non-negative int"):
+            rt.copy_to(ptr, ctypes.addressof(host), 16, src_offset=-1)
+        with pytest.raises(ValueError, match="src_offset must be a non-negative int"):
+            rt.copy_to(ptr, ctypes.addressof(host), 16, src_offset=bad_offset)
+        with pytest.raises(ValueError, match="must be a positive int"):
+            rt.copy_to(ptr, ctypes.addressof(host), 0, dst_offset=0)
+        with pytest.raises(ValueError, match="must be a positive int"):
+            rt.copy_to(ptr, ctypes.addressof(host), -1, dst_offset=0)
+        with pytest.raises(ValueError, match="exceeds allocation size"):
+            rt.copy_to(ptr, ctypes.addressof(host), 16, dst_offset=60)
+        with pytest.raises(ValueError, match="interior pointer"):
+            rt.copy_to(ptr + 32, ctypes.addressof(host), 16, dst_offset=0)
+
+        rt.free(ptr)
+        rt.close()
+
+    def test_copy_to_with_offset_supports_non_default_worker_id(self, patched_setup):
+        rt = DistributedWorker(_fake_compiled([_param("a", [16, 16])], []))
+        ptr = rt.malloc(64, worker_id=1)
+        host = (ctypes.c_ubyte * 16)()
+        rt.copy_to(ptr, ctypes.addressof(host), 8, dst_offset=8, worker_id=1)
+
+        call_args = patched_setup["worker"].copy_to.call_args
+        assert call_args.args[0] is rt._buffer_for_ptr(ptr, worker_id=1)
+        assert call_args.kwargs["dst_offset"] == 8
+
+        with pytest.raises(ValueError, match="worker_id=0"):
+            rt.copy_to(ptr, ctypes.addressof(host), 8, worker_id=0)
+        rt.free(ptr, worker_id=1)
+        rt.close()
+
+    def test_copy_from_with_offset_reads_a_device_sub_range(self, patched_setup):
+        """A staged D2H reads `src_offset` into `dst_host_ptr + dst_offset`."""
+        rt = DistributedWorker(_fake_compiled([_param("a", [16, 16])], []))
+        patched_setup["worker"].alloc_child_tensor.return_value = _FakeBuffer(0xDEAD0000, 128)
+        ptr = rt.malloc(128)
+        host = (ctypes.c_ubyte * 64)()
+
+        def _fill(dst_buffer, _src, **_kwargs):
+            ctypes.memset(int(dst_buffer.base), 0xAB, int(dst_buffer.nbytes))
+
+        patched_setup["worker"].copy_from.side_effect = _fill
+        rt.copy_from(ctypes.addressof(host), ptr, 16, dst_offset=8, src_offset=32)
+
+        call_args = patched_setup["worker"].copy_from.call_args
+        assert call_args.args[1] is rt._buffer_for_ptr(ptr)
+        assert call_args.kwargs["src_offset"] == 32
+        assert call_args.kwargs["nbytes"] == 16
+        # dst_offset is resolved host-side for a staged copy, so the staging buffer starts at 0
+        # and the payload lands at `dst_offset` in the caller's memory.
+        assert bytes(host[:8]) == b"\x00" * 8
+        assert bytes(host[8:24]) == b"\xab" * 16
+        assert bytes(host[24:]) == b"\x00" * 40
+        patched_setup["worker"].release_buffer.assert_called_once_with(call_args.args[0])
+        rt.free(ptr)
+        rt.close()
+
+    def test_copy_from_with_offset_checks_parameters(self, patched_setup):
+        rt = DistributedWorker(_fake_compiled([_param("a", [16, 16])], []))
+        patched_setup["worker"].alloc_child_tensor.return_value = _FakeBuffer(0xDEAD0000, 64)
+        ptr = rt.malloc(64)
+        host = (ctypes.c_ubyte * 32)()
+        bad_offset: Any = "0"
+
+        with pytest.raises(ValueError, match="dst_offset must be a non-negative int"):
+            rt.copy_from(ctypes.addressof(host), ptr, 16, dst_offset=-1)
+        with pytest.raises(ValueError, match="dst_offset must be a non-negative int"):
+            rt.copy_from(ctypes.addressof(host), ptr, 16, dst_offset=bad_offset)
+        with pytest.raises(ValueError, match="src_offset must be a non-negative int"):
+            rt.copy_from(ctypes.addressof(host), ptr, 16, src_offset=-1)
+        with pytest.raises(ValueError, match="src_offset must be a non-negative int"):
+            rt.copy_from(ctypes.addressof(host), ptr, 16, src_offset=bad_offset)
+        with pytest.raises(ValueError, match="must be a positive int"):
+            rt.copy_from(ctypes.addressof(host), ptr, 0)
+        with pytest.raises(ValueError, match="exceeds allocation size"):
+            rt.copy_from(ctypes.addressof(host), ptr, 16, src_offset=60)
+        with pytest.raises(ValueError, match="interior pointer"):
+            rt.copy_from(ctypes.addressof(host), ptr + 32, 16)
+
+        rt.free(ptr)
+        rt.close()
+
+    def test_copy_from_offsets_reach_a_named_span_without_a_second_buffer(self, patched_setup):
+        """A named D2H applies the host offset within the span's one Buffer."""
+        host = torch.zeros(16, 4, dtype=torch.float32).share_memory_()
+        rt = DistributedWorker(
+            _fake_compiled([_param("a", [4, 4])], []),
+            inherited_host_tensors=[host],
+        )
+        dev = _resident(rt, (4, 4))
+
+        rt.copy_from(host.data_ptr(), dev.data_ptr, 32, dst_offset=64, src_offset=16)
+
+        call_args = patched_setup["worker"].copy_from.call_args
+        named = call_args.args[0]
+        assert (named.base, named.nbytes) == (host.data_ptr(), host.numel() * host.element_size())
+        assert call_args.kwargs["dst_offset"] == 64
+        assert call_args.kwargs["src_offset"] == 16
+        assert call_args.kwargs["nbytes"] == 32
+        patched_setup["worker"].create_buffer.assert_not_called()
         rt.close()
 
     def test_alloc_tensor_forwards_malloc_and_copy(self, patched_setup):
@@ -3346,9 +3510,8 @@ class TestNamedInheritedHostRanges:
         named = patched_setup["worker"].copy_to.call_args.args[1]
         assert isinstance(named, _NamedHostRange)
         assert (named.base, named.nbytes) == (host.data_ptr(), nbytes)
-        # READ, not READWRITE as this asserted before: an upload source is only ever read by the
-        # child, and granting write access to a mapping that may be read-only misdescribes it.
-        assert (named.backend_kind, named.access) == ("FORK_SHM", "READ")
+        # One registered span has one descriptor in both copy directions.
+        assert (named.backend_kind, named.access) == ("FORK_SHM", "READWRITE")
         # The point of naming it: no staging buffer is created at all.
         patched_setup["worker"].create_buffer.assert_not_called()
         rt.close()
@@ -3421,12 +3584,8 @@ class TestNamedInheritedHostRanges:
         assert isinstance(patched_setup["worker"].copy_from.call_args.args[0], _NamedHostRange)
         rt.close()
 
-    def test_a_named_upload_source_is_granted_read_only(self, patched_setup):
-        """An upload source is read by the child and nothing more, so the descriptor says READ.
-
-        Granting READWRITE would tell the ABI a consumer may write memory that, for the
-        read-only file mapping this targets, faults on a write.
-        """
+    def test_a_named_upload_source_uses_the_shared_readwrite_descriptor(self, patched_setup):
+        """An upload reuses the span's direction-independent descriptor."""
         host = torch.zeros(4, 4, dtype=torch.float32)
         rt = DistributedWorker(
             _fake_compiled([_param("a", [4, 4])], []),
@@ -3438,7 +3597,7 @@ class TestNamedInheritedHostRanges:
         rt.copy_to(dev.data_ptr, host.data_ptr(), nbytes)
 
         named = patched_setup["worker"].copy_to.call_args.args[1]
-        assert (named.backend_kind, named.access) == ("FORK_SHM", "READ")
+        assert (named.backend_kind, named.access) == ("FORK_SHM", "READWRITE")
         rt.close()
 
     def test_a_named_read_back_destination_is_granted_readwrite(self, patched_setup):
@@ -3538,15 +3697,8 @@ class TestNamedInheritedHostRanges:
         patched_setup["worker"].create_buffer.assert_not_called()
         rt.close()
 
-    def test_the_same_range_in_both_directions_gets_distinct_identities(self, patched_setup):
-        """One identity may name only one backing, and the two directions differ in access.
-
-        Regression: the identity was keyed on ``(host_ptr, nbytes)`` alone while a source is
-        granted READ and a destination READWRITE, so a copy_to followed by a copy_from on one
-        range reused a single identity under two descriptors — which `ImportRegistry.materialize`
-        rejects for the changed access. Keyed by direction, both are named and reuse stays
-        per-range rather than per-copy.
-        """
+    def test_the_same_span_in_both_directions_reuses_one_buffer(self, patched_setup):
+        """One memory span has one READWRITE descriptor in both copy directions."""
         host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
         rt = DistributedWorker(_fake_compiled([_param("a", [4, 4])], []), inherited_host_tensors=[host])
         dev = self._dev(rt)
@@ -3557,12 +3709,12 @@ class TestNamedInheritedHostRanges:
 
         src = patched_setup["worker"].copy_to.call_args.args[1]
         dst = patched_setup["worker"].copy_from.call_args.args[0]
-        assert (src.access, dst.access) == ("READ", "READWRITE")
-        assert src.buffer_id != dst.buffer_id
+        assert (src.access, dst.access) == ("READWRITE", "READWRITE")
+        assert src is dst
 
-        # Re-copying either direction must still reuse that direction's identity.
+        # Re-copying either direction must still reuse the span's Buffer object.
         rt.copy_to(dev.data_ptr, host.data_ptr(), nbytes)
-        assert patched_setup["worker"].copy_to.call_args.args[1].buffer_id == src.buffer_id
+        assert patched_setup["worker"].copy_to.call_args.args[1] is src
         rt.close()
 
     def test_copy_to_stages_a_partially_overlapping_range(self, patched_setup):
@@ -3608,8 +3760,8 @@ class TestNamedInheritedHostRanges:
         assert not isinstance(patched_setup["worker"].copy_to.call_args.args[1], _NamedHostRange)
         rt.close()
 
-    def test_one_range_keeps_one_identity_across_copies(self, patched_setup):
-        """Re-copying a range must reuse its identity, not mint a new one.
+    def test_one_range_keeps_one_buffer_across_copies(self, patched_setup):
+        """Re-copying a range must reuse its Buffer object, not mint a new one.
 
         Two reasons, both in the consumer: ``ImportRegistry.materialize`` refuses a second
         descriptor for an identity it already handed out, so a fresh id per copy would make the
@@ -3628,69 +3780,132 @@ class TestNamedInheritedHostRanges:
         rt.copy_to(dev.data_ptr, host.data_ptr(), nbytes)
         second = patched_setup["worker"].copy_to.call_args.args[1]
 
-        assert (first.owner, first.buffer_id) == (second.owner, second.buffer_id)
+        assert first is second
         rt.close()
 
-    def test_distinct_sub_ranges_get_distinct_identities(self, patched_setup):
-        """Identity is per range, so a sharded upload's halves must not collide on one name."""
+    @pytest.mark.parametrize(
+        "views",
+        [("overlapping", slice(0, 3), slice(1, 4)), ("disjoint", slice(0, 2), slice(2, 4))],
+    )
+    def test_views_of_one_storage_reuse_one_buffer(self, patched_setup, views):
+        """A listed view names its whole storage, so any set of views yields one Buffer.
+
+        The disjoint case is the one a range-overlap heuristic gets wrong: ``host[:2]`` and
+        ``host[2:]`` do not intersect, yet they are one allocation and must not be named twice.
+        """
+        _label, first_view, second_view = views
         host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
-        rt = DistributedWorker(_fake_compiled([_param("a", [4, 4])], []), inherited_host_tensors=[host])
+        rt = DistributedWorker(
+            _fake_compiled([_param("a", [4, 4])], []),
+            inherited_host_tensors=[host[first_view], host[second_view]],
+        )
         dev = self._dev(rt)
-        half = host.numel() * host.element_size() // 2
+        nbytes = host.numel() * host.element_size()
+        half = nbytes // 2
 
         rt.copy_to(dev.data_ptr, host.data_ptr(), half)
-        first = patched_setup["worker"].copy_to.call_args.args[1]
+        first_call = patched_setup["worker"].copy_to.call_args
         rt.copy_to(dev.data_ptr, host.data_ptr() + half, half)
-        second = patched_setup["worker"].copy_to.call_args.args[1]
+        second_call = patched_setup["worker"].copy_to.call_args
 
-        assert first.owner == second.owner
-        assert first.buffer_id != second.buffer_id
+        first = first_call.args[1]
+        second = second_call.args[1]
+        assert (first.base, first.nbytes) == (host.data_ptr(), nbytes)
+        assert first is second
+        assert first_call.kwargs["src_offset"] == 0
+        assert second_call.kwargs["src_offset"] == half
         rt.close()
 
-    def test_concurrent_copies_of_distinct_ranges_never_share_an_identity(self, patched_setup):
-        """The configuration `alloc_stacked_tensor` actually creates: one thread per chip.
+    def test_a_read_only_listing_is_named_read_and_refuses_a_read_back(self, patched_setup):
+        """A ReadOnlyHostTensor span uploads in place but is refused as a D2H destination.
 
-        Identity minting is not atomic on its own — `+=` is load/add/store and the first-time
-        owner mint is check-then-act — and two ranges landing on one identity is a hard failure
-        in the consumer, not a silent one. A single-threaded test cannot observe that, so this
-        drives the path concurrently and asserts the mapping is still one-to-one.
+        One Buffer carries one access mode, so the marker is the only way to say a shared
+        backing is not writable; declaring it READWRITE would grant the child a write right
+        over memory that faults on the store.
         """
+        host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+        rt = DistributedWorker(
+            _fake_compiled([_param("a", [4, 4])], []),
+            inherited_host_tensors=[ReadOnlyHostTensor(host)],
+        )
+        dev = self._dev(rt)
+        nbytes = host.numel() * host.element_size()
+
+        rt.copy_to(dev.data_ptr, host.data_ptr(), nbytes)
+        named = patched_setup["worker"].copy_to.call_args.args[1]
+        assert (named.backend_kind, named.access) == ("FORK_SHM", "READ")
+        patched_setup["worker"].create_buffer.assert_not_called()
+
+        with pytest.raises(ValueError, match="ReadOnlyHostTensor"):
+            rt.copy_from(host.data_ptr(), dev.data_ptr, nbytes)
+        rt.close()
+
+    def test_one_allocation_listed_both_ways_is_refused(self, patched_setup):
+        """One allocation has one access mode, so a contradictory listing cannot be resolved."""
+        host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+        with pytest.raises(ValueError, match="one allocation has one access mode"):
+            DistributedWorker(
+                _fake_compiled([_param("a", [4, 4])], []),
+                inherited_host_tensors=[host, ReadOnlyHostTensor(host[1:])],
+            )
+
+    def test_a_read_only_marking_leaves_other_allocations_writable(self, patched_setup):
+        """The marker is per allocation, not a mode for the whole list."""
+        weights = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+        cache = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+        rt = DistributedWorker(
+            _fake_compiled([_param("a", [4, 4])], []),
+            inherited_host_tensors=[ReadOnlyHostTensor(weights), cache],
+        )
+        dev = self._dev(rt)
+        nbytes = cache.numel() * cache.element_size()
+
+        rt.copy_from(cache.data_ptr(), dev.data_ptr, nbytes)
+        named = patched_setup["worker"].copy_from.call_args.args[0]
+        assert (named.base, named.access) == (cache.data_ptr(), "READWRITE")
+
+        with pytest.raises(ValueError, match="ReadOnlyHostTensor"):
+            rt.copy_from(weights.data_ptr(), dev.data_ptr, nbytes)
+        rt.close()
+
+    def test_concurrent_sub_ranges_share_one_identity_and_keep_their_offsets(self, patched_setup):
+        """Concurrent shard resolution reuses one span identity without losing offsets."""
         host = torch.zeros(64, 4, dtype=torch.float32).share_memory_()
         rt = DistributedWorker(_fake_compiled([_param("a", [4, 4])], []), inherited_host_tensors=[host])
         row = 4 * host.element_size()
         rows = 64
-        seen: list[tuple[int, tuple[Any, int]]] = []
+        seen: list[tuple[int, int]] = []
         lock = threading.Lock()
 
         def _copy(index: int) -> None:
             offset = host.data_ptr() + index * row
             named = rt._named_host_buffer(offset, row)
+            assert named is not None
+            buffer, relative_offset, _read_only = named
             with lock:
-                seen.append((offset, (named.owner, named.buffer_id)))
+                seen.append((relative_offset, id(buffer)))
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(_copy, range(rows)))
 
-        identities = [identity for _, identity in seen]
+        buffer_ids = [buffer_id for _, buffer_id in seen]
         assert len(seen) == rows
-        # One identity per range, and no range sharing another's: both directions matter, since
-        # a duplicate id makes the child refuse the import and a missing one breaks reuse.
-        assert len(set(identities)) == rows
-        assert len({offset for offset, _ in seen}) == rows
+        assert len(set(buffer_ids)) == 1
+        assert {offset for offset, _ in seen} == {index * row for index in range(rows)}
         rt.close()
 
-    def test_identity_cache_is_dropped_with_the_ranges_it_names(self, patched_setup):
+    def test_buffer_cache_is_dropped_with_the_ranges_it_names(self, patched_setup):
         """After the parent releases its references, nothing may keep naming those ranges."""
         host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
         rt = DistributedWorker(_fake_compiled([_param("a", [4, 4])], []), inherited_host_tensors=[host])
         dev = self._dev(rt)
         nbytes = host.numel() * host.element_size()
         rt.copy_to(dev.data_ptr, host.data_ptr(), nbytes)
-        assert rt._named_identities
+        assert rt._named_host_buffers
 
         rt.release_inherited_host_tensor_refs()
 
-        assert not rt._named_identities
+        assert not rt._named_host_buffers
         rt.close()
 
 
