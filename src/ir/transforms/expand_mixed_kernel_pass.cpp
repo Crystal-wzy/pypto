@@ -153,8 +153,12 @@ class DeferredWaiterCallSiteValidator : public IRVisitor {
 // These ops are folded into ExpandMixedKernel's cross-core boundary machinery:
 // aiv_shard (cube -> vector, full -> half) becomes a CUBE_TO_VECTOR boundary,
 // aic_gather (vector -> cube, half -> full) a VECTOR_TO_CUBE boundary. The
-// direction is authoritative by op name — both ops keep the input's memory
-// space (set_output_memory_inherit_input), so it cannot be derived from memory.
+// direction is authoritative by op name: each op's declared memory names only
+// its CONSUMING lane (set_output_memory — Vec for the shard, Mat for the
+// gather), and the operand's space is deliberately left undeclared, so the
+// direction cannot be read off a single type. The operand must still be
+// PRODUCED on the pushing lane for the fold to be well-formed —
+// CheckOpDrivenBoundaryOperands enforces that below.
 
 const std::string* GetSplitReshapeOpName(const CallPtr& call) {
   if (!call) return nullptr;
@@ -400,6 +404,157 @@ void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
       }
     } else if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
       CollectCVBoundaryMoves(FlattenBody(while_stmt->body_), boundary_moves, tpop_defs);
+    }
+  }
+}
+
+/// The lane a boundary op's RESULT is bound on: its CONSUMING lane, which is
+/// where `BuildCoreBody` emits the tpop. The producing lane only ever sees a
+/// tpush, and a tpush binds nothing — so a boundary result exists on exactly
+/// one lane, not both.
+std::optional<CoreAffinity> BoundaryResultLane(const CallPtr& call) {
+  if (IsOp(call, "tile.aiv_shard")) return CoreAffinity::VECTOR;
+  if (IsOp(call, "tile.aic_gather")) return CoreAffinity::CUBE;
+  // A C/V-crossing tile.move lands in its target memory, on that memory's lane.
+  switch (ClassifyMoveDirection(call)) {
+    case CVDirection::CUBE_TO_VECTOR:
+      return CoreAffinity::VECTOR;
+    case CVDirection::VECTOR_TO_CUBE:
+      return CoreAffinity::CUBE;
+    case CVDirection::NONE:
+      break;
+  }
+  return std::nullopt;
+}
+
+/// The single lane `operand` is bound on, or nullopt when every lane holds a
+/// definition (so no push can dangle) or the lane cannot be resolved.
+/// `producer_call` receives the defining call when there is one, for the
+/// diagnostic.
+std::optional<CoreAffinity> OperandDefiningLane(
+    const ExprPtr& operand, const std::unordered_map<const Var*, CoreAffinity>& var_affinity,
+    const std::unordered_map<const Var*, StmtPtr>& def_map, CallPtr* producer_call) {
+  // An operand written inline rather than bound to a name — `aiv_shard(full(...))`
+  // — has no defining statement to filter out of a lane, so nothing dangles; it is
+  // instead EMITTED inside the tpush, asking the pushing lane to run the op itself
+  // (a UB write on a core with no UB). Same defect, different shape, so classify
+  // the call directly. Only a definite single-lane answer is actionable: MIXED
+  // (a nested crossing) and SHARED have no one producing lane here.
+  if (auto call = transform_utils::AsCallOrSubmitView(operand)) {
+    *producer_call = call;
+    const CoreAffinity affinity = ClassifyCallAffinity(call);
+    if (affinity == CoreAffinity::CUBE || affinity == CoreAffinity::VECTOR) return affinity;
+    return std::nullopt;
+  }
+
+  auto var = AsVarLike(operand);
+  if (!var) return std::nullopt;
+  // No entry means no defining AssignStmt in this body — a parameter, a free
+  // variable, or a loop-carried IterArg the ForStmt binds. None of those is
+  // filtered out of a lane, so the push has a definition either way.
+  auto aff_it = var_affinity.find(var.get());
+  if (aff_it == var_affinity.end()) return std::nullopt;
+  if (auto def_it = def_map.find(var.get()); def_it != def_map.end()) {
+    if (auto assign = As<AssignStmt>(def_it->second)) {
+      *producer_call = transform_utils::AsCallOrSubmitView(assign->value_);
+    }
+  }
+  switch (aff_it->second) {
+    case CoreAffinity::CUBE:
+    case CoreAffinity::VECTOR:
+      return aff_it->second;
+    case CoreAffinity::MIXED:
+      // The producer IS a crossing, so it binds a result on its consuming lane
+      // only — chaining another boundary onto it in the SAME direction leaves
+      // the second push without a definition. The inverse chain (shard then
+      // gather) is fine and resolves to the lane that does hold it.
+      return *producer_call ? BoundaryResultLane(*producer_call) : std::nullopt;
+    case CoreAffinity::SHARED:
+      return std::nullopt;  // duplicated onto both lanes
+  }
+  return std::nullopt;
+}
+
+/// Reject an op-driven boundary whose operand is bound on the lane that
+/// consumes it, instead of the lane that pushes it.
+///
+/// `SplitReshapeDirection` names the pushing lane from the op name alone, while
+/// the statement partition keeps every producer on the lane its own affinity
+/// names. The two agree for a genuine crossing and disagree exactly when the
+/// operand is bound on the far side: `BuildCoreBody` then emits the tpush on a
+/// lane whose body never defines the value (the producer is filtered out by the
+/// `affinity == skip_affinity` arm), and the dangling reference reaches PTO
+/// codegen as `no MLIR mapping for MemRef base` — pointing at an orphan
+/// `Mem.Vec` allocation in a cube kernel, nine passes from the source line that
+/// caused it.
+///
+/// Rejected rather than lowered: `pl.aiv_shard` MEANS "cross the AIC/AIV
+/// boundary", so a value the consuming lane already holds has no crossing to
+/// name. The AivSplitValid verifier's boundary memory contract (check (d))
+/// refuses the same authoring error one level up, with the `pl.split_aiv`
+/// region still in scope; this is the pass establishing that invariant itself,
+/// so a build with verification disabled fails here with the user's span rather
+/// than in codegen.
+///
+/// Walks in program order and reports the first violation, so a body with
+/// several mis-routed boundaries names the same op on every run — and the one
+/// the author should fix first. Iterating `boundary_moves` instead would visit
+/// them in statement-POINTER order; ordering by span does not repair that,
+/// because hand-built IR shares one `Span::unknown()` across every statement.
+void CheckOpDrivenBoundaryOperands(const std::vector<StmtPtr>& stmts,
+                                   const std::map<const Stmt*, CVBoundaryMove>& boundary_moves,
+                                   const std::unordered_map<const Var*, CoreAffinity>& var_affinity,
+                                   const std::unordered_map<const Var*, StmtPtr>& def_map) {
+  for (const auto& stmt : stmts) {
+    if (auto bm_it = boundary_moves.find(stmt.get()); bm_it != boundary_moves.end()) {
+      const auto& bm = bm_it->second;
+      if (bm.op_driven) {
+        CallPtr producer_call;
+        auto lane = OperandDefiningLane(bm.source_tile, var_affinity, def_map, &producer_call);
+        const bool cube_to_vector = (bm.direction == CVDirection::CUBE_TO_VECTOR);
+        const CoreAffinity pushing = cube_to_vector ? CoreAffinity::CUBE : CoreAffinity::VECTOR;
+        if (lane.has_value() && *lane != pushing) {
+          auto source_var = AsVarLike(bm.source_tile);
+          const std::string operand_name = source_var ? "'" + source_var->name_hint_ + "'" : "(inline)";
+          std::string producer_op;
+          if (auto op = As<Op>(producer_call ? producer_call->op_ : nullptr)) {
+            producer_op = " by '" + op->name_ + "'";
+          }
+          const bool chained_boundary = producer_call && BoundaryResultLane(producer_call).has_value();
+          const char* op_name = cube_to_vector ? "pl.aiv_shard" : "pl.aic_gather";
+          const char* producer_lane = (*lane == CoreAffinity::CUBE) ? "CUBE" : "VECTOR";
+          const char* crossing = cube_to_vector ? "CUBE -> VECTOR" : "VECTOR -> CUBE";
+          const char* pushing_lane = cube_to_vector ? "CUBE" : "VECTOR";
+          const char* hint =
+              chained_boundary ? " Its producer is itself a cross-core boundary, which binds a result on its"
+                                 " consuming lane only — the value cannot cross a second time in the same"
+                                 " direction, because the first crossing already delivered it there."
+              : cube_to_vector
+                  ? " A vector-produced value (pl.full / pl.load) already lives on the AIV lane and"
+                    " has no boundary to cross: drop the pl.aiv_shard and use the value directly,"
+                    " authoring it at the per-lane extent inside the region — or lane-localize the"
+                    " load with the region's aiv_id."
+                  : " Gather the value only after it has been computed by vector ops on the AIV lane.";
+          CHECK_SPAN(false, stmt->span_)
+              << "'" << op_name << "' operand " << operand_name << " is produced on the " << producer_lane
+              << " lane" << producer_op << ", but '" << op_name << "' is the " << crossing
+              << " crossing and pushes from the " << pushing_lane << " lane, which never defines it." << hint;
+        }
+      }
+    }
+
+    if (auto for_stmt = As<ForStmt>(stmt)) {
+      CheckOpDrivenBoundaryOperands(FlattenBody(for_stmt->body_), boundary_moves, var_affinity, def_map);
+    } else if (auto if_stmt = As<IfStmt>(stmt)) {
+      CheckOpDrivenBoundaryOperands(FlattenBody(if_stmt->then_body_), boundary_moves, var_affinity, def_map);
+      if (if_stmt->else_body_.has_value()) {
+        CheckOpDrivenBoundaryOperands(FlattenBody(*if_stmt->else_body_), boundary_moves, var_affinity,
+                                      def_map);
+      }
+    } else if (auto while_stmt = As<WhileStmt>(stmt)) {
+      CheckOpDrivenBoundaryOperands(FlattenBody(while_stmt->body_), boundary_moves, var_affinity, def_map);
+    } else if (auto seq = As<SeqStmts>(stmt)) {
+      CheckOpDrivenBoundaryOperands(seq->stmts_, boundary_moves, var_affinity, def_map);
     }
   }
 }
@@ -1319,6 +1474,12 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // Build definition map from original body for init value fixup (#533)
   std::unordered_map<const Var*, StmtPtr> original_def_map;
   BuildDefMap(stmts, original_def_map);
+
+  // The op-name-derived push lane must agree with where the operand is actually
+  // produced, or the pushing lane's body would reference a value it never
+  // defines. Checked before either body is built, so the failure names the
+  // user's boundary op instead of surfacing in codegen.
+  CheckOpDrivenBoundaryOperands(stmts, boundary_moves, var_affinity, original_def_map);
 
   // Boundary-generated tpops never reuse the source-tpop Var (CollectCVBoundaryMoves
   // skips moves whose source comes from a tpop), so no original-tpop statements need
