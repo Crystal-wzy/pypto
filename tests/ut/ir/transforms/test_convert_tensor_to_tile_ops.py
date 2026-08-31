@@ -1626,6 +1626,188 @@ class TestConvertTensorToTileOps:
         )
         _assert_convert_equal(before, expected)
 
+    @pytest.mark.parametrize(
+        ("name", "rows", "boxed_rows"),
+        [
+            ("single_row", 1, 16),
+            ("just_over_one_box", 17, 32),
+            ("mid_box", 100, 112),
+        ],
+    )
+    def test_matmul_lhs_rows_are_boxed_to_the_cube_fractal(self, name, rows, boxed_rows):
+        """An unaligned matmul M loads a whole number of NZ fractal boxes.
+
+        PTO-ISA separates the two extents of a cube operand: ``pto.mad`` derives
+        ``%m`` from the operand's *valid* rows (``%m == 1`` is a documented case),
+        while the *physical* allocation must be whole 16-row boxes -- ptoas rejects
+        anything else with ``'pto.alloc_tile' op expects result boxed tile rows to
+        be a multiple of innerRows (16)``. So the bridge load allocates the boxed
+        row count and declares the tensor's true extent as ``valid_shape``; the
+        DMA still moves only the valid rows. The right operand's rows are ``K``,
+        whose granularity is dtype-dependent, and are left alone.
+        """
+        lhs_shape = [rows, 128]
+        rhs_shape = [128, 64]
+        out_shape = [rows, 64]
+        dtype = DataType.FP16
+        in_specs: list[InSpec] = [("lhs", lhs_shape, dtype), ("rhs", rhs_shape, dtype)]
+
+        def before_body(ib, ins):
+            return ib.let("y", tensor_ops.matmul(ins[0], ins[1]))
+
+        def expected_body(ib, params):
+            lhs_p, rhs_p = params
+            lhs_mat = ib.let(
+                "lhs_mat",
+                tile_ops.load(lhs_p, [0, 0], [boxed_rows, 128], lhs_shape, target_memory=MemorySpace.Mat),
+            )
+            rhs_mat = ib.let(
+                "rhs_mat",
+                tile_ops.load(rhs_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat),
+            )
+            return ib.let("y_tile", tile_ops.matmul(lhs_mat, rhs_mat))
+
+        before = _make_before(in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=before_body)
+        expected = _make_expected(
+            in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=expected_body, preload=False
+        )
+        _assert_convert_equal(before, expected)
+
+    def test_sliced_matmul_lhs_is_row_boxed_by_the_consumer_driven_load(self):
+        """A sliced left operand is boxed too, not just a bare parameter.
+
+        A ``tensor.slice`` feeding a matmul answers the Mat demand at the slice
+        itself (``HandleConsumerDrivenLoad``) rather than through
+        ``BridgeInputSpaces``, so the box rule has to ride on ``ConsumerSpaceReq``
+        as well. Without that the sliced operand keeps its unaligned physical row
+        count all the way to ptoas. ``valid_shape`` still names the slice window,
+        so only the allocation grows.
+        """
+        param_shape = [32, 128]
+        slice_shape: list[int | ir.Expr] = [17, 128]
+        rhs_shape = [128, 64]
+        out_shape = [17, 64]
+        dtype = DataType.FP16
+        in_specs: list[InSpec] = [("a", param_shape, dtype), ("b", rhs_shape, dtype)]
+
+        def before_body(ib, ins):
+            sliced = ib.let("a_slice", tensor_ops.slice(ins[0], slice_shape, [0, 0]))
+            return ib.let("y", tensor_ops.matmul(sliced, ins[1]))
+
+        def expected_body(ib, params):
+            a_p, b_p = params
+            lhs_mat = ib.let(
+                "a_slice_tile",
+                tile_ops.load(a_p, [0, 0], [32, 128], slice_shape, target_memory=MemorySpace.Mat),
+            )
+            rhs_mat = ib.let(
+                "rhs_mat",
+                tile_ops.load(b_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat),
+            )
+            return ib.let("y_tile", tile_ops.matmul(lhs_mat, rhs_mat))
+
+        before = _make_before(in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=before_body)
+        expected = _make_expected(
+            in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=expected_body, preload=False
+        )
+        _assert_convert_equal(before, expected)
+
+    def test_matmul_lhs_reached_through_set_validshape_is_row_boxed(self):
+        """A parameter that reaches the matmul through an inherit-input wrapper.
+
+        ``tensor.set_validshape`` propagates the Mat demand back to the parameter,
+        whose load the pass emits in its Phase-1 entry loop -- neither
+        ``BridgeInputSpaces`` nor ``HandleConsumerDrivenLoad``. That third site
+        needs the same boxing, or a 17-row operand reaches ptoas with 17 physical
+        rows and is rejected.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                av: pl.Tensor[[17, 128], pl.FP16] = pl.tensor.set_validshape(a, 17, 128)
+                y: pl.Tensor[[17, 64], pl.FP32] = pl.matmul(av, b, out_dtype=pl.FP32)
+                return y
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                y: pl.Tensor[[17, 64], pl.FP32] = self.main_incore_0(a, b)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a: pl.Tensor[[17, 128], pl.FP16],
+                b: pl.Tensor[[128, 64], pl.FP16],
+                ret0_out: pl.Out[pl.Tensor[[17, 64], pl.FP32]],
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                # 17 rows allocated as two whole 16-row NZ boxes; valid_shape keeps
+                # the true extent, so the store still writes exactly 17 rows.
+                a_mat: pl.Tile[[32, 128], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    a, [0, 0], [32, 128], [17, 128], target_memory=pl.MemorySpace.Mat
+                )
+                av_tile = pl.tile.set_validshape(a_mat, 17, 128)
+                b_mat: pl.Tile[[128, 64], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    b, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile = pl.tile.matmul(av_tile, b_mat)
+                out_store: pl.Tensor[[17, 64], pl.FP32] = pl.store(y_tile, [0, 0], ret0_out)
+                return out_store
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                ret0_out: pl.Tensor[[17, 64], pl.FP32] = pl.create_tensor([17, 64], dtype=pl.FP32)
+                y: pl.Tensor[[17, 64], pl.FP32] = self.main_incore_0(a, b, ret0_out)
+                return y
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_matmul_a_trans_lhs_keeps_its_natural_load(self):
+        """A transposed left operand is NOT row-boxed.
+
+        ``a_trans`` loads the operand naturally and reinterprets it with a
+        zero-copy ``tile.transpose_view``, so the loaded tile's row axis is the
+        matmul's ``K``, not its ``M``. Boxing rows there would pad the wrong axis;
+        the transposed dual's own granularity is dtype-dependent and is not
+        settled by this rule.
+        """
+        lhs_shape = [128, 17]
+        rhs_shape = [128, 64]
+        out_shape = [17, 64]
+        dtype = DataType.FP16
+        in_specs: list[InSpec] = [("lhs", lhs_shape, dtype), ("rhs", rhs_shape, dtype)]
+
+        def before_body(ib, ins):
+            return ib.let("y", tensor_ops.matmul(ins[0], ins[1], a_trans=True))
+
+        def expected_body(ib, params):
+            lhs_p, rhs_p = params
+            lhs_mat = ib.let(
+                "lhs_mat",
+                tile_ops.load(lhs_p, [0, 0], lhs_shape, lhs_shape, target_memory=MemorySpace.Mat),
+            )
+            lhs_operand = ib.let("lhs_mat_t", tile_ops.transpose_view(lhs_mat))
+            rhs_mat = ib.let(
+                "rhs_mat",
+                tile_ops.load(rhs_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat),
+            )
+            return ib.let("y_tile", tile_ops.matmul(lhs_operand, rhs_mat))
+
+        before = _make_before(in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=before_body)
+        expected = _make_expected(
+            in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=expected_body, preload=False
+        )
+        _assert_convert_equal(before, expected)
+
     def test_mixed_kernel_vec_btrans_moves_to_mat_then_views(self):
         """A Vec compute result (add) feeding a b_trans=True 2D matmul is bridged to Mat
         via a NATURAL tile.move, then transposed by a zero-copy tile.transpose_view — NOT
@@ -3381,10 +3563,17 @@ class TestSliceMatmulConversion:
 
         ``slice_side`` selects which operand of matmul is sliced; ``trans_kw`` selects
         which transpose flag (a_trans/b_trans) is set on the matmul (or ``None`` for none).
+
+        A non-transposed left operand additionally loads a whole number of NZ fractal
+        boxes on its row axis, with the tensor's true extent in ``valid_shape`` — so
+        the ``btrans`` case's one-row ``a`` loads as ``[16, 128]`` valid ``[1, 128]``.
         """
         in_specs: list[InSpec] = [("a", lhs_shape, DataType.BF16), ("b", rhs_shape, DataType.BF16)]
         slice_shape = lhs_shape if slice_side == "lhs" else rhs_shape
         slice_trans = trans_kw == "a_trans" if slice_side == "lhs" else trans_kw == "b_trans"
+        # Row-boxed physical shape of the left operand's load. `a_trans` keeps its
+        # natural (unboxed) load: the transpose_view makes its COLUMN axis the M axis.
+        lhs_load_shape = lhs_shape if trans_kw == "a_trans" else [-(-lhs_shape[0] // 16) * 16, lhs_shape[1]]
 
         def before_body(ib, ins):
             a_in, b_in = ins
@@ -3427,7 +3616,7 @@ class TestSliceMatmulConversion:
             )
             other_tile = ib.let(
                 "lhs_mat",
-                tile_ops.load(a_p, [0, 0], lhs_shape, lhs_shape, target_memory=MemorySpace.Mat),
+                tile_ops.load(a_p, [0, 0], lhs_load_shape, lhs_shape, target_memory=MemorySpace.Mat),
             )
             rhs_operand = (
                 ib.let("b_slice_tile_t", tile_ops.transpose_view(sliced_tile)) if slice_trans else sliced_tile

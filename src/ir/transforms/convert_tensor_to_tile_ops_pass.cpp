@@ -34,6 +34,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/op_conversion_registry.h"
@@ -78,6 +79,52 @@ CallPtr MarkCompilerMatBridge(const CallPtr& call, MemorySpace space) {
   auto marked = MutableCopy(call);
   marked->attrs_.emplace_back(kCompilerTensorToTileMatBridgeAttr, true);
   return marked;
+}
+
+/// Physical shape a cube load must allocate for the window @p shape.
+///
+/// PTO-ISA keeps two independent notions of size for a cube operand, and only
+/// one of them is constrained.  The *logical* extent is essentially free:
+/// ``pto.mad`` derives ``%m`` from the operand's valid rows, bounds it at
+/// ``[1, 4095]``, and documents ``%m == 1`` as a first-class case.  The
+/// *physical* extent must be a whole number of NZ fractal boxes — ptoas
+/// enforces exactly that (``'pto.alloc_tile' op expects result boxed tile rows
+/// to be a multiple of innerRows (16)``), and pto-isa's ``TExtract`` repeats it
+/// as a static assertion on the Mat source it reads.  So the allocation is
+/// rounded up to the box and the tensor's true extent rides in ``valid_shape``,
+/// which the hardware already addresses through compact mode.
+///
+/// The padding is free on both axes of the cost model: a load moves only the
+/// valid extent, so no extra DMA; and the MAD cost is ``ceil(M/16)`` passes,
+/// which rounding M up to a multiple of 16 leaves unchanged.
+///
+/// Returns @p shape unchanged — leaving the emitted load byte-identical to its
+/// historical form — unless every precondition holds:
+///
+///   * rank 2.  A rank >= 3 operand lowers to ``tile.batch_matmul``, whose rows
+///     ``FlattenTileNdTo2D`` row-packs into one ``[B*M, N]`` tile; the box rule
+///     binds that packed extent, not this dimension.
+///   * a static row extent.  A dynamic one has no compile-time box to round to.
+///   * a Mat view whose ``slayout`` is row-major, the orientation whose row axis
+///     really is the matmul's M axis.  The transposed dual boxes 16 on the
+///     *column* axis instead and its row granularity is dtype-dependent; that
+///     rule is deliberately not settled here.
+std::vector<ExprPtr> BoxLoadRows(const std::vector<ExprPtr>& shape, const DataType& dtype, MemorySpace space,
+                                 const Span& span) {
+  if (shape.size() != 2) return shape;
+  auto rows = As<ConstInt>(shape[0]);
+  if (!rows || rows->value_ <= 0) return shape;
+
+  const auto view = tile_view_semantics::GetImplicitTileView(shape, space);
+  if (view.slayout != TileLayout::row_major) return shape;
+  const auto box = tile_view_semantics::GetBoxedTileAlignment(view, dtype);
+  if (!box || box->rows <= 1) return shape;
+
+  const int64_t remainder = rows->value_ % box->rows;
+  if (remainder == 0) return shape;
+  auto boxed = shape;
+  boxed[0] = std::make_shared<ConstInt>(rows->value_ + box->rows - remainder, DataType::INDEX, span);
+  return boxed;
 }
 
 bool IsPassthroughTensorOp(const CallPtr& call) {
@@ -359,6 +406,11 @@ struct ConsumerSpaceReq {
   MemorySpace space;  ///< Required memory space. The consumer-driven load is always
                       ///< natural; a transposed (b_trans/a_trans) operand is realised
                       ///< by a zero-copy tile.transpose_view in BridgeInputSpaces.
+  /// Mirror of ``InputSpaceReq::cube_row_boxed``, so a load-like producer that
+  /// answers the demand directly boxes the same rows ``BridgeInputSpaces``
+  /// would have. Set only when the consumer reads the operand *untransposed*:
+  /// a transposed use makes the loaded tile's row axis K, not M.
+  bool cube_row_boxed = false;
 };
 
 /**
@@ -448,12 +500,23 @@ class ConsumerSpaceCollector : public IRVisitor {
     for (const auto& [idx, req] : entry->input_reqs) {
       if (idx >= call->args_.size()) continue;
       if (auto var = As<Var>(call->args_[idx])) {
+        // A transposed use reinterprets the loaded tile's row axis as K, so the
+        // M-axis box rule does not apply to it (see ConsumerSpaceReq).
+        const bool transposed = req.trans_kwarg && call->GetKwarg<bool>(*req.trans_kwarg, false);
+        const ConsumerSpaceReq resolved{req.space, req.cube_row_boxed && !transposed};
         // Prioritize non-Vec spaces: if an existing requirement is the default Vec but this
         // consumer needs a specialized space (Mat/Left/Right/Acc/Bias), override it so the
         // load-like producer can emit the specialized space directly.
-        auto [it, inserted] = consumer_reqs_.try_emplace(var.get(), ConsumerSpaceReq{req.space});
-        if (!inserted && it->second.space == MemorySpace::Vec && req.space != MemorySpace::Vec) {
-          it->second = ConsumerSpaceReq{req.space};
+        auto [it, inserted] = consumer_reqs_.try_emplace(var.get(), resolved);
+        if (inserted) continue;
+        if (it->second.space == MemorySpace::Vec && req.space != MemorySpace::Vec) {
+          it->second = resolved;
+        } else if (it->second.space == resolved.space) {
+          // Several consumers share one producer (e.g. a sliced KV feeding two
+          // matmuls). Box only when every one of them wants it, so a consumer
+          // that reads the tile at its declared physical shape is never handed a
+          // padded one.
+          it->second.cube_row_boxed = it->second.cube_row_boxed && resolved.cube_row_boxed;
         }
       }
     }
@@ -817,14 +880,27 @@ class TensorToTileMutator : public TypePropagatingMutator {
         << "tensor.slice conversion does not support rank-0 tiles; keep one unit axis or use tensor.read "
            "for a scalar result";
 
+    // A cube operand answered here rather than in BridgeInputSpaces must get the
+    // same row boxing, or a sliced left operand keeps its unaligned physical row
+    // count all the way to ptoas. `valid_shape` already names the slice window,
+    // so only the allocation grows. Skipped when the slice drops a dimension:
+    // the result is then not the rank-2 tile the M-axis rule is about.
+    ExprPtr physical_shape_arg = shape_arg;
+    if (req.cube_row_boxed && drop_dims.empty()) {
+      auto boxed = BoxLoadRows(full_shape, tensor_type->dtype_, req.space, call->span_);
+      if (!AreExprVectorsEqual(boxed, full_shape)) {
+        physical_shape_arg = MakeShapeTuple(boxed, call->span_);
+      }
+    }
+
     // The consumer-driven load is always natural; a transposed (b_trans/a_trans)
     // operand gets a zero-copy tile.transpose_view at the matmul site instead.
     std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", req.space}};
     AppendCachePolicyKwarg(input, cache_policies_, &load_kwargs);
-    auto load_call =
-        MarkCompilerMatBridge(op_registry_.Create("tile.load", {input, offset_arg, shape_arg, valid_shape},
-                                                  load_kwargs, call->span_),
-                              req.space);
+    auto load_call = MarkCompilerMatBridge(
+        op_registry_.Create("tile.load", {input, offset_arg, physical_shape_arg, valid_shape}, load_kwargs,
+                            call->span_),
+        req.space);
 
     auto tile_name = MakeTileValueName(op->var_->name_hint_);
     if (drop_dims.empty()) {
@@ -868,14 +944,24 @@ class TensorToTileMutator : public TypePropagatingMutator {
     // Emit a `tile.load` of `arg` (TensorType) into `space`, append its AssignStmt,
     // and return the bound load Var. The load is always natural; a transposed
     // operand is realised by a zero-copy tile.transpose_view on the result.
-    auto emit_load = [&](const ExprPtr& arg, const TensorTypePtr& tensor_type, MemorySpace space,
-                         size_t idx) -> VarPtr {
+    //
+    // `row_boxed` marks a cube operand (see InputSpaceReq::cube_row_boxed): the
+    // load then allocates a whole number of NZ fractal boxes on the row axis and
+    // declares the tensor's true extent as valid_shape. `BoxLoadRows` returns the
+    // physical shape; it equals `tensor_type->shape_` whenever no padding applies,
+    // so a fractal-sized operand keeps its historical byte-identical load.
+    auto emit_load = [&](const ExprPtr& arg, const TensorTypePtr& tensor_type, MemorySpace space, size_t idx,
+                         bool row_boxed) -> VarPtr {
       auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), call->span_);
-      auto shapes = MakeShapeTuple(tensor_type->shape_, call->span_);
+      auto valid = MakeShapeTuple(tensor_type->shape_, call->span_);
+      auto shapes = row_boxed ? MakeShapeTuple(
+                                    BoxLoadRows(tensor_type->shape_, tensor_type->dtype_, space, call->span_),
+                                    call->span_)
+                              : valid;
       std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", space}};
       AppendCachePolicyKwarg(arg, cache_policies_, &load_kw);
       auto load = MarkCompilerMatBridge(
-          op_registry_.Create("tile.load", {arg, offsets, shapes, shapes}, load_kw, call->span_), space);
+          op_registry_.Create("tile.load", {arg, offsets, shapes, valid}, load_kw, call->span_), space);
       std::string var_name;
       if (auto var = As<Var>(arg)) {
         auto space_str = MemorySpaceToString(space);
@@ -927,7 +1013,11 @@ class TensorToTileMutator : public TypePropagatingMutator {
       if (tensor_type) {
         // GM operand: load NATURAL (2D and ND alike), then reinterpret as its
         // transpose with a zero-copy view when b_trans/a_trans.
-        auto loaded = emit_load(args[idx], tensor_type, req.space, idx);
+        // A transposed operand keeps its natural (unboxed) load: the
+        // tile.transpose_view below reinterprets the row axis as the matmul's K,
+        // so boxing rows here would pad the wrong axis.
+        const bool row_boxed = req.cube_row_boxed && !use_view;
+        auto loaded = emit_load(args[idx], tensor_type, req.space, idx, row_boxed);
         args[idx] = use_view ? emit_view(loaded) : loaded;
         continue;
       }
@@ -1955,7 +2045,7 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
     // Attribute the entry load to the parameter declaration it loads, not to `def`.
     const auto& load_span = var->span_;
     auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), load_span);
-    auto shapes = MakeShapeTuple(tensor_type->shape_, load_span);
+    auto valid = MakeShapeTuple(tensor_type->shape_, load_span);
 
     // Honour the same consumer demand the mutator honours for the loads it
     // creates (see BridgeInputSpaces): a parameter feeding a matmul goes
@@ -1974,8 +2064,19 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
       load_kwargs.emplace_back("target_memory", entry_req->space);
     }
     AppendCachePolicyKwarg(var, cache_policies, &load_kwargs);
+    // A parameter that reaches a matmul directly, or through an inherit-input
+    // chain such as tensor.set_validshape, is loaded here rather than by
+    // BridgeInputSpaces / HandleConsumerDrivenLoad -- so the same row boxing has
+    // to apply, or the cube operand keeps its unaligned physical row count.
+    ExprPtr shapes = valid;
+    if (entry_req.has_value() && entry_req->cube_row_boxed) {
+      auto boxed = BoxLoadRows(tensor_type->shape_, tensor_type->dtype_, entry_req->space, load_span);
+      if (!AreExprVectorsEqual(boxed, tensor_type->shape_)) {
+        shapes = MakeShapeTuple(boxed, load_span);
+      }
+    }
     auto load_call = MarkCompilerMatBridge(
-        op_registry.Create("tile.load", {var, offsets, shapes, shapes}, load_kwargs, load_span),
+        op_registry.Create("tile.load", {var, offsets, shapes, valid}, load_kwargs, load_span),
         entry_req.has_value() ? entry_req->space : MemorySpace::Vec);
 
     std::string tile_name = MakeTileValueName(var->name_hint_);
