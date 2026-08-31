@@ -375,5 +375,75 @@ def test_pass_metadata():
     assert p.get_required_properties().contains(passes.IRProperty.CallDirectionsResolved)
 
 
+def test_no_dep_arg_carry_is_not_a_rebind():
+    """``no_dep_args`` suppresses ordering, not buffer identity.
+
+    ``pl.at(no_dep_args=[out])`` stamps the *call-site* direction ``NoDep``; the
+    callee's ``ParamDirection`` stays ``Out``/``InOut``, which is what codegen's
+    own result alias (``CollectOutIndices``) reads. Classifying such a carry as a
+    rebind would have codegen materialise a fresh ``TaskTensor`` for a slot it is
+    simultaneously aliasing to the arg.
+
+    Written in the scope form because ``no_dep_args`` is a ``pl.at`` / ``pl.submit``
+    keyword, so the outliner has to run first — which is also what introduces the
+    carry (see OutlineIncoreScopes, "store targets written inside control flow").
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function
+        def main(
+            self,
+            x: pl.Tensor[[N, M], pl.FP32],
+            out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+        ) -> pl.Tensor[[N, M], pl.FP32]:
+            for _i in pl.range(4):
+                with pl.at(level=pl.Level.CORE_GROUP, no_dep_args=[out]):
+                    t = pl.load(x, [0, 0], [N, M])
+                    pl.store(t, [0, 0], out)
+            return out
+
+    outlined = passes.outline_incore_scopes()(passes.convert_to_ssa()(Prog))
+    loops = _for_stmts(_orch_func(_classify(outlined)).body)
+    assert len(loops) == 1
+    assert _carry_attrs(loops[0]) == {"iter_arg_rebind_0": False}
+
+
+def test_no_dep_arg_on_a_read_only_capture_does_not_shift_the_output_index():
+    """``no_dep_args`` accepts any *captured* tensor, read or written.
+
+    So a `NoDep` call-site slot is not evidence of a write, and counting one as
+    output-side shifts every later index in the return-tuple walk: here the
+    callee's real output is arg 1, and treating the read-only arg 0 as the first
+    output would alias ``ret[0]`` to the input and misclassify the carry. The
+    alias rule reads the callee's ``ParamDirection`` instead, which is what
+    codegen consults and what ``no_dep_args`` never touches.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function
+        def main(
+            self,
+            x: pl.Tensor[[N, M], pl.FP32],
+            out: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+        ) -> pl.Tensor[[N, M], pl.FP32]:
+            scratch = pl.create_tensor([N, M], pl.FP32)
+            for _i in pl.range(4):
+                # `x` is only read inside the scope, yet named in no_dep_args.
+                with pl.at(level=pl.Level.CORE_GROUP, no_dep_args=[x]) as _tid:
+                    t = pl.load(x, [0, 0], [N, M])
+                    pl.store(t, [0, 0], scratch)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                t2 = pl.load(scratch, [0, 0], [N, M])
+                pl.store(t2, [0, 0], out)
+            return out
+
+    outlined = passes.outline_incore_scopes()(passes.convert_to_ssa()(Prog))
+    loops = _for_stmts(_orch_func(_classify(outlined)).body)
+    assert len(loops) == 1
+    assert _carry_attrs(loops[0]) == {"iter_arg_rebind_0": False}
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

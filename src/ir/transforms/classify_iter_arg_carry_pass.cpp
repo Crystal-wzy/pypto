@@ -101,6 +101,54 @@ ForStmtPtr FindForStmtByReturnVar(const StmtPtr& body, const Var* target) {
   return finder.result;
 }
 
+/// Argument slots the callee writes, in order — codegen's ``CollectOutIndices``.
+///
+/// Read off the *callee's* ``ParamDirection``, which is the only thing
+/// orchestration codegen consults when it aliases a call's result to an arg. The
+/// call-site ``ArgDirection`` is not a usable stand-in: ``pl.at(no_dep_args=[t])``
+/// overwrites whatever direction a slot had with ``NoDep``, and it accepts *any*
+/// tensor the scope captures — read or written. So the call-site view both loses
+/// a genuine write and, if ``NoDep`` were simply admitted, invents one on a
+/// read-only slot, which shifts every later index in the positional walk below.
+///
+/// Indices are param indices. They double as arg indices only where the two
+/// coincide; every caller range-checks against ``args_.size()`` before use,
+/// which is also what keeps a ``Submit``'s runtime-allocated (uncovered) params
+/// out — those have no caller-supplied arg to alias to.
+[[nodiscard]] std::vector<size_t> CalleeWrittenParamIndices(const FunctionPtr& callee) {
+  std::vector<size_t> indices;
+  if (!callee) return indices;
+  const auto& dirs = callee->param_directions_;
+  for (size_t i = 0; i < dirs.size(); ++i) {
+    if (dirs[i] == ParamDirection::Out || dirs[i] == ParamDirection::InOut) indices.push_back(i);
+  }
+  return indices;
+}
+
+/// The arg @p call's return-tuple element @p position aliases, or null.
+///
+/// Mirrors ``OrchestrationCodegen::GenerateTupleReturnAliases`` exactly: prefer
+/// the callee's explicit returned-param map, and fall back to the i-th written
+/// param only when the callee has no ReturnStmt to read.
+[[nodiscard]] const Var* CalleeReturnedArg(const CallPtr& call, const FunctionPtr& callee, size_t position) {
+  const auto ret_map = return_lineage::ExplicitReturnedParamIndices(callee);
+  std::optional<size_t> param_idx;
+  if (position < ret_map.size()) param_idx = ret_map[position];
+  if (!param_idx.has_value()) {
+    // The callee's ReturnStmt names no param at this position — it has none, or
+    // it returns a value (``return pl.store(...)``) rather than the param that
+    // store wrote. Codegen falls back to the position-th written param here
+    // (``returned_idx.value_or(out_indices[0])``); match it.
+    auto written = CalleeWrittenParamIndices(callee);
+    if (position < written.size()) param_idx = written[position];
+  }
+  // No mapping, or a runtime-allocated param the caller never passed: there is
+  // no arg to alias to.
+  if (!param_idx.has_value() || *param_idx >= call->args_.size()) return nullptr;
+  auto out_arg = AsVarLike(call->args_[*param_idx]);
+  return out_arg ? out_arg.get() : nullptr;
+}
+
 /// Alias forest over a loop body: maps each Var that is *another name for an
 /// existing buffer* to the Var it aliases.
 ///
@@ -108,7 +156,7 @@ ForStmtPtr FindForStmtByReturnVar(const StmtPtr& body, const Var* target) {
 /// ``X → source(X) → …`` lands on ``A``. Four rules produce an edge:
 ///
 ///   * ``tensor.assemble``: the result aliases its first arg (the write target).
-///   * Output_existing/inout calls: the result aliases the Out/InOut arg the
+///   * Calls with output-side args: the result aliases the Out/InOut arg the
 ///     callee actually returns (traced via ``return_lineage``, so a kernel with
 ///     a GM-scratch Out param does not capture the alias).
 ///   * ``TupleGetItemExpr``: climb to the tuple-producing call/submit and
@@ -216,22 +264,8 @@ class AliasForest {
       if (it == var_to_assign.end()) return nullptr;
       auto tcall = transform_utils::AsCallOrSubmitView(it->second->value_);
       if (!tcall) return nullptr;
-      auto tdirs = tcall->GetArgDirections();
-      if (tdirs.size() != tcall->args_.size()) return nullptr;
-      int64_t out_seen = 0;
-      const auto target_idx = static_cast<int64_t>(tge->index_);
-      for (size_t a = 0; a < tdirs.size(); ++a) {
-        if (tdirs[a] != ArgDirection::OutputExisting && tdirs[a] != ArgDirection::InOut &&
-            tdirs[a] != ArgDirection::Output) {
-          continue;
-        }
-        if (out_seen == target_idx) {
-          auto out_arg = AsVarLike(tcall->args_[a]);
-          return out_arg ? out_arg.get() : nullptr;
-        }
-        ++out_seen;
-      }
-      return nullptr;
+      FunctionPtr tcallee = program ? program->GetFunction(tcall->op_->name_) : nullptr;
+      return CalleeReturnedArg(tcall, tcallee, static_cast<size_t>(tge->index_));
     }
 
     auto call = transform_utils::AsCallOrSubmitView(assign->value_);
@@ -243,23 +277,19 @@ class AliasForest {
       return first_arg ? first_arg.get() : nullptr;
     }
 
-    // Calls with output_existing/inout args (e.g. InCore kernels): the result
-    // aliases the Out/InOut arg the callee actually returns, mirroring the
-    // codegen alias ``const TaskTensor& result = args[out_idx];``. For kernels with
-    // multiple Out params (e.g. real result + GM scratch passed through pl.spmd
-    // mixed dispatch), tracing the ReturnStmt back to its Param avoids aliasing
-    // the result to an arbitrary scratch tensor.
+    // A single-result call to a kernel that writes one of its args (e.g. an
+    // InCore kernel): the result aliases the arg the callee actually returns,
+    // mirroring the codegen alias ``const TaskTensor& result = args[out_idx];``.
+    // For kernels with multiple Out params (e.g. real result + GM scratch passed
+    // through pl.spmd mixed dispatch), tracing the ReturnStmt back to its Param
+    // avoids aliasing the result to an arbitrary scratch tensor.
+    //
+    // Gated on the call carrying arg_directions, which is what marks it as a
+    // non-builtin dispatch DeriveCallDirections has processed.
     auto call_dirs = call->GetArgDirections();
     if (call_dirs.size() != call->args_.size()) return nullptr;
     FunctionPtr callee = program ? program->GetFunction(call->op_->name_) : nullptr;
-    std::optional<size_t> returned_idx = return_lineage::ExplicitReturnedParamIndex(callee);
-    for (size_t a = 0; a < call_dirs.size(); ++a) {
-      if (call_dirs[a] != ArgDirection::OutputExisting && call_dirs[a] != ArgDirection::InOut) continue;
-      if (returned_idx.has_value() && a != *returned_idx) continue;
-      auto out_arg = AsVarLike(call->args_[a]);
-      return out_arg ? out_arg.get() : nullptr;
-    }
-    return nullptr;
+    return CalleeReturnedArg(call, callee, 0);
   }
 
   std::unordered_set<const Var*> roots_;

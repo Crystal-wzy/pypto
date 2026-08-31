@@ -37,12 +37,19 @@ fence 算子，不会改动 Orchestration `ForStmt` 的 iter_arg。
 | 规则 | 边 |
 | ---- | -- |
 | `tensor.assemble` | 结果别名到 `args[0]`（写入目标） |
-| Out / InOut 调用 | 结果别名到 callee 真正*返回*的那个 Out/InOut 实参（经 `return_lineage` 追踪，因此 GM scratch 的 Out 参数不会误抢别名） |
+| 输出侧（output-side）调用 | 结果别名到 callee 真正*返回*的那个被写实参（经 `return_lineage` 追踪，因此 GM scratch 的 Out 参数不会误抢别名） |
 | `TupleGetItemExpr` | `ret_tuple[i]` 别名到产生该 tuple 的 `Call` / `Submit` 的第 i 个输出侧实参 |
 | 嵌套 `ForStmt` | 穿过嵌套循环的 carry 以该循环的 `return_var` 重新出现，而它别名到嵌套循环的 init 值 |
 
-assemble 规则与 Out/InOut 规则不可能在同一条赋值上同时命中：`tensor.assemble` 是
+assemble 规则与输出侧规则不可能在同一条赋值上同时命中：`tensor.assemble` 是
 builtin op，而 `DeriveCallDirections` 只给非 builtin 调用打 `arg_directions`。
+
+**哪个实参被写入，一律读取 *callee 的* `ParamDirection`，绝不读调用点的
+`ArgDirection`**——这与代码生成自身的别名（`CollectOutIndices`）取自同一处，因此两者
+天然一致。调用点视角回答不了这个问题：`pl.at(no_dep_args=[t])` 会把槽位原有的方向直接
+覆写为 `NoDep`，而且它接受作用域捕获的*任意*张量，无论只读还是写入。据此判断既会漏掉
+真实的写入，又会在只读槽位上凭空造出一个写入——在下面按位置遍历的 `TupleGetItemExpr`
+路径中，这会把之后每一个输出的下标都错位到别的实参上。
 
 `ArrayType` 的 iter_arg 被**排除**在嵌套循环规则之外。与 `TensorType`（指向缓冲区的
 指针别名）不同，`ArrayType` iter_arg 在每一层都拥有一份*全新的* C 栈数组。把内层

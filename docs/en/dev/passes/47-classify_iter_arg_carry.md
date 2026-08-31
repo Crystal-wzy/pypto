@@ -39,13 +39,23 @@ source, so the edges form a forest and the class query is a memoized chain walk
 | Rule | Edge |
 | ---- | ---- |
 | `tensor.assemble` | the result aliases `args[0]` (the write target) |
-| Out / InOut call | the result aliases the Out/InOut arg the callee actually *returns* (traced via `return_lineage`, so a GM-scratch Out param never captures the alias) |
+| output-side call | the result aliases the written arg the callee actually *returns* (traced via `return_lineage`, so a GM-scratch Out param never captures the alias) |
 | `TupleGetItemExpr` | `ret_tuple[i]` aliases the i-th output-side arg of the tuple-producing `Call` / `Submit` |
 | nested `ForStmt` | a carry threaded through a nested loop re-emerges as that loop's `return_var`, which aliases the nested loop's init value |
 
-The assemble rule and the Out/InOut rule can never both fire on one assignment:
+The assemble rule and the output-side rule can never both fire on one assignment:
 `tensor.assemble` is a builtin op, and `DeriveCallDirections` stamps
 `arg_directions` on non-builtin calls only.
+
+**Which arg is written is read off the *callee's* `ParamDirection`, never the
+call-site `ArgDirection`** — the same source codegen's own alias
+(`CollectOutIndices`) uses, so the two agree by construction. The call-site view
+cannot answer the question: `pl.at(no_dep_args=[t])` overwrites whatever
+direction a slot had with `NoDep`, and it accepts *any* tensor the scope
+captures, read or written. Reading it would both miss a genuine write and, if
+`NoDep` were simply admitted, invent one on a read-only slot — which in the
+positional `TupleGetItemExpr` walk shifts every later output's index onto the
+wrong arg.
 
 `ArrayType` iter_args are **excluded** from the nested-loop rule. Unlike a
 `TensorType` (a pointer-to-buffer alias), an `ArrayType` iter_arg owns a *fresh*
