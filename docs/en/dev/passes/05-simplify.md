@@ -79,6 +79,18 @@ Two folds run inside the `SimplifyMutator` traversal so they share the analyzer'
 
 The choice to substitute `return_vars` via `var_remap_` rather than emit a literal `AssignStmt(rv, yielded)` is deliberate: the orchestration codegen's role-aware name disambiguation (`role == "out"` etc.) collapses several role-tagged SSA versions to the same C++ identifier, so an `out__rv_v2 = out__co_l0_rv_v3` alias would lower to the ill-formed `auto out = out;`. Substituting at use sites side-steps the disambiguation entirely.
 
+#### Escaping return vars
+
+A substitution only reaches uses visited while its `var_remap_` entry is live, and `ForStmt`, `WhileStmt` and `IfStmt` each rebase `var_remap_` to a pre-body baseline on the way out so a body-internal remap cannot rewrite siblings or post-loop code. A use that outlives that restore would keep the original `Var` — which the fold has just stripped the only definition of, a dangling reference `UseAfterDefCheck` reports.
+
+`ReturnVarEscapeIndex` (a pre-pass in `simplify_pass.cpp`) decides this per fold site. It walks the function body once, numbering the restoring scopes in pre-order so a scope owns the contiguous id range `[id, end)` of its subtree; "every use of `v` sits inside scope `S`" is then two integer comparisons. A monotonic tick orders uses against the fold site, so a use *preceding* it inside the same scope counts as escaping too. One walk plus O(1) lookups per fold keeps Simplify within its O(N log N) budget.
+
+Statements the index has never seen answer "does not escape", keeping the substitution. That covers folds nested inside a body Fold B `DeepClone`d, whose `Var` identities are minted after indexing. A clone's Vars are unreachable from outside it, so the only unhandled case is a restore-scope *within* a clone standing between such a fold and a later use of its return var — pre-SSA only, and no worse than the behaviour before this index existed. Re-indexing each clone would close it, but nested single-trip loops would then pay an O(N²) walk.
+
+For an escaping `return_vars[i]`, `LiftBodyToReturnVars` emits `AssignStmt(return_vars[i], yielded_value[i])` at the fold site instead of recording the remap. The assignment stays *inside* the region being lifted — the yielded value may name body-local `Var`s, so it cannot be hoisted past the loop, and in leak-mode semantics the last iteration writing last is exactly what a post-loop read expects.
+
+Nothing escapes in SSA form: a value defined inside a region is never referenced outside it, and every use is dominated by its definition. Since the pipeline runs Simplify only after `ConvertToSSA` (positions 5 and 46), the materializing path never fires there — it exists for callers that run Simplify directly on pre-SSA IR, where the alias-assignment concern above does not apply because SSA conversion still runs afterwards.
+
 The two folds compose in a single pass: when Fold B substitutes `loop_var → 0` in a body, predicates like `if loop_var == 0` reduce to `if 0 == 0` → `ConstBool(true)`, which Fold A then collapses without a second Simplify run.
 
 ## Examples
