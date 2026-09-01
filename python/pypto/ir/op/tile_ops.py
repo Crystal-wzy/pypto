@@ -20,6 +20,7 @@ from typing import Any
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import (
+    AccPhase,
     Call,
     ConstFloat,
     ConstInt,
@@ -28,6 +29,7 @@ from pypto.pypto_core.ir import (
     PadValue,
     ScalarType,
     Span,
+    STPhase,
     TensorLayout,
     TileLayout,
 )
@@ -310,6 +312,7 @@ def store(
     span: Span | None = None,
     *,
     atomic: int = 0,
+    st_phase: STPhase = STPhase.Unspecified,
 ) -> Call:
     """Copy data from unified buffer (tile) to tensor.
 
@@ -324,6 +327,10 @@ def store(
         atomic: ``AtomicType`` underlying int — 0 (``kNone``, plain overwrite) or
             1 (``kAdd``, atomic-add into global memory). The kwarg is omitted
             entirely when 0 so non-atomic stores are unchanged.
+        st_phase: Unit-flag-aware store phase. ``STPhase.Unspecified`` (default)
+            preserves ordinary stores; ``STPhase.Final`` checks and clears the
+            flag published by a final phased accumulator producer. The kwarg is
+            omitted entirely for the default so existing stores remain unchanged.
 
     Returns:
         Call expression that returns the output tensor
@@ -336,6 +343,8 @@ def store(
         args = [tile, offsets_tuple, output_tensor]
 
     kwargs: dict[str, Any] = {"atomic": atomic} if atomic else {}
+    if st_phase != STPhase.Unspecified:
+        kwargs["st_phase"] = int(st_phase)
     return _ir_core.create_op_call("tile.store", args, kwargs, actual_span)
 
 
@@ -2105,7 +2114,13 @@ def batch_matmul_acc(
     return _ir_core.create_op_call("tile.batch_matmul_acc", args, {}, actual_span)
 
 
-def gemv(lhs: Expr, rhs: Expr, span: Span | None = None, *, acc_phase: str = "unspecified") -> Call:
+def gemv(
+    lhs: Expr,
+    rhs: Expr,
+    span: Span | None = None,
+    *,
+    acc_phase: AccPhase = AccPhase.Unspecified,
+) -> Call:
     """General Matrix-Vector multiplication: C[1,N] = A[1,K] @ B[K,N].
 
     ``lhs`` must have exactly one physical and logical row. The rhs logical K
@@ -2115,14 +2130,15 @@ def gemv(lhs: Expr, rhs: Expr, span: Span | None = None, *, acc_phase: str = "un
     Args:
         lhs: Row vector tile (TileType [1, K])
         rhs: Right-hand side tile (TileType [K, N])
-        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
+        acc_phase: Producer-side unit-flag phase. Use ``AccPhase.Partial`` for
+            intermediate chunks and ``AccPhase.Final`` for the last chunk.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for GEMV
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.gemv", [lhs, rhs], {"acc_phase": acc_phase}, actual_span)
+    return _ir_core.create_op_call("tile.gemv", [lhs, rhs], {"acc_phase": int(acc_phase)}, actual_span)
 
 
 def gemv_acc(
@@ -2131,7 +2147,7 @@ def gemv_acc(
     rhs: Expr,
     span: Span | None = None,
     *,
-    acc_phase: str = "unspecified",
+    acc_phase: AccPhase = AccPhase.Unspecified,
     init_cond: Expr | None = None,
 ) -> Call:
     """GEMV with accumulation: C[1,N] += A[1,K] @ B[K,N].
@@ -2149,7 +2165,8 @@ def gemv_acc(
         acc: Accumulator tile (TileType [1, N])
         lhs: Row vector tile (TileType [1, K])
         rhs: Right-hand side tile (TileType [K, N])
-        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
+        acc_phase: Producer-side unit-flag phase. Use ``AccPhase.Partial`` for
+            intermediate chunks and ``AccPhase.Final`` for the last chunk.
         span: Optional source span for debugging (auto-captured if not provided)
         init_cond: Optional BOOL scalar predicate selecting overwrite over accumulate
 
@@ -2158,7 +2175,12 @@ def gemv_acc(
     """
     actual_span = _get_span_or_capture(span)
     args = [acc, lhs, rhs] if init_cond is None else [acc, lhs, rhs, init_cond]
-    return _ir_core.create_op_call("tile.gemv_acc", args, {"acc_phase": acc_phase}, actual_span)
+    return _ir_core.create_op_call(
+        "tile.gemv_acc",
+        args,
+        {"acc_phase": int(acc_phase)},
+        actual_span,
+    )
 
 
 def gemv_bias(
@@ -2167,7 +2189,7 @@ def gemv_bias(
     bias: Expr,
     span: Span | None = None,
     *,
-    acc_phase: str = "unspecified",
+    acc_phase: AccPhase = AccPhase.Unspecified,
 ) -> Call:
     """GEMV with bias add: C[1,N] = A[1,K] @ B[K,N] + bias[1,N].
 
@@ -2180,14 +2202,20 @@ def gemv_bias(
         rhs: Right-hand side tile (TileType [K, N])
         bias: Bias tile (TileType [1, N]) with the accumulator dtype (FP32 for
             floating-point matrix operands, INT32 for integer matrix operands)
-        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
+        acc_phase: Producer-side unit-flag phase. Use ``AccPhase.Partial`` for
+            intermediate chunks and ``AccPhase.Final`` for the last chunk.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for GEMV with bias
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.gemv_bias", [lhs, rhs, bias], {"acc_phase": acc_phase}, actual_span)
+    return _ir_core.create_op_call(
+        "tile.gemv_bias",
+        [lhs, rhs, bias],
+        {"acc_phase": int(acc_phase)},
+        actual_span,
+    )
 
 
 # ============================================================================

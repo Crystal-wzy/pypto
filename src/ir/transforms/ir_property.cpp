@@ -109,6 +109,8 @@ std::string IRPropertyToString(IRProperty prop) {
       return "AccCompactValid";
     case IRProperty::GraphBoundaryLegalized:
       return "GraphBoundaryLegalized";
+    case IRProperty::AccStorePhaseValid:
+      return "AccStorePhaseValid";
     default:
       return "Unknown";
   }
@@ -163,7 +165,8 @@ const IRPropertySet& GetVerifiedProperties() {
                                    IRProperty::GraphBoundaryLegalized,
                                    IRProperty::AccToGmStoreValid,
                                    IRProperty::AccCompactValid,
-                                   IRProperty::AtomicAddDtypeValid};
+                                   IRProperty::AtomicAddDtypeValid,
+                                   IRProperty::AccStorePhaseValid};
   return props;
 }
 
