@@ -2499,6 +2499,21 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
+  // Selective device timing (pl.submit(..., timing_slot=N)). The runtime folds
+  // every task tagged with a slot into one device-domain dispatch-to-finish span.
+  // The parser validates the user-facing literal; retain this codegen guard for
+  // hand-built or deserialized IR that bypasses the parser.
+  // Mirrors the runtime's ``NUM_TASK_TIMING_SLOTS`` in ``device_phase.h``.
+  static constexpr int kRuntimeNumTaskTimingSlots = 16;
+
+  void EmitTaskTimingSlot(const std::string& task_var, const CallPtr& call) {
+    if (!call->HasAttr(kAttrTaskTimingSlot)) return;
+    const int slot = call->GetAttr<int>(kAttrTaskTimingSlot);
+    CHECK_SPAN(slot >= 0 && slot < kRuntimeNumTaskTimingSlots, call->span_)
+        << "task_timing_slot must be in 0.." << kRuntimeNumTaskTimingSlots - 1 << ", got " << slot;
+    EmitIndentedLine(task_var + ".set_task_timing_slot(" + std::to_string(slot) + ");");
+  }
+
   // Mirrors the runtime's ``MAX_TENSOR_DIMS`` — the capacity of the fixed
   // ``uint32_t indices[]`` array in ``CorePredicateOperand``.
   static constexpr size_t kRuntimeMaxTensorDims = 5;
@@ -2888,15 +2903,17 @@ class OrchestrationStmtCodegen : public CodegenBase {
         cg.EmitIndentedLine(line);
       }
       if (deps_before_launch) {
-        // Direct-call order: deps -> launch_spec -> early_resolve.
+        // Direct-call order: deps -> launch_spec -> task metadata.
         cg.EmitManualDeps(call, task_var);
         cg.EmitLaunchSpec(task_var, launch_core_num, launch_sync_start);
         cg.EmitEarlyResolveHint(task_var, call);
+        cg.EmitTaskTimingSlot(task_var, call);
         cg.EmitPredicateHint(task_var, call);
       } else {
-        // Wrapper (Spmd/Group/Mixed) order: launch_spec -> early_resolve -> deps.
+        // Wrapper (Spmd/Group/Mixed) order: launch_spec -> task metadata -> deps.
         cg.EmitLaunchSpec(task_var, launch_core_num, launch_sync_start);
         cg.EmitEarlyResolveHint(task_var, call);
+        cg.EmitTaskTimingSlot(task_var, call);
         cg.EmitPredicateHint(task_var, call);
         cg.EmitManualDeps(call, task_var);
       }
