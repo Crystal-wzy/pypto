@@ -579,14 +579,19 @@ std::vector<StmtPtr> RewriteDeadIfPhisOnce(const std::vector<StmtPtr>& stmts,
       if (dropped_any) {
         FilterTrailingYieldSlots(new_then, kept_indices);
         if (new_else.has_value()) FilterTrailingYieldSlots(*new_else, kept_indices);
+        // Removing every synthetic phi yield can leave an engaged but empty
+        // else, which prints as `else: pass` but reparses as no else. Reset the
+        // optional here; non-empty branches and surviving phis stay intact.
+        if (new_else.has_value() && new_else->empty() && new_return_vars.empty()) {
+          new_else.reset();
+        }
         *changed = true;
       }
 
       auto new_if = MutableCopy(if_stmt);
       new_if->then_body_ = MakeBody(new_then, if_stmt->span_);
-      if (new_else.has_value()) {
-        new_if->else_body_ = MakeBody(*new_else, if_stmt->span_);
-      }
+      new_if->else_body_ =
+          new_else.has_value() ? std::optional<StmtPtr>(MakeBody(*new_else, if_stmt->span_)) : std::nullopt;
       if (dropped_any) {
         new_if->return_vars_ = std::move(new_return_vars);
       }
