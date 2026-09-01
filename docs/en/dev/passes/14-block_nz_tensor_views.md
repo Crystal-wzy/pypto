@@ -97,21 +97,76 @@ wt: pl.Tile[[256, 512], pl.INT8, pl.Mem.Mat] =
     pl.tile.load(w, [1, 16, 16, 0, 0], [1, 16, 16, 16, 32], target_memory=pl.Mem.Mat)
 ```
 
-The two trailing offsets must be **constants**. Milestone 1 performs the
-`k0/c0` / `n0/16` mapping only on `ConstInt`, so a symbolic offset is rejected
-even when it is provably aligned — mapping one would need a divisibility proof
-plus an algebraic rewrite (`nb*256` -> `nb*16`), which is not implemented.
+### Symbolic trailing offsets
 
-A loop-derived slice is therefore **not supported yet**:
+A trailing offset does not have to be a constant, but its alignment must be
+**proven** — never assumed. An offset arrives here as the SSA name it was bound
+to, not as the arithmetic that produced it, so `IsProvableMultipleOf`
+(`tensor_view_semantics.h`) walks two kinds of binding the pass collects from
+the enclosing function in one read-only sweep:
+
+| Binding | Multiple of the axis factor | Non-negative |
+| ------- | --------------------------- | ------------ |
+| `AssignStmt` (`n0 = nb * 256`) | one factor of the product is a multiple | both factors are non-negative |
+| `ForStmt` (`for k0 in pl.pipeline(512, 4096, 512)`) | `start` and `step` are both multiples | `start` and `step` are both non-negative |
+| `tile.get_block_idx` / `tile.get_block_num` | — | a lane number is never negative |
+| `ConstInt` | the value is a multiple | the value is `>= 0` |
+
+Sums and products compose from those; a difference proves divisibility but never
+its sign, so it is refused. **Both** columns must hold — see [Why the sign is
+proven too](#why-the-sign-is-proven-too). The grouped-matmul weight path that
+motivated the feature therefore compiles:
 
 ```python
 for nb in pl.spmd(N // N_TILE):
-    n0 = nb * N_TILE
-    wt = w[n0 : n0 + N_TILE, 0:K_TILE]   # rejected: dynamic offset on shape[-2]
+    n0 = nb * N_TILE                     # -> row fractal offset  n0 // 16
+    for k0 in pl.pipeline(K_TILE, K, K_TILE, stage=2):
+        wt = w[n0 : n0 + N_TILE, k0 : k0 + K_TILE]   # -> c0 block offset  k0 // c0
 ```
 
-This is the main gap between this milestone and the grouped-matmul weight path
-that motivated it. Tracked as issue #2548.
+Anything the walk cannot prove is rejected with a diagnostic naming the provable
+forms. That refusal is the design: an NZ tensor addressed from a guessed
+coordinate reads the wrong fractal, and nothing downstream would notice.
+
+#### Why the offset is divided, not re-associated
+
+Only the *result* of the offset is divided (`FloorDiv(offset, divisor)`). The
+tempting rewrite — turning `n0 = nb * 256` into `nb * 16` and saving the runtime
+division — is unsound, because IR arithmetic wraps at its declared width while
+the rewritten form does not:
+
+```text
+x : INT32 = 1 << 24
+(x * 256) / 16   ==  0            # x * 256 wraps to 0 in i32
+x * (256 / 16)   ==  268435456    # re-associated: no wrap, wrong fractal
+```
+
+Widening is not the culprit, and rebuilding at the original width does not help:
+for `a * b = q * 2^W + r`, the original yields `r / d` while any re-association
+yields `r / d + q * 2^(W - log2 d)`. Dividing the offset as a whole keeps its
+own dtype and overflow behaviour intact.
+
+The proof itself survives wraparound because every divisor here is a power of
+two and so divides `2^W`: reducing a multiple of `d` modulo `2^W` leaves a
+multiple of `d`. An `INTERNAL_CHECK` pins that precondition.
+
+One further limit is deliberate: an `IterArg` is never resolved, because its
+value changes every iteration, so neither its initial value nor any binding
+recorded for it describes the value a given use sees.
+
+#### Why the sign is proven too
+
+Divisibility alone does not make a coordinate safe. `n0 = -16` is a clean
+multiple of 16, and `FloorDiv(n0, 16)` is `-1`; codegen then *clamps* a negative
+`pto.partition_view` offset to 0 instead of failing, so the load reads fractal 0
+and returns silently wrong data — the same shape [#2543] fixed for row indices.
+
+The constant path already refuses a negative literal, so proving only
+divisibility for a symbolic offset would mean the identical value is caught
+written inline and waved through once bound to a name.
+`IsProvableNonNegative` closes that gap.
+
+[#2543]: https://github.com/hw-native-sys/pypto/pull/2543
 
 The destination `TileType` is **preserved verbatim**: the GM partition becomes
 rank-(r+2), the tile stays the logical 2-D operand. The load is therefore rebuilt
@@ -149,7 +204,9 @@ diagnostic naming the fix — an NZ tensor must never be silently mis-addressed.
 | `shape[-1] % c0 != 0` | rejected — a partial C0 line has no representation |
 | dynamic `shape[-2]` / `shape[-1]` | rejected — divisibility cannot be proven |
 | slice offset not fractal-aligned | rejected — no blocked representation |
-| **dynamic (non-constant) trailing slice offset** | **rejected — only `ConstInt` offsets are mapped; a provably aligned symbolic offset is refused too (#2548)** |
+| symbolic trailing slice offset, alignment and sign both provable | mapped — see [Symbolic trailing offsets](#symbolic-trailing-offsets) |
+| symbolic trailing slice offset, alignment not provable | rejected — never divided on the assumption that it is aligned |
+| symbolic trailing slice offset, sign not provable | rejected — a negative offset is clamped, not caught, at the partition view |
 | rank < 2 | rejected |
 | `target_memory != Mat` (or absent) | rejected — NZ→NZ is the cube operand path |
 | consumer other than `tile.load` | rejected — NZ is read-only here |

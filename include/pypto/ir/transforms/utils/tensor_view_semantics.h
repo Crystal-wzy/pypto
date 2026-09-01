@@ -14,10 +14,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "pypto/core/dtype.h"
@@ -192,42 +194,205 @@ inline std::vector<ExprPtr> BlockNzShape(const std::vector<ExprPtr>& shape, Data
   return blocked;
 }
 
+/// How an index expression is bound, supplied by the pass that owns the
+/// enclosing function.
+///
+/// A slice offset reaches ``BlockNzOffsets`` as the SSA name it was bound to
+/// (``n0__ssa_v0``), never as the arithmetic that produced it, so without these
+/// facts the only provable offset is a literal constant. Both callbacks are
+/// optional: a default-constructed ``NzOffsetFacts`` proves nothing beyond
+/// constant folding.
+struct NzOffsetFacts {
+  /// The expression an SSA ``Var`` was assigned, or nullptr when unknown.
+  std::function<ExprPtr(const VarPtr&)> definition;
+  /// Whether a ``Var`` holds a multiple of ``divisor`` by construction — a loop
+  /// variable whose start and step are both multiples. Such a variable has no
+  /// exact structural quotient (nothing in the IR names its trip count), so the
+  /// property is the only thing that licenses dividing it.
+  std::function<bool(const VarPtr&, int64_t)> is_multiple_of;
+  /// Whether a ``Var`` is non-negative by construction. Two sources qualify: a
+  /// loop variable whose start and step are both non-negative, and a variable
+  /// bound to an operator whose result cannot be negative (the SPMD block
+  /// index). The second is an *operator* fact, which is why the owning pass
+  /// supplies it rather than this header deciding it structurally.
+  std::function<bool(const VarPtr&)> is_non_negative;
+};
+
+/// Node-visit allowance for one ``IsProvableMultipleOf`` walk.
+///
+/// The walk follows SSA definitions, so a diamond-shaped def chain
+/// (``x = y + y``) can be re-entered exponentially. Bounding the visits keeps
+/// the proof O(1) per offset — and the pass O(N) — and exhausting the budget
+/// degrades to a refusal, never to a wrong answer.
+constexpr int kNzDivideStepBudget = 256;
+
+/// Whether every runtime value of ``expr`` is a multiple of ``divisor``.
+///
+/// This only *proves* the property; it deliberately does not build the
+/// quotient. Re-associating the offset arithmetic to divide it symbolically —
+/// rewriting ``nb * 256`` into ``nb * 16`` — is unsound, because IR arithmetic
+/// wraps at its declared width while the rewritten form does not:
+///
+///     x : INT32 = 1 << 24
+///     (x * 256) / 16   ==  0            // x * 256 wraps to 0 in i32
+///     x * (256 / 16)   ==  268435456    // re-associated: no wrap, wrong answer
+///
+/// Widening is not the culprit and matching the original width does not help:
+/// with ``a * b = q * 2^W + r``, the original yields ``r / d`` while any
+/// re-association yields ``r / d + q * 2^(W - log2 d)``. Callers therefore
+/// divide the *result* of the original expression (``FloorDiv(expr, divisor)``),
+/// which evaluates the offset exactly as written and only then divides.
+///
+/// The proof itself survives wraparound because every divisor here is a power
+/// of two and therefore divides ``2^W``: reducing a multiple of ``d`` modulo
+/// ``2^W`` leaves a multiple of ``d``. ``INTERNAL_CHECK`` pins that precondition
+/// rather than leaving it implicit.
+inline bool IsProvableMultipleOf(const ExprPtr& expr, int64_t divisor, const NzOffsetFacts& facts,
+                                 int* budget) {
+  INTERNAL_CHECK(divisor > 0 && (divisor & (divisor - 1)) == 0)
+      << "Internal error: NZ divisibility proofs require a power-of-two divisor (it must divide the "
+         "wraparound modulus to survive fixed-width overflow), got "
+      << divisor;
+  if (!expr || --*budget < 0) return false;
+
+  if (auto const_expr = As<ConstInt>(expr)) return const_expr->value_ % divisor == 0;
+
+  // One divisible factor makes the whole product divisible.
+  if (auto mul = As<Mul>(expr)) {
+    return IsProvableMultipleOf(mul->left_, divisor, facts, budget) ||
+           IsProvableMultipleOf(mul->right_, divisor, facts, budget);
+  }
+
+  if (auto add = As<Add>(expr)) {
+    return IsProvableMultipleOf(add->left_, divisor, facts, budget) &&
+           IsProvableMultipleOf(add->right_, divisor, facts, budget);
+  }
+
+  if (auto sub = As<Sub>(expr)) {
+    return IsProvableMultipleOf(sub->left_, divisor, facts, budget) &&
+           IsProvableMultipleOf(sub->right_, divisor, facts, budget);
+  }
+
+  // ``As<Var>`` deliberately excludes ``IterArg`` (see ir-kind-traits): an
+  // IterArg's value changes every iteration, so neither its initial value nor
+  // any binding recorded for it proves anything about the value this use sees.
+  if (auto var = As<Var>(expr)) {
+    if (facts.is_multiple_of && facts.is_multiple_of(var, divisor)) return true;
+    if (facts.definition) {
+      if (auto def = facts.definition(var)) {
+        return IsProvableMultipleOf(def, divisor, facts, budget);
+      }
+    }
+  }
+
+  return false;
+}
+
+/// Whether every runtime value of ``expr`` is non-negative.
+///
+/// Divisibility alone does not make a blocked coordinate safe. ``n0 = -16`` is
+/// a perfectly good multiple of 16, and ``FloorDiv(n0, 16)`` is ``-1``; codegen
+/// then clamps a negative ``pto.partition_view`` offset to 0 rather than
+/// failing, so the load silently reads fractal 0 instead of reporting anything.
+/// That is the same silent-wrong-data shape #2543 fixed for row indices. A
+/// literal ``-16`` is already rejected by the constant path, so without this a
+/// negative offset would be caught inline and waved through once bound to a
+/// name.
+///
+/// ``Sub`` is deliberately absent: ``a - b`` is negative whenever ``b > a``,
+/// and nothing here bounds either side. A difference is therefore refused, even
+/// though its divisibility is provable.
+inline bool IsProvableNonNegative(const ExprPtr& expr, const NzOffsetFacts& facts, int* budget) {
+  if (!expr || --*budget < 0) return false;
+
+  if (auto const_expr = As<ConstInt>(expr)) return const_expr->value_ >= 0;
+
+  // Both operands non-negative implies the product and the sum are too. The
+  // converse cases (two negatives multiplying to a positive) are not worth
+  // proving: refusing them costs nothing real.
+  if (auto mul = As<Mul>(expr)) {
+    return IsProvableNonNegative(mul->left_, facts, budget) &&
+           IsProvableNonNegative(mul->right_, facts, budget);
+  }
+
+  if (auto add = As<Add>(expr)) {
+    return IsProvableNonNegative(add->left_, facts, budget) &&
+           IsProvableNonNegative(add->right_, facts, budget);
+  }
+
+  if (auto var = As<Var>(expr)) {
+    if (facts.is_non_negative && facts.is_non_negative(var)) return true;
+    if (facts.definition) {
+      if (auto def = facts.definition(var)) {
+        return IsProvableNonNegative(def, facts, budget);
+      }
+    }
+  }
+
+  return false;
+}
+
 /// Map logical offsets ``[..., r0, c0off]`` into the blocked NZ coordinate
 /// system ``[..., c0off/c0, r0/16, 0, 0]`` produced by ``BlockNzShape``.
 ///
-/// A slice must start on a fractal boundary; an unaligned offset has no blocked
-/// representation and is rejected rather than silently truncated.
+/// A slice must start on a fractal boundary. A constant offset is folded
+/// directly; a symbolic one is accepted only when ``IsProvableMultipleOf``
+/// proves it a multiple of the axis factor, and is then divided as a whole
+/// rather than re-associated. Anything else is rejected rather than silently
+/// truncated.
 inline std::vector<ExprPtr> BlockNzOffsets(const std::vector<ExprPtr>& offsets, DataType dtype,
-                                           const Span& span = Span::unknown()) {
+                                           const Span& span = Span::unknown(),
+                                           const NzOffsetFacts& facts = {}) {
   CHECK_SPAN(offsets.size() >= 2, span) << "NZ layout requires rank >= 2 offsets, got " << offsets.size();
   const int64_t c0 = NzC0Elems(dtype);
 
-  // Milestone 1 maps only *constant* trailing offsets. A symbolic offset would
-  // need a divisibility proof plus an algebraic rewrite (``nb*256`` -> ``nb*16``
-  // for the 16-row axis); that is not implemented, so even a provably aligned
-  // expression is refused rather than guessed at. This is the limit that keeps
-  // a loop-derived slice (``n0 = nb * N_TILE``) out of NZ for now.
-  auto row_off = As<ConstInt>(offsets[offsets.size() - 2]);
-  auto col_off = As<ConstInt>(offsets.back());
-  CHECK_SPAN(row_off, span) << "NZ layout does not support a dynamic offset on shape[-2] yet: only a "
-                            << "constant offset (a multiple of " << kNzFractalRow << ") can be mapped to "
-                            << "blocked coordinates. A loop-derived slice offset is not supported yet.";
-  CHECK_SPAN(col_off, span) << "NZ layout does not support a dynamic offset on shape[-1] yet: only a "
-                            << "constant offset (a multiple of c0 = " << c0 << ") can be mapped to "
-                            << "blocked coordinates. A loop-derived slice offset is not supported yet.";
-  CHECK_SPAN(row_off->value_ >= 0 && row_off->value_ % kNzFractalRow == 0, span)
-      << "NZ slice offset on shape[-2] must be a non-negative multiple of " << kNzFractalRow << ", got "
-      << row_off->value_ << ".";
-  CHECK_SPAN(col_off->value_ >= 0 && col_off->value_ % c0 == 0, span)
-      << "NZ slice offset on shape[-1] must be a non-negative multiple of c0 = " << c0 << ", got "
-      << col_off->value_ << ".";
+  // A constant keeps its own diagnostic: the offending value is in hand, so the
+  // message can name it. Only a symbolic offset needs the proof machinery, and
+  // its message has to describe the shapes that *are* provable instead.
+  auto block_axis = [&](const ExprPtr& offset, int64_t divisor, const char* axis,
+                        const std::string& unit) -> ExprPtr {
+    if (auto const_offset = As<ConstInt>(offset)) {
+      CHECK_SPAN(const_offset->value_ >= 0 && const_offset->value_ % divisor == 0, span)
+          << "NZ slice offset on shape[" << axis << "] must be a non-negative multiple of " << unit
+          << ", got " << const_offset->value_ << ".";
+      return std::make_shared<ConstInt>(const_offset->value_ / divisor, DataType::INDEX, span);
+    }
+    // Both halves of the constant path's "non-negative multiple" contract have
+    // to be re-proven for a symbolic offset, or the same value would be
+    // rejected written inline and accepted once bound to a name.
+    int budget = kNzDivideStepBudget;
+    CHECK_SPAN(IsProvableMultipleOf(offset, divisor, facts, &budget), span)
+        << "NZ layout requires the slice offset on shape[" << axis << "] to be a multiple of " << unit
+        << ", and this one cannot be proven to be. Provable forms are a constant, a loop variable whose "
+        << "start and step are both multiples of " << unit
+        << ", and any sum, difference or constant multiple built from those. Slice on a " << unit
+        << "-aligned boundary, or annotate the tensor as pl.ND.";
+    int sign_budget = kNzDivideStepBudget;
+    CHECK_SPAN(IsProvableNonNegative(offset, facts, &sign_budget), span)
+        << "NZ layout requires the slice offset on shape[" << axis
+        << "] to be non-negative, and this one cannot be proven to be. A negative offset is clamped to 0 "
+        << "at the partition view rather than rejected, so it would read the wrong fractal silently. "
+        << "Provable forms are a non-negative constant, the SPMD block index, a loop variable whose "
+        << "start and step are both non-negative, and any sum or product built from those — note that a "
+        << "difference never qualifies. Slice from a non-negative offset, or annotate the tensor as "
+        << "pl.ND.";
+    // Divide the offset's *result*, never its arithmetic: the expression keeps
+    // its own dtype and wraparound behaviour, and only the value it produces is
+    // divided. See ``IsProvableMultipleOf`` for why re-association is unsound.
+    return MakeFloorDiv(offset, std::make_shared<ConstInt>(divisor, DataType::INDEX, span), span);
+  };
+
+  // Evaluate the row axis first so its diagnostic wins when both are malformed.
+  auto row_blocked =
+      block_axis(offsets[offsets.size() - 2], kNzFractalRow, "-2", std::to_string(kNzFractalRow));
+  auto col_blocked = block_axis(offsets.back(), c0, "-1", "c0 = " + std::to_string(c0));
 
   std::vector<ExprPtr> blocked;
   blocked.reserve(offsets.size() + 2);
   for (size_t i = 0; i + 2 < offsets.size(); ++i) blocked.push_back(offsets[i]);
   auto make_index = [&span](int64_t v) { return std::make_shared<ConstInt>(v, DataType::INDEX, span); };
-  blocked.push_back(make_index(col_off->value_ / c0));
-  blocked.push_back(make_index(row_off->value_ / kNzFractalRow));
+  blocked.push_back(std::move(col_blocked));
+  blocked.push_back(std::move(row_blocked));
   blocked.push_back(make_index(0));  // start of the fractal's rows
   blocked.push_back(make_index(0));  // start of the C0 line
   return blocked;
