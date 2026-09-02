@@ -306,6 +306,55 @@ void CheckGatherRowOperands(const std::vector<ExprPtr>& args,
 void CheckMatmulInitCond(const std::vector<ExprPtr>& args, size_t index, const std::string& op_name);
 
 /**
+ * @brief Data type the Cube accumulator holds for a matmul over these operands
+ *
+ * The L0C accumulator is fixed by the operand domain, not by anything the caller
+ * asks for: a pair of float operands accumulates in FP32, every other pair
+ * (int operands, or a mixed pair) accumulates in INT32. ``tile.matmul`` and the
+ * ``tensor.matmul`` that lowers to it must agree on this, so both read it here.
+ *
+ * @param lhs Left operand element type
+ * @param rhs Right operand element type
+ * @return FP32 for two float operands, INT32 otherwise
+ */
+DataType MatmulAccumulatorDataType(DataType lhs, DataType rhs);
+
+/**
+ * @brief Can the Cube writeback turn @p accumulator into @p out without a scale?
+ *
+ * The matmul result leaves L0C through the FIXPIPE, and the plain (no quant
+ * parameter) writeback offers exactly one conversion: the float narrowing
+ * ``f32 -> f16`` / ``f32 -> bf16`` (``QuantMode_t::F322F16`` / ``F322BF16``; see
+ * ``GetCastPreQuantMode`` in pto-isa ``npu/a2a3/common.hpp`` and ``npu/a5/common.hpp``,
+ * which agree). Anything else is a *quantization*: an INT32 accumulator reaching
+ * FP16 or INT8 is a dequant/requant needing a scale, so from INT32 only INT32
+ * leaves unchanged.
+ *
+ * @param accumulator Accumulator element type (FP32 or INT32)
+ * @param out Requested destination element type
+ * @return true when the FIXPIPE can produce @p out from @p accumulator unscaled
+ */
+bool CubeWritebackSupportsDataType(DataType accumulator, DataType out);
+
+/**
+ * @brief Name the scaled conversion a rejected Acc writeback pair would need
+ *
+ * The pairs `CubeWritebackSupportsDataType` rejects are not all the same kind of
+ * conversion, and FIXPIPE's scaled modes are directional: an integer accumulator
+ * reaching a float destination is a *dequantization* (`DEQF16`), a float
+ * accumulator reaching an integer one is a *quantization* (`QF322B8_PRE`), and
+ * integer to a narrower integer is a *requantization* (`REQ8`). All three carry
+ * a scale, which is what a plain matmul or store has nowhere to put -- but a
+ * diagnostic that calls every one of them a dequantization is wrong for two of
+ * the three. Call this only for a pair `CubeWritebackSupportsDataType` rejects.
+ *
+ * @param accumulator Accumulator element type (FP32 or INT32)
+ * @param out Requested destination element type
+ * @return "a dequantization", "a quantization", or "a requantization"
+ */
+const char* DescribeCubeWritebackScaledConversion(DataType accumulator, DataType out);
+
+/**
  * @brief Read the elements of a tuple-typed operand
  *
  * A ``MakeTuple`` operand yields its elements directly, which preserves the
