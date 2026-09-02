@@ -33,8 +33,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from pypto.ir import DistributedConfig
 from pypto.ir.compiled_program import _ParamInfo
-from pypto.ir.distributed_compiled_program import DistributedConfig
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import ParamDirection
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
@@ -1585,16 +1585,16 @@ class TestBindSubWorkers:
 
 
 class TestOneShotRegression:
-    """The one-shot execute_distributed path still works after helper extraction."""
+    """The one-shot _execute_distributed path still works after helper extraction."""
 
     def test_one_shot_setup_dispatch_close(self, patched_setup):
-        from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
+        from pypto.runtime.distributed_runner import _execute_distributed  # noqa: PLC0415
 
         compiled = _fake_compiled([_param("a", [8, 8]), _param("b", [8, 8])], [])
         a = torch.zeros(8, 8, dtype=torch.float32)
         b = torch.zeros(8, 8, dtype=torch.float32)
 
-        execute_distributed(compiled, [a, b])
+        _execute_distributed(compiled, [a, b])
 
         patched_setup["assemble"].assert_called_once()
         patched_setup["construct"].assert_called_once()
@@ -1603,31 +1603,31 @@ class TestOneShotRegression:
         patched_setup["worker"].close.assert_called_once()
 
     def test_one_shot_rejects_resident_tensor_before_setup(self, patched_setup):
-        from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
+        from pypto.runtime.distributed_runner import _execute_distributed  # noqa: PLC0415
 
         compiled = _fake_compiled([_param("a", [8, 8])], [])
         with pytest.raises(TypeError, match=r"same prepared DistributedWorker"):
-            execute_distributed(compiled, [DeviceTensor(0x1000, (8, 8), torch.float32)])
+            _execute_distributed(compiled, [DeviceTensor(0x1000, (8, 8), torch.float32)])
         patched_setup["assemble"].assert_not_called()
 
     def test_one_shot_enables_sdma_when_a_chip_requires_it(self, patched_setup):
-        from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
+        from pypto.runtime.distributed_runner import _execute_distributed  # noqa: PLC0415
 
         patched_setup["assemble"].return_value = ({"chip_orch": object()}, "rt_name", True)
         compiled = _fake_compiled([_param("a", [8, 8])], [])
 
-        execute_distributed(compiled, [torch.zeros(8, 8, dtype=torch.float32)])
+        _execute_distributed(compiled, [torch.zeros(8, 8, dtype=torch.float32)])
 
         assert patched_setup["construct"].call_args.kwargs["enable_sdma"] is True
 
     def test_one_shot_retries_incomplete_worker_cleanup(self, patched_setup):
-        from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
+        from pypto.runtime.distributed_runner import _execute_distributed  # noqa: PLC0415
 
         worker = patched_setup["worker"]
         worker.close.side_effect = [RuntimeError("cleanup pending"), None]
         compiled = _fake_compiled([_param("a", [8, 8])], [])
 
-        execute_distributed(compiled, [torch.zeros(8, 8, dtype=torch.float32)])
+        _execute_distributed(compiled, [torch.zeros(8, 8, dtype=torch.float32)])
 
         assert worker.close.call_count == 2
 
@@ -2093,7 +2093,7 @@ class TestMultiProgram:
             DistributedWorker([prog_a, prog_b], callbacks={"typo": lambda args: None})
 
     def test_prepare_extra_compiled_forwards_program_list(self):
-        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+        from pypto.ir import DistributedCompiledProgram  # noqa: PLC0415
 
         primary = _fake_compiled([_param("a", [4])], [])
         extra = _fake_compiled([_param("b", [8])], [])
@@ -2103,7 +2103,7 @@ class TestMultiProgram:
         assert fake_worker.call_args.args[0] == [primary, extra]
 
     def test_prepare_forwards_persistent_flag(self):
-        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+        from pypto.ir import DistributedCompiledProgram  # noqa: PLC0415
 
         primary = _fake_compiled([_param("a", [4])], [])
         with patch("pypto.runtime.distributed_runner.DistributedWorker") as fake_worker:
@@ -2118,7 +2118,7 @@ class TestMultiProgram:
         call the user manual shows raised TypeError and the zero-copy path was reachable
         only through the lower-level API.
         """
-        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+        from pypto.ir import DistributedCompiledProgram  # noqa: PLC0415
 
         primary = _fake_compiled([_param("a", [4])], [])
         host = torch.zeros(4, dtype=torch.float32).share_memory_()
@@ -2127,7 +2127,7 @@ class TestMultiProgram:
         assert fake_worker.call_args.kwargs["inherited_host_tensors"] == [host]
 
     def test_prepare_forwards_startup_timeout(self):
-        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+        from pypto.ir import DistributedCompiledProgram  # noqa: PLC0415
 
         primary = _fake_compiled([_param("a", [4])], [])
         with patch("pypto.runtime.distributed_runner.DistributedWorker") as fake_worker:
@@ -3680,7 +3680,7 @@ class TestNamedInheritedHostRanges:
 
     def test_a_range_listed_through_prepare_is_named(self, patched_setup):
         """End to end through the documented entry point, not just the constructor."""
-        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+        from pypto.ir import DistributedCompiledProgram  # noqa: PLC0415
 
         host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
         rt = DistributedCompiledProgram.prepare(

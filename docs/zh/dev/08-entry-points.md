@@ -33,7 +33,7 @@ PyPTO 的编译与执行入口比它拥有的概念要多，而且好几个名�
 | 一个 `CompiledProgram` | 派发一次 | `compiled(*args, config=...)` |
 | 一个 `CompiledProgram` 和常驻设备的数据 | 派发多次 | `ChipWorker.run(compiled, *args)` |
 | 一个 `DistributedCompiledProgram` | 派发多次 | `compiled.prepare()` → `DistributedWorker.run(...)` |
-| 磁盘上的一个构建目录 | 派发一次，不重新编译 | `execute_compiled(work_dir, args, ...)` |
+| 磁盘上的一个构建目录 | 派发一次，不重新编译 | `CompiledProgram.from_dir(work_dir)(*args, config=...)` |
 | 一个 `CompiledProgram` | 计时派发 | `benchmark(compiled, args, ...)` |
 
 ## 编译
@@ -53,14 +53,24 @@ PyPTO 的编译与执行入口比它拥有的概念要多，而且好几个名�
 
 它的参数在[编译](../user/execution/00-compile.md)中有说明。
 
+它可能返回的两种产物类型，以及选定分布式那一种的配置，都从 `pypto.ir` 导出：
+
+```python
+from pypto.ir import CompiledProgram, DistributedCompiledProgram, DistributedConfig
+```
+
+定义它们的模块 `pypto.ir.distributed_compiled_program` 仍然可以导入 —— `pypto.runtime`
+直接从那里取，以避开导入环 —— 但用户代码与测试应当从 `pypto.ir` 取这三个名字。
+
 ## 执行
 
 | 入口 | 层 | 接受什么 | 位置 |
 | ---- | -- | -------- | ---- |
 | `CompiledProgram.__call__` | 产物 | 产物句柄 | [`ir/compiled_program.py`](../../../python/pypto/ir/compiled_program.py) |
 | `Worker.run` / `ChipWorker.run` / `DistributedWorker.run` | 执行 | 产物 + worker | [`runtime/worker.py`](../../../python/pypto/runtime/worker.py) |
-| `runtime.execute_compiled` | 执行 | 产物目录 | [`runtime/runner.py`](../../../python/pypto/runtime/runner.py) |
-| `execute_distributed_compiled` | 执行 | 产物目录 | [`runtime/distributed_runner.py`](../../../python/pypto/runtime/distributed_runner.py) |
+| `CompiledProgram.from_dir` / `DistributedCompiledProgram.from_dir` | 产物 | 产物目录 | [`ir/compiled_program.py`](../../../python/pypto/ir/compiled_program.py) |
+| `runtime.execute_compiled`（已弃用） | 执行 | 产物目录 | [`runtime/runner.py`](../../../python/pypto/runtime/runner.py) |
+| `execute_distributed_compiled`（已弃用） | 执行 | 产物目录 | [`runtime/distributed_runner.py`](../../../python/pypto/runtime/distributed_runner.py) |
 | `device_runner.execute_on_device` | 装配 | 已装配的二进制 | [`runtime/device_runner.py`](../../../python/pypto/runtime/device_runner.py) |
 | `execute_artifact_dir` / `execute_batch_manifest` | CLI | 产物目录 | [`runtime/execute_artifact.py`](../../../python/pypto/runtime/execute_artifact.py) |
 
@@ -68,9 +78,47 @@ PyPTO 的编译与执行入口比它拥有的概念要多，而且好几个名�
 `DistributedWorker.run` 派发产物，二者都实现 `Worker.run`。`PassPipeline.run`
 与此无关——它变换一个 `Program`——`PassManager.run_passes` 同理。
 
-`execute_compiled` 与 `execute_distributed_compiled` 分别是 L2 与 L3 的
-"目录驱动"路径。它们完全跳过 PyPTO 编译，[replay](03-runtime-replay.md)
-正是靠这一点成立的。
+派发一个目录而不是一个活的句柄，正是 [replay](03-runtime-replay.md) 成立的前提：
+PyPTO 编译被完全跳过。`from_dir` 就是抵达那里的方式 —— 它从持久化的 sidecar 重建
+产物句柄，而调用这个句柄走的路径，与一个从未离开内存的句柄完全相同。
+
+`execute_compiled` 与 `execute_distributed_compiled` 曾是它在 L2 与 L3 的写法，
+现已**弃用**。两者仍转发到同一份实现，并各自发出 `DeprecationWarning`。
+
+L3 那个是纯粹改名 —— 它本来就是 `from_dir` 加一次调用：
+
+```python
+# before
+execute_distributed_compiled(work_dir, args, config=cfg, platform="a2a3")
+
+# after
+ir.DistributedCompiledProgram.from_dir(work_dir, platform="a2a3")(*args, config=cfg)
+```
+
+**L2 那个不是**，因为两条路径的优先级规则不同：
+
+| 设置项 | `execute_compiled` | `CompiledProgram.__call__` |
+| ------ | ------------------ | -------------------------- |
+| `platform` | 显式传入的参数 | 传了 config 就取 `config.platform`，否则取产物自带的 |
+| `device_id` / `dfx` / `aicpu_thread_num` | 显式传入的参数 | 一律取自 `config` |
+| ring 覆写项 | 取自 `config` | 取自 `config` |
+
+也就是说，仅为 ring 尺寸而传的 `config` 会顺带接管其余各项；而
+`RunConfig.platform` 默认为 `a2a3sim`，直接丢掉那些显式参数会把这次运行悄悄挪到
+仿真器上。正确做法是把它们并入 config：
+
+```python
+# before —— 显式参数优先，cfg 只被用来读 ring 尺寸
+execute_compiled(work_dir, args, platform="a2a3", device_id=0, config=cfg)
+
+# after —— 由 cfg 承载全部执行期设置
+cfg = dataclasses.replace(cfg, platform="a2a3", device_id=0)
+ir.CompiledProgram.from_dir(work_dir)(*args, config=cfg)
+```
+
+`dfx` 与 `aicpu_thread_num` 不需要翻译：各个 DFX 开关与 `aicpu_thread_num`
+本来就是 `RunConfig` 的字段。而 `from_dir(platform=...)` 仍决定**不带 config**
+那次调用的 platform。
 
 ## 用同一个 config 驱动两个阶段
 
@@ -99,6 +147,10 @@ compiled(*tensors, config=config)
 以下没有稳定性保证。它们不在任何 `__all__` 中，PyPTO 之外的代码不应导入：
 
 - `pypto.ir.compile` —— `_ensure_orchestration_headers`
+- `pypto.runtime.runner` —— `_execute_compiled`
+- `pypto.runtime.distributed_runner` —— `_execute_distributed`
+- `pypto.ir.compiled_program` —— `CompiledProgram._build_orch_args`、
+  `CompiledProgram._build_call_config`
 - `pypto.runtime.device_runner` —— `compile_and_assemble`、`compile_single_kernel`、
   `compile_single_orchestration`、`execute_on_device`
 - `pypto.runtime.kernel_compiler` —— `KernelCompiler`、`compile_incore`
@@ -106,8 +158,10 @@ compiled(*tensors, config=config)
   `_DfxOpts`
 - `pypto.runtime.tensor_arg`、`pypto.runtime.elf_parser`、`pypto.runtime._binary_cache`
 
-`DistributedCompiledProgram` 与 `DistributedConfig` 是公开的，但没有从 `pypto.ir`
-重新导出；请从 `pypto.ir.distributed_compiled_program` 导入。
+这两个实参构造器把用户实参编排成 simpler 的 `TaskArgs` 与 `CallConfig`。
+`ChipWorker.run` 与 `ChipWorker.register` 是抵达这条路径的受支持方式 —— 它们会替你调用
+构造器；而自行构造 `simpler.worker.Worker` 的调用方，仍可从公开面拿到 `chip_callable`、
+`runtime_name` 与 `runtime_config`。
 
 ## 命令行入口
 
