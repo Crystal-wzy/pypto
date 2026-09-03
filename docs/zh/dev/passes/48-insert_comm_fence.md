@@ -41,7 +41,15 @@
 - **每个不透明发布写之后** —— 一个 `Submit`，或对未注册用户函数（其函数体不在本 pass 内分析,
   没有单一可寻址区域）的调用：保守地插一条**全 GM** `system.cacheinvalid()` + `system.fence`；
 - **每个 wait 之后** —— 一条**全 GM** `system.cacheinvalid`（消费侧在下一次可缓存读之前
-  的失效）；
+  的失效）。**会做批量合并**：连续的一段 wait，或一个**纯 wait 循环**（`for`/`while` 的循环体
+  经 `if`/`seq` 嵌套后只含 wait **且至少含一条**，例如 mesh composite 的
+  `for src: if src != me: wait(...)`），在 wait 之间不会有任何内存访问，因此只在循环/序列
+  **之后**发**一条**全 GM `cacheinvalid`，而不是每个 wait 一条——每个屏障代次从 `(P-1)`
+  次整缓存刷新降为 1 次。遍历仍保持结构化（无数据流分析），用一个局部的纯 wait 循环判定；
+  同时含 load 的循环（如 ring 逐 step 的 `wait; load`）不算纯循环，仍保留逐 wait 失效。
+  **无 wait 的循环同样不算纯**：空 body 是空真地“只含 wait”，因此判定要求 ≥ 1 条 wait——
+  否则 pass 会给一个原本什么都不发的循环追加全 GM `cacheinvalid`（在一个以移除刷新为目标的
+  pass 里反而引入回归）；
 - **notify** —— 什么都不插。
 
 区域 `system.cacheinvalid(target)` 寻址的是 `target` 的**本地** base，这对本地窗口写是对的。
@@ -132,18 +140,25 @@ codegen 最终降级的 IR。
 `remote_load`（结果是 tile、不写 GM），以及目标是普通 `Tensor` 而非 window-bound
 `DistributedTensor` 的 `tile.store` / `tensor.write` / `get`，**不是**发布写 —— 完全不插标记。
 
-## 算法 —— 一趟结构遍历，无流状态
+## 算法 —— 一趟结构遍历，带消费侧批处理
 
-本 pass **不带**任何控制流状态（无 `pending` 布尔、无 `if`/循环分析、无 notify 分类）：
+本 pass 只携带一项控制流状态 —— 一个标志位：在访问**纯 wait 循环**（`for`/`while` 的 body
+经 seq/if 嵌套后只含 `pld.system.wait` —— **至少一条** —— 且控制表达式不触达内存；无 wait
+的循环不算纯 wait 循环）的 body 时抑制逐 wait 的 invalidate：
 
 - 每个**本地发布写**处追加 `region cacheinvalid; fence`；
 - 每个**远端发布写**（`remote_store` / `put`）处只追加 `fence`（peer 区域 cacheinvalid 由 codegen 发,见下）；
-- 每个 **wait** 处追加 `cacheinvalid()`；
+- 每个 **wait** 处追加 `cacheinvalid()` —— **批量**：纯 wait 循环在循环后共享一条全 GM
+  `cacheinvalid()`，连续 wait 序列在序列后共享一条。wait 之间没有内存访问，因此最后一次 wait
+  之后 invalidate 等价于每次 wait 之后都 invalidate —— 在 mesh composite 中每个屏障代际的
+  `(P-1)` 次整缓存冲刷变为 1 次。
 - **notify** 保持不动。
 
 `if`/`for`/`while` 的 body 正常递归访问；唯一的特殊处理是包裹裸单语句 body（作为 `if`/`for`
-唯一 body、且无外层 `SeqStmts` 的写/wait），使其标记也能落上。由于两条规则都是局部且只追加，
-控制流无关紧要：某个循环内的写会被正确标记，无论其 notify 是否在另一个循环。
+唯一 body、且无外层 `SeqStmts` 的写/wait），使其标记也能落上 —— 裸纯 wait 循环 body 同样获得
+抑制，并在循环后落一条 `cacheinvalid()`。由于其余规则都是局部且只追加，控制流无关紧要：某个
+循环内的写会被正确标记，无论其 notify 是否在另一个循环。读取 GM 的控制表达式（`tensor.read`
+降级为缓存加载）会使循环不再“纯”，从而 invalidate 绝不会被推迟到可能读到陈旧 peer 数据的读取之后。
 
 ```text
 store(win); notify                   -> store(win); cacheinvalid(win); fence; notify
