@@ -109,6 +109,49 @@ def host_orch(
 
 `@pl.jit.host` 拒绝 `level=`（HOST 是隐含的）。
 
+### 子函数返回的张量会保留 shape 和 dtype
+
+特化会给每个生成的参数打上具体的 shape 和 dtype，因此子函数返回的张量必须能追溯到某个来源。
+两种写法都可用，也可以在同一个入口中混用：
+
+```python
+@pl.jit.inline
+def make_pair(x: pl.Tensor[[1, 8], pl.FP32]):
+    a = pl.create_tensor([1, 8], dtype=pl.FP32)   # helper 自己分配结果
+    b = pl.create_tensor([1, 8], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP):
+        a[:, :] = x[:, :]
+        b[:, :] = pl.mul(x[:, :], 2.0)
+    return a, b
+
+@pl.jit.incore
+def relu_kernel(x: pl.Tensor, out: pl.Out[pl.Tensor]):   # 调用方分配，kernel 填充
+    ...
+
+@pl.jit
+def entry(x: pl.Tensor[[1, 8], pl.FP32], out: pl.Out[pl.Tensor[[1, 8], pl.FP32]]):
+    a, b = make_pair(x)          # 元数据从 make_pair 自身的函数体中读出
+    buf = pl.create_tensor([1, 8], dtype=pl.FP32)
+    mid = relu_kernel(a, buf)    # mid 别名到 buf，因此继承 buf 的元数据
+    ...
+```
+
+设备 kernel（`@pl.jit.incore`）不能分配内存，所以它只能用第二种写法 —— `pl.create_tensor`
+属于控制平面。`@pl.jit.inline` helper 会被拼接进调用方，两种写法都可以用。
+
+特化器无法静态计算某个维度本身**不是**问题。由只有设备才知道的值决定尺寸的
+`pl.create_tensor` —— `pl.tensor.read(cfg, [0])`、`pld.world_size()` —— 会变成一个动态
+维度并继续向下传递，之后由共享的 pass 流水线来判定程序对它做了什么（例如把整个张量作为
+tile 加载，就会得到 `InitMemRef requires static shape` —— 与等价的 `@pl.program` 写法
+报出的错误完全相同）。
+
+真正无法解析的情况是：返回张量的 shape 特化器根本**触及不到** —— 例如目标 shape 非静态的
+`pl.reshape`（reshape 受源张量元素总数约束，因此不能用动态维度顶替），或者经过特化器未
+建模的操作重新绑定的结果。它会在**下一个**消费该张量的调用处报出
+`missing inferred tensor metadata for parameter '<name>'` —— 错误指向的是消费方，但要改的
+是生产方：让产生该张量的语句具有可静态推导的 shape，或者把缓冲区作为 `pl.Out[...]`
+参数传入。
+
 ### 决定 jit kernel 能否编译的三条约束
 
 这是新写的 `@pl.jit` 代码会依次撞上的三个失败。
