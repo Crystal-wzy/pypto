@@ -758,21 +758,117 @@ the trailing `Substitute` rewrites the argument even where nothing is halved:
 - a **singleton result** returns early — `gather` with `[1, N]` indices yields a
   `[1, N]` result, so the result is untouched while the table under it is still
   halved;
-- a **tuple result** skips the block entirely. `tile.gather_compare` returns
-  `Tuple[dst, cdst]`, which the generic path (single `TileType` only) cannot
-  halve — so it would keep declaring full-width elements over a halved input.
-  A tuple-returning op that consumes a partitioned operand is rejected;
-  per-element split mapping for tuple results is not implemented.
+- a **tuple result** takes its own path (below), because the generic block follows
+  one `result_split_dim` and a tuple has one *per element*.
+
+### Tuple results — one split axis per element
+
+`tile.gather_compare` returns `Tuple[dst[rows, out_cols], cdst[1, rows]]`. Under a
+row split those two elements do **not** move along the same axis: `dst` halves on
+dim 0, while `cdst` — a single contiguous row of per-row counts — halves on dim 1.
+There is no single result axis to follow, so the generic path cannot express it.
+
+The mapping is **discovered, not declared**: re-deduce the call from the arguments the
+halved node will carry, and read which axis of each element moved. A new tuple-returning
+operator needs no registration, and the mapping cannot go stale the way per-operator
+metadata did (gh#2612). Re-deduction supplies only the *axis*; `HalveTileShape` still
+halves, so odd extents localize per lane as usual.
+
+Every element must halve on exactly one axis. An element that comes back **unchanged**
+is the dangerous case, not the harmless one — the operator produced a full-width output
+from an operand each lane owns only half of, so neither lane holds the whole answer while
+the shape still looks right. That is what correctly rejects a LEFT_RIGHT
+`tile.gather_compare`: both its outputs are sized from the source's *rows*.
+
+`split_axis::RetypeTupleProjection` retypes the `x = tup[i]` projections from the halved
+tuple and records each element's own axis, so a later `tile.store` offsets the right
+dimension. **Both** lowering arms call it — the AUTO arm's affinity gate only routes leaf
+*calls* into `ProcessStmts`, so a projection left to its pass-through fallback would keep
+a full-width declared type over a halved tuple.
+
+A projection need not be bound at all: `pl.tile.store(pair[0], [0, 0], out)` passes the
+`TupleGetItemExpr` **inline**, and nothing hoists it — so anything matching only `Var` on
+a tile operand misses it, and the operand is still substituted afterwards, leaving a
+full-width declared type over per-lane data. `split_axis::OperandSplitInfo` is the single
+answer to "did the split partition this operand, and along which axis"; it handles a
+bound `Var` and an inline projection alike, and `BuildHalvedCallArgs` rebuilds the
+projection over the halved tuple so the type-consistency probe sees per-lane operands
+too. Every consumer goes through them — the generic path's tracked-input scan,
+`LocalizeStoreOffset`, and `GetFirstTileArgMemory` (which reads the operand's *type*, so
+a vector op is no longer misclassified SHARED and replicated onto both lanes).
+
+Everything that asks "was this operand partitioned" goes through `OperandSplitInfo`.
+That question has more consumers than the halving itself, and each answered *no* for an
+inline projection with a different consequence:
+
+| Asks it | Wrong answer costs |
+| ------- | ------------------ |
+| the generic path's tracked-input scan | the result keeps a full-width type over per-lane operands |
+| `LocalizeStoreOffset` | both lanes store to the same rows |
+| `GetFirstTileArgMemory` | a vector op classifies SHARED and is replicated onto both lanes |
+| absolute-index gate | a halved `tile.gather` table under absolute indices — **no diagnostic**, since `gather` sizes its result from `indices` |
+| `tile.reshape` / `tile.reinterpret_view` | a full-width view plus a per-lane slice over an operand about to be halved |
+| `tile.slice` offset | `+ subblock_idx * half` added to an already lane-local offset, so lane 1 reads past the end |
+| the V→C boundary | a legal `tile.move(pair[0], target_memory=Mat)` refused as full width |
+| `RepairIterArgs` (loop init) | the carry, the exit, and everything after the loop stay full width under a halved init |
+| `YieldedTileInfo` (backedge / merge) | **both** ways: a full-width carry fed `pl.yield_(pair[1])` waved through, and a legally halved one refused |
+| `FindFullWidthOperand` (condition 2) | a partitioned projection reported as a full-width operand — a false rejection |
+
+The only `AsVarLike` lookups left in the pass are inside `OperandSplitInfo` /
+`ReplacedOperand` themselves, and the two places that deliberately identify a **whole
+tuple** by variable (`YieldedHalvedTupleType`, `RetypeTupleProjection`). Anything else
+asking about an operand's split belongs in the helper — that is what stops this class
+from recurring one call site at a time.
+
+The boundary also builds its `tile.aic_gather` from `ReplacedOperand`, which rebuilds an
+inline projection over the halved tuple so the gather doubles HALF → FULL either way.
+
+A tuple also crosses **merges and loop carries**, and neither reads its split from
+`tile_vars` — a tuple var is never in it. Both adopt the halved *type* instead, whose
+elements already carry the per-element split, so there is no single axis to record:
+
+| Shape | Repaired by | Agreement rule |
+| ----- | ----------- | -------------- |
+| `if` merge | `RepairIfReturnVars` | both branches must yield the same halved tuple |
+| loop carry + exit | `RepairIterArgs` / `RepairReturnVars` | the backedge `Yield` must match the carry |
+
+The DSL cannot annotate either, but `ConvertToSSA` synthesizes exactly the merge phi for
+a tuple reassigned in a branch, and `pl.range(..., init_values=(tup,))` carries one
+directly.
+
+Two different failures end in a rejection, and the diagnostics keep them apart — one
+message cannot explain both:
+
+| The operator... | Cause | Diagnostic |
+| --------------- | ----- | ---------- |
+| **refuses** the halved arguments | a constraint does not survive halving (`tile.tquant_mx` needs `M % 16 == 0`); or a workspace sized from the full source — after `LowerCompositeOps` decomposes it, `tile.tquant_mx_raw` needs its `[1, groups]` scratch to match a count derived from `src`, and that singleton dim 0 keeps the generic path from halving it. Repartitioning one is **not implemented**: the extent lives in the deducer, and the allocation was already emitted at full width | quote the operator rather than guess which |
+| **accepts** them, but an element did not move | the wrong-contents case above | name the stationary element |
+
+Condition 2 (the blind-operand backstop) is written against a single result axis and does
+not run here. "Every element must move" covers a *primary* per-lane operand left full
+width, but not a *secondary* one no element's shape depends on; no registered
+tuple-returning operator has one, and a new one surfaces in the blind inventory first.
 
 A position that is scratch only in *some* arities cannot be declared:
 `tile.mrgsort_format2`'s `tmp_or_src2` is a third sorted input in a 3/4-way merge
-and workspace in a 2-way one, and the arity is the positional argument count.
-Such a position stays unclassified and a full-width one is rejected.
+and workspace in a 2-way one, and the arity is the positional argument count. It
+needs no declaration in practice — the deducer sizes the result from whichever
+position holds `tmp` (always the last), so type consistency decides that position at
+every arity, and the remaining positions are real sorted inputs that must be sharded.
 
 ### Carries, merges and dropped axes
 
-Three places rewrite state *around* the halving rather than in it, and each must
+Four places rewrite state *around* the halving rather than in it, and each must
 follow the same axis and tracking rules or the conditions above misfire:
+
+- **A store reached as the return expression.** `LocalizeStoreOffset` moves a
+  `tile.store` of a tracked tile to this lane's half, and the *statement shape*
+  decides whether it is reached. `return pl.tile.store(v, [0, 0], out)` is ordinary
+  DSL — nothing normalizes it into an assignment — yet it is neither an `AssignStmt`
+  nor an `EvalStmt`, and the AUTO arm's affinity gate skips it too (no leaf call of
+  its own). `Substitute` still swaps in the halved tile, so both lanes wrote the same
+  rows from different data. `LocalizeReturnStores` covers it from both arms; binding
+  the store to a name first was never meant to be load-bearing.
 
 - **Loop carries.** A carry has three edges, and all three must agree. An
   `iter_arg` inherits its init value's tracking, so a halved init makes the carry

@@ -257,6 +257,50 @@ def test_store_offset_at_nonzero_base_localizes_additively():
     ir.assert_structural_equal(_lower(Before), Expected)
 
 
+def test_store_as_the_return_expression_gets_the_same_offset_as_the_bound_form():
+    """Binding the store to a name first was never meant to be load-bearing.
+
+    ``return pl.tile.store(...)`` is ordinary DSL — nothing normalizes it into an
+    assignment — but such a store reaches neither the ``AssignStmt`` nor the
+    ``EvalStmt`` offset-localization arm, and the AUTO arm's affinity gate does not
+    route it either (it carries no leaf call of its own). The trailing ``Substitute``
+    swapped in the halved tile regardless, so both AIV lanes wrote the SAME rows from
+    different data and lane 1's half was silently lost.
+
+    Assert the two spellings agree, which is the property that was broken.
+    """
+
+    @pl.program
+    class ReturnExpression:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            qk: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat],
+            out_0: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+        ) -> pl.Tensor[[256, 128], pl.FP32]:
+            popped = pl.tile.move(qk, target_memory=pl.Mem.Vec)
+            y = pl.tile.add(popped, popped)
+            return pl.tile.store(y, [0, 0], out_0)
+
+    @pl.program
+    class BoundFirst:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            qk: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat],
+            out_0: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+        ) -> pl.Tensor[[256, 128], pl.FP32]:
+            popped = pl.tile.move(qk, target_memory=pl.Mem.Vec)
+            y = pl.tile.add(popped, popped)
+            out_store = pl.tile.store(y, [0, 0], out_0)
+            return out_store
+
+    returned = _lower(ReturnExpression).as_python()
+    bound = _lower(BoundFirst).as_python()
+
+    assert "return pl.tile.store(y, [0 + subblock_idx * 64, 0], out_0)" in returned
+    # Same destination arithmetic either way — only the binding differs.
+    assert "pl.tile.store(y, [0 + subblock_idx * 64, 0], out_0)" in bound
+
+
 # ---------------------------------------------------------------------------
 # Vector sub-region per-op halving (migrated from test_split_vector_kernel.py).
 #
@@ -1858,16 +1902,15 @@ def test_gather_partitioned_table_is_rejected_even_with_a_singleton_result():
     assert "source operand 'src'" in str(exc_info.value)
 
 
-def test_tuple_result_op_over_a_partitioned_operand_is_rejected():
-    """A tuple result is not halveable, and its operands are substituted anyway.
+def test_tuple_result_op_halves_each_element_on_its_own_axis():
+    """A tuple result carries one split axis PER ELEMENT, discovered from the operator.
 
-    ``tile.gather_compare`` returns ``Tuple[dst[rows, out_cols], cdst[1, rows]]``,
-    so the generic path — which only understands a single ``TileType`` — skips it
-    entirely: no full-width check, no type consistency, no halving. But the
-    trailing ``Substitute`` still rewrites its arguments, so the call ends up
-    declaring full-width tuple elements over a halved ``[128, 128]`` input. That
-    is illegal IR and would misallocate, so it is rejected; per-element split
-    mapping for tuple results is not implemented.
+    ``tile.gather_compare`` returns ``Tuple[dst[rows, out_cols], cdst[1, rows]]``.
+    Under a row split those two do not move along the same axis: ``dst`` halves on
+    dim 0 while ``cdst`` — laid out as a single contiguous row of per-row counts —
+    halves on dim 1. Re-deducing from the halved arguments is what supplies that
+    mapping, so no per-operator metadata declares it, and each projection is
+    tracked on its own axis so its store offsets the right dimension.
     """
 
     @pl.program
@@ -1878,14 +1921,538 @@ def test_tuple_result_op_over_a_partitioned_operand_is_rejected():
             tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
             rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
             out_0: pl.Out[pl.Tensor[[256, 16], pl.INT32]],
+            out_1: pl.Out[pl.Tensor[[1, 256], pl.INT32]],
+        ) -> pl.Tensor[[1, 256], pl.INT32]:
+            src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            dst, cdst = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            dst_store = pl.tile.store(dst, [0, 0], out_0)  # noqa: F841
+            cdst_store = pl.tile.store(cdst, [0, 0], out_1)
+            return cdst_store
+
+    printed = _lower(Before).as_python()
+
+    # The call now declares per-lane tuple elements over the halved [128, 128] source.
+    assert (
+        "pl.Tuple[pl.Tile[[128, 16], pl.INT32, pl.Mem.Vec], pl.Tile[[1, 128], pl.INT32, pl.Mem.Vec]]"
+        in printed
+    )
+    # Each projection is retyped to its own element ...
+    assert "dst: pl.Tile[[128, 16], pl.INT32, pl.Mem.Vec] = _tuple_tmp[0]" in printed
+    assert "cdst: pl.Tile[[1, 128], pl.INT32, pl.Mem.Vec] = _tuple_tmp[1]" in printed
+    # ... and each store offsets the axis THAT element was halved along.
+    assert "pl.tile.store(dst, [0 + subblock_idx * 128, 0], out_0)" in printed
+    assert "pl.tile.store(cdst, [0, 0 + subblock_idx * 128], out_1)" in printed
+
+
+def test_arity_dependent_scratch_needs_no_declaration():
+    """A position that is scratch only at *some* arities still gets the right answer.
+
+    ``tile.mrgsort_format2`` takes ``(src0..srcN-1, tmp)``, so position 2 is the
+    workspace in a 2-way merge and a third sorted input in a 3/4-way one. A
+    per-position registry declaration cannot express that — but none is needed: the
+    deducer sizes the result from whichever position holds ``tmp`` (always the last),
+    so type consistency decides that position at every arity, and the remaining
+    positions are real per-lane data the full-width check requires to be sharded.
+
+    Here the 2-way form lowers when its workspace is produced inside the region and
+    halves with the sources, and is refused when the workspace stays full width —
+    which is correct, because the result *is* the workspace.
+    """
+
+    @pl.program
+    class Halved:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            a: pl.Tensor[[256, 128], pl.FP32],
+            b: pl.Tensor[[256, 128], pl.FP32],
+            wt: pl.Tensor[[256, 128], pl.FP32],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_0: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+        ) -> pl.Tensor[[256, 128], pl.FP32]:
+            s0 = pl.tile.load(a, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            s1 = pl.tile.load(b, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            w = pl.tile.load(wt, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            merged = pl.tile.mrgsort(s0, s1, tmp=w)
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            out_store = pl.tile.store(merged, [0, 0], out_0)
+            return out_store
+
+    printed = _lower(Halved).as_python()
+    assert "merged: pl.Tile[[128, 128], pl.FP32, pl.Mem.Vec] = pl.tile.mrgsort_format2(s0, s1, w" in printed
+
+    @pl.program
+    class FullWidthWorkspace:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            a: pl.Tensor[[256, 128], pl.FP32],
+            b: pl.Tensor[[256, 128], pl.FP32],
+            w: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_0: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+        ) -> pl.Tensor[[256, 128], pl.FP32]:
+            s0 = pl.tile.load(a, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            s1 = pl.tile.load(b, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            merged = pl.tile.mrgsort(s0, s1, tmp=w)
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            out_store = pl.tile.store(merged, [0, 0], out_0)
+            return out_store
+
+    with pytest.raises(ValueError, match="full-width operand 'w'"):
+        _lower(FullWidthWorkspace)
+
+
+def test_both_tuple_elements_stored_inline_get_their_own_lane_offsets():
+    """A projection consumed inline must offset exactly like a bound one.
+
+    ``pl.tile.gather_compare`` hands back two ``Tile``s wrapping
+    ``TupleGetItemExpr``, so ``pl.tile.store(pair[0], ...)`` passes the projection
+    *inline* — neither the parser nor ``FlattenCallExpr`` hoists it into its own
+    binding. That shape used to break twice over:
+
+    * ``GetFirstTileArgMemory`` matched only ``Var``, so the store classified SHARED
+      instead of VECTOR — replicated onto both lanes and never routed to the split
+      pass at all; and
+    * ``LocalizeStoreOffset`` matched only ``Var``, so even once routed it left the
+      offset alone.
+
+    ``Substitute`` still swapped the tuple for the halved one underneath, so both AIV
+    lanes wrote the SAME rows holding different halves. Both elements are stored here
+    because they halve along *different* axes, which is what makes a single shared
+    offset impossible to fake.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[256, 128], pl.FP32],
+            tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_0: pl.Out[pl.Tensor[[256, 16], pl.INT32]],
+            out_1: pl.Out[pl.Tensor[[1, 256], pl.INT32]],
+        ) -> pl.Tensor[[1, 256], pl.INT32]:
+            src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            d_store = pl.tile.store(pair[0], [0, 0], out_0)  # noqa: F841
+            return pl.tile.store(pair[1], [0, 0], out_1)
+
+    printed = _lower(Before).as_python()
+
+    # `dst` halves on dim 0, `cdst` ([1, rows]) on dim 1 — each store offsets its own.
+    assert "pl.tile.store(pair[0], [0 + subblock_idx * 128, 0], out_0)" in printed
+    assert "pl.tile.store(pair[1], [0, 0 + subblock_idx * 128], out_1)" in printed
+
+
+def test_inline_tuple_projection_feeding_a_generic_op_carries_its_split():
+    """An inline projection is a tracked operand for EVERY op, not just `tile.store`.
+
+    The generic path finds the tracked input by scanning the arguments, so matching
+    only ``Var`` left ``y = tile.add(pair[1], pair[1])`` with no tracked input at all:
+    it fell back to the global split dim (0), found the result's dim 0 was the
+    singleton of ``cdst``'s ``[1, rows]``, and passed the statement through. The
+    trailing ``Substitute`` then rewrote the operands to ``[1, 128]`` under a result
+    still declared ``[1, 256]`` — type-inconsistent IR, and a store with no offset.
+
+    ``pair[1]`` is deliberately the element that halves on dim **1**, since following
+    the global dim 0 is precisely what produced the wrong answer.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[256, 128], pl.FP32],
+            tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_1: pl.Out[pl.Tensor[[1, 256], pl.INT32]],
+        ) -> pl.Tensor[[1, 256], pl.INT32]:
+            src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            y = pl.tile.add(pair[1], pair[1])
+            return pl.tile.store(y, [0, 0], out_1)
+
+    printed = _lower(Before).as_python()
+    assert "y: pl.Tile[[1, 128], pl.INT32, pl.Mem.Vec] = pl.tile.add(pair[1], pair[1])" in printed
+    assert "pl.tile.store(y, [0, 0 + subblock_idx * 128], out_1)" in printed
+
+
+def test_tuple_merged_across_branches_adopts_the_halved_type():
+    """A tuple crossing an if-merge must carry the split like a tile does.
+
+    ``RepairIfReturnVars`` reads ``tile_vars``, and a tuple var is never in it — tuples
+    are not tiles. So both branches halved their tuple while the merge variable kept its
+    full-width declared type, contradicting both ``Yield``s, and projections after the
+    merge got no split information.
+
+    Reachable from ordinary source: the DSL cannot annotate a tuple merge, but
+    ``ConvertToSSA`` synthesizes exactly this phi for a tuple reassigned in a branch.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[256, 128], pl.FP32],
+            tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            flag: pl.Scalar[pl.INT64],
+            out_1: pl.Out[pl.Tensor[[1, 256], pl.INT32]],
+        ) -> pl.Tensor[[1, 256], pl.INT32]:
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            if flag > 0:
+                pair = pl.tile.gather_compare(src, pl.const(2.0, pl.FP32), tmp, cmp_mode="lt", out_cols=16)
+            return pl.tile.store(pair[1], [0, 0], out_1)
+
+    with passes.PassContext([make_roundtrip_instrument()]):
+        printed = passes.lower_auto_vector_split()(passes.convert_to_ssa()(Before)).as_python()
+
+    halved = "pl.Tuple[pl.Tile[[128, 16], pl.INT32, pl.Mem.Vec], pl.Tile[[1, 128], pl.INT32, pl.Mem.Vec]]"
+    # Both branch definitions AND the phi that merges them carry the halved type.
+    assert printed.count(halved) >= 3, printed
+    assert "pl.Tuple[pl.Tile[[256, 16]" not in printed
+    # The projection off the merged tuple still offsets its own axis.
+    assert "[0, 0 + subblock_idx * 128]" in printed
+
+
+def test_inline_tuple_projection_as_an_absolutely_indexed_table_is_rejected():
+    """The absolute-index check must see an inline projection as partitioned.
+
+    This is the one of the family with **no diagnostic at all** before the fix: the
+    check matched only ``Var``, so ``tile.gather(pair[0], indices, tmp)`` was let
+    through with a table the split had halved while the indices stayed absolute. Type
+    consistency cannot catch it either — ``gather`` takes its result shape from
+    ``indices``, so it is satisfied whatever happens to the table. Lane 1 then reads
+    the wrong half, and out of bounds once an index exceeds the halved extent.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[256, 128], pl.FP32],
+            idx: pl.Tensor[[256, 16], pl.INT32],
+            tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            gtmp: pl.Tile[[256, 16], pl.INT32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_0: pl.Out[pl.Tensor[[256, 16], pl.INT32]],
         ) -> pl.Tensor[[256, 16], pl.INT32]:
             src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            indices = pl.tile.load(idx, [0, 0], [256, 16], target_memory=pl.Mem.Vec)
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            picked = pl.tile.gather(pair[0], indices, gtmp)
+            return pl.tile.store(picked, [0, 0], out_0)
+
+    with pytest.raises(ValueError, match="ABSOLUTE indices") as exc_info:
+        _lower(Before)
+    assert "partitioned along dim 0" in str(exc_info.value)
+
+
+def test_reshape_of_an_inline_projection_is_not_split_twice():
+    """A view over an inline projection must see an already-partitioned input.
+
+    ``tile.reshape`` asks whether its source was split so it can tell "lift a full
+    tile onto a new shape, then slice per lane" from "the producer already
+    partitioned this". Matching only ``Var`` answered *full width* for an inline
+    projection, so the pass emitted a full-width view plus a per-lane slice — and
+    ``Substitute`` then made the actual input ``[1, 128]``, leaving lane 1 slicing
+    from 128 into a 128-wide tile.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[256, 128], pl.FP32],
+            tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_1: pl.Out[pl.Tensor[[1, 256], pl.INT32]],
+        ) -> pl.Tensor[[1, 256], pl.INT32]:
+            src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            r = pl.tile.reshape(pair[1], [1, 256])
+            return pl.tile.store(r, [0, 0], out_1)
+
+    printed = _lower(Before).as_python()
+    # Reshaped straight to the per-lane extent — no full-width view, no extra slice.
+    assert "r: pl.Tile[[1, 128], pl.INT32, pl.Mem.Vec] = pl.tile.reshape(pair[1], [1, 128])" in printed
+    assert "pl.tile.slice" not in printed
+    assert "pl.tile.store(r, [0, 0 + subblock_idx * 128], out_1)" in printed
+
+
+def test_tuple_loop_carry_propagates_the_halved_type():
+    """A tuple carried across a loop must carry the split like a tile does.
+
+    ``RepairIterArgs`` substitutes the halved init but reads ``tile_vars`` to retype
+    the carry, and a tuple var is never in it — so the init was per-lane while the
+    carry, the loop exit, and every projection after the loop stayed full width. The
+    backedge check skipped it for the same reason, so nothing flagged the mismatch.
+
+    Reachable from ordinary source: ``ConvertToSSA`` turns a tuple reassigned in a loop
+    into exactly this carry.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[256, 128], pl.FP32],
+            tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_1: pl.Out[pl.Tensor[[1, 256], pl.INT32]],
+        ) -> pl.Tensor[[1, 256], pl.INT32]:
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            for i in pl.range(2):  # noqa: B007
+                pair = pl.tile.gather_compare(src, pl.const(2.0, pl.FP32), tmp, cmp_mode="lt", out_cols=16)
+            return pl.tile.store(pair[1], [0, 0], out_1)
+
+    with passes.PassContext([make_roundtrip_instrument()]):
+        printed = passes.lower_auto_vector_split()(passes.convert_to_ssa()(Before)).as_python()
+
+    halved = "pl.Tuple[pl.Tile[[128, 16], pl.INT32, pl.Mem.Vec], pl.Tile[[1, 128], pl.INT32, pl.Mem.Vec]]"
+    # The init, the backedge Yield, and the loop exit all carry the halved tuple.
+    assert printed.count(halved) >= 3, printed
+    assert "pl.Tuple[pl.Tile[[256, 16]" not in printed
+    # The projection off the loop exit still offsets its own axis.
+    assert "[1], [0, 0 + subblock_idx * 128], out_1__ssa_v0)" in printed
+
+
+def test_slice_of_an_inline_projection_is_not_offset_twice():
+    """An already-partitioned source must keep its lane-local offset.
+
+    ``tile.slice`` adds ``+ subblock_idx * half`` only for a source the split has NOT
+    partitioned; a partitioned one is already in lane-local coordinates. Matching only
+    ``Var`` answered *not partitioned* for an inline projection, so the offset was
+    added on top of a source that only holds this lane's half — lane 1 slicing from
+    column 128 of a 128-wide tile, i.e. straight past the end.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[256, 128], pl.FP32],
+            tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_1: pl.Out[pl.Tensor[[1, 256], pl.INT32]],
+        ) -> pl.Tensor[[1, 256], pl.INT32]:
+            src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            sl = pl.tile.slice(pair[1], [1, 256], [0, 0])
+            return pl.tile.store(sl, [0, 0], out_1)
+
+    printed = _lower(Before).as_python()
+    # The slice reads its own half at offset 0 — the lane offset belongs to the store.
+    assert "pl.tile.slice(pair[1], [1, 128], [0, 0])" in printed
+    assert "pl.tile.store(sl, [0, 0 + subblock_idx * 128], out_1)" in printed
+
+
+def test_inline_projection_crossing_to_cube_is_gathered():
+    """The V->C boundary must see a projection as halved, like the bound spelling.
+
+    ``tile.move(pair[0], target_memory=pl.Mem.Mat)`` is the same value as
+    ``dst = pair[0]`` followed by the move, but only the bound form worked: the
+    boundary looked its operand up by ``Var``, found nothing, and refused it as a
+    full-width vector operand. It must instead gather the halved projection back to
+    the full tile the cube expects.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[256, 128], pl.FP32],
+            tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[16, 128], pl.INT32, pl.Mem.Right],
+            out_0: pl.Out[pl.Tensor[[256, 128], pl.INT32]],
+        ) -> pl.Tensor[[256, 128], pl.INT32]:
+            src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            mat = pl.tile.move(pair[0], target_memory=pl.Mem.Mat)
+            acc = pl.tile.matmul(mat, rhs)
+            back = pl.tile.move(acc, target_memory=pl.Mem.Vec)
+            return pl.tile.store(back, [0, 0], out_0)
+
+    printed = _lower(Before).as_python()
+    # The halved [128, 16] projection is reassembled to the full [256, 16] the cube wants,
+    # along dim 0 (split=1 is UP_DOWN), and the cube placement move rides on that.
+    assert "pl.tile.aic_gather(pair[0], split=1)" in printed
+    assert "mat_mat: pl.Tile[[256, 16], pl.INT32, pl.Mem.Mat]" in printed
+
+
+def test_loop_init_from_an_inline_projection_carries_the_split():
+    """A loop init that is an inline projection tracks like a bound one.
+
+    ``RepairIterArgs`` propagates the init's split onto the carry, so operations in
+    the body and the loop exit see it. Matching only ``Var`` missed a projection: the
+    carry stayed ``[1, 256]`` and untracked while ``Substitute`` halved the init to
+    ``[1, 128]`` underneath it, so the exit stayed full width too and the store that
+    consumed it got no lane offset.
+
+    The earlier tuple fix covered a whole tuple as the init; this is one *element* of
+    it, which is an ordinary tile carry and takes the ``TileInfo`` path.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[256, 128], pl.FP32],
+            tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_1: pl.Out[pl.Tensor[[1, 256], pl.INT32]],
+        ) -> pl.Tensor[[1, 256], pl.INT32]:
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            for i, (acc,) in pl.range(2, init_values=(pair[1],)):  # noqa: B007
+                doubled = pl.tile.add(acc, acc)
+                result = pl.yield_(doubled)
+            return pl.tile.store(result, [0, 0], out_1)
+
+    printed = _lower(Before).as_python()
+    # The body op, the backedge value and the loop exit all sit at the per-lane extent...
+    assert "doubled: pl.Tile[[1, 128], pl.INT32, pl.Mem.Vec]" in printed
+    assert "result: pl.Tile[[1, 128], pl.INT32, pl.Mem.Vec]" in printed
+    # ...and the store that consumes the exit offsets `cdst`'s own axis, dim 1.
+    assert "pl.tile.store(result, [0, 0 + subblock_idx * 128], out_1)" in printed
+
+
+def test_backedge_yielding_an_inline_projection_is_accepted():
+    """A per-lane backedge feeding a per-lane carry must lower.
+
+    ``YieldedTileInfo`` decides whether the value flowing back into a carry is
+    lane-local. Matching only ``Var`` answered *no* for an inline projection, so a
+    legitimately halved carry fed `pl.yield_(pair[1])` was refused as a width
+    disagreement that did not exist.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[256, 128], pl.FP32],
+            tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_1: pl.Out[pl.Tensor[[1, 256], pl.INT32]],
+        ) -> pl.Tensor[[1, 256], pl.INT32]:
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            for i, (acc,) in pl.range(2, init_values=(pair[1],)):  # noqa: B007
+                result = pl.yield_(pair[1])
+            return pl.tile.store(result, [0, 0], out_1)
+
+    printed = _lower(Before).as_python()
+    assert "result: pl.Tile[[1, 128], pl.INT32, pl.Mem.Vec] = pl.yield_(pair[1])" in printed
+    # `cdst` halves on dim 1, so the store off the loop exit offsets dim 1.
+    assert "pl.tile.store(result, [0, 0 + subblock_idx * 128], out_1)" in printed
+
+
+def test_backedge_yielding_an_inline_projection_into_a_full_carry_is_rejected():
+    """The same backedge under a FULL-width carry is the silent-wrong-answer half.
+
+    Both sides looked "not lane-local" to a ``Var``-only lookup, so the widths appeared
+    to agree and the loop was waved through: a ``[1, 128]`` value flowed into a carry
+    still declared ``[1, 256]``, and the store off the loop exit got no lane offset.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[256, 128], pl.FP32],
+            tmp: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            full_tile: pl.Tile[[1, 256], pl.INT32, pl.Mem.Vec],
+            out_1: pl.Out[pl.Tensor[[1, 256], pl.INT32]],
+        ) -> pl.Tensor[[1, 256], pl.INT32]:
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            src = pl.tile.load(t, [0, 0], [256, 128], target_memory=pl.Mem.Vec)
+            pair = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
+            for i, (acc,) in pl.range(2, init_values=(full_tile,)):  # noqa: B007
+                result = pl.yield_(pair[1])
+            return pl.tile.store(result, [0, 0], out_1)
+
+    with pytest.raises(ValueError, match="yields") as exc_info:
+        _lower(Before)
+    message = str(exc_info.value)
+    assert "is full width" in message
+    assert "the split made lane-local" in message
+
+
+def test_tuple_result_op_refusing_the_halved_arguments_says_so():
+    """A refused halving is diagnosed as a refusal, not as a stationary element.
+
+    An operator can fail the tuple path two ways: it *refuses* the halved arguments,
+    or it *accepts* them and returns an element that did not move. Only the second is
+    "an element keeps its full extent", so one message cannot serve both.
+
+    ``tile.tquant_mx`` requires ``M % 16 == 0``. With ``M = 48`` the un-split call is
+    legal and the per-lane ``M = 24`` is not, so the operator throws. Quoting it is
+    what tells the author which constraint broke — the generic wording would send
+    them looking for a full-width operand that does not exist.
+    """
+
+    M, K = 48, 128  # M % 16 == 0 holds; the halved 24 does not
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def split_auto(
+            t: pl.Tensor[[M, K], pl.FP16],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_0: pl.Out[pl.Tensor[[M, K], pl.FP8E4M3FN]],
+        ) -> pl.Tensor[[M, K], pl.FP8E4M3FN]:
+            src = pl.tile.load(t, [0, 0], [M, K], target_memory=pl.Mem.Vec)
+            quant, _scale = pl.tile.quant_mx(src, group_axis=1)
+            seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
+            out_store = pl.tile.store(quant, [0, 0], out_0)
+            return out_store
+
+    with pytest.raises(ValueError, match="REFUSES the halved arguments") as exc_info:
+        _lower(Before)
+    message = str(exc_info.value)
+    # The operator's own words, so the reader learns WHICH constraint broke ...
+    assert "requires M divisible by 16" in message
+    # ... and the explanation that does not apply is not offered.
+    assert "keeps its full extent" not in message
+
+
+def test_tuple_result_op_whose_elements_do_not_move_is_rejected():
+    """An element that keeps its full extent is the unsafe case, not the harmless one.
+
+    Both of ``tile.gather_compare``'s outputs are sized from the source's ROWS, so a
+    LEFT_RIGHT split — which halves the source's columns — leaves them unchanged. Each
+    lane would then scan half the columns and declare a full-width count: right shape,
+    wrong contents, which is exactly what type consistency cannot see. Refuse it.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.LEFT_RIGHT})
+        def split_auto(
+            t: pl.Tensor[[128, 256], pl.FP32],
+            tmp: pl.Tile[[128, 256], pl.FP32, pl.Mem.Vec],
+            rhs: pl.Tile[[128, 128], pl.FP32, pl.Mem.Right],
+            out_0: pl.Out[pl.Tensor[[128, 16], pl.INT32]],
+        ) -> pl.Tensor[[128, 16], pl.INT32]:
+            src = pl.tile.load(t, [0, 0], [128, 256], target_memory=pl.Mem.Vec)
             dst, cdst = pl.tile.gather_compare(src, pl.const(1.0, pl.FP32), tmp, cmp_mode="eq", out_cols=16)
             seed = pl.tile.move(rhs, target_memory=pl.Mem.Mat)  # noqa: F841
             out_store = pl.tile.store(dst, [0, 0], out_0)
             return out_store
 
-    with pytest.raises(ValueError, match="returns a tuple of tiles") as exc_info:
+    with pytest.raises(ValueError, match="one halved axis per tuple element") as exc_info:
         _lower(Before)
     assert "tile.gather_compare" in str(exc_info.value)
 

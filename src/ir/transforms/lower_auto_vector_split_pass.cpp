@@ -445,11 +445,14 @@ std::vector<StmtPtr> LowerStmts(const std::vector<StmtPtr>& stmts, SplitMode mod
           // using the original full-typed reference would over-double to 2x FULL.
           auto src = call->args_[0];
           auto src_var = AsVarLike(src);
-          auto tracked = src_var ? tile_vars.find(src_var.get()) : tile_vars.end();
+          // Through OperandSplitInfo, so an INLINE tuple projection counts as halved:
+          // `tile.move(pair[0], target_memory=pl.Mem.Mat)` is the same value as
+          // `dst = pair[0]` followed by the move, and only the bound spelling worked.
+          auto tracked_info = split_axis::OperandSplitInfo(src, tile_vars, var_replacements);
           // Precondition, not a guarantee: a Vec param moved straight to cube, or a
           // singleton split dim the affinity gate preserves, reaches here un-halved.
           // Reject rather than emit a doubled operand under a FULL-typed move.
-          CHECK_SPAN(tracked != tile_vars.end(), call->span_)
+          CHECK_SPAN(tracked_info.has_value(), call->span_)
               << "LowerAutoVectorSplit: the V->C boundary tile.move here carries a full-width "
               << "vector operand" << (src_var ? " '" + src_var->name_hint_ + "'" : "")
               << ". tile.aic_gather reassembles the two AIV lanes' per-lane halves into the full "
@@ -459,8 +462,10 @@ std::vector<StmtPtr> LowerStmts(const std::vector<StmtPtr>& stmts, SplitMode mod
               << "per-lane half first (load or slice the value inside the split function) and "
               << "move that to the cube side, or, if the split axis is a singleton that cannot "
               << "be halved, keep the value on the vector side.";
-          if (auto it = var_replacements.find(src_var.get()); it != var_replacements.end()) {
-            src = it->second;
+          // ReplacedOperand rebuilds an inline projection over the halved tuple, so the
+          // gather doubles HALF -> FULL either way.
+          if (auto replaced = split_axis::ReplacedOperand(src, var_replacements)) {
+            src = replaced;
           }
           // Gather along the OPERAND's own split axis, not the function/region mode:
           // a tile.reshape can migrate the split axis (the rms_norm [N,1]<->[1,N]
@@ -468,7 +473,7 @@ std::vector<StmtPtr> LowerStmts(const std::vector<StmtPtr>& stmts, SplitMode mod
           // tracks where it actually ended up. Doubling the function axis instead
           // would reassemble the wrong dimension — for a [1,8] operand under UP_DOWN
           // it yields [2,8] where the cube-placement move expects [1,16].
-          const int tracked_split_dim = tracked->second.split_dim;
+          const int tracked_split_dim = tracked_info->split_dim;
           CHECK_SPAN(tracked_split_dim == 0 || tracked_split_dim == 1, call->span_)
               << "LowerAutoVectorSplit: the V->C boundary operand"
               << (src_var ? " '" + src_var->name_hint_ + "'" : "") << " carries its split on dim "
@@ -529,6 +534,13 @@ std::vector<StmtPtr> LowerStmts(const std::vector<StmtPtr>& stmts, SplitMode mod
     // --- Affinity gate: only halve VECTOR-affine leaf stmts. ---
     CallPtr leaf_call;
     if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
+      // A tuple projection carries no call, so the gate below would drop it into the
+      // pass-through fallback and leave a full-width declared type over a halved
+      // tuple. Retype it here, the same way split_axis::ProcessStmt does.
+      if (auto projected = split_axis::RetypeTupleProjection(assign, tile_vars, var_replacements)) {
+        result.push_back(projected);
+        continue;
+      }
       leaf_call = AsCall(assign->value_);
     } else if (auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt)) {
       leaf_call = AsCall(eval->expr_);
@@ -566,7 +578,7 @@ std::vector<StmtPtr> LowerStmts(const std::vector<StmtPtr>& stmts, SplitMode mod
       auto new_body = LowerStmts(body, mode, split_dim, tile_vars, subblock_idx, var_replacements, used_names,
                                  lane_stride);
       split_axis::ValidateCarryBackedge(loop_repair::MakeBody(new_body, for_stmt->span_), new_iter_args,
-                                        tile_vars, for_stmt->span_);
+                                        tile_vars, var_replacements, for_stmt->span_);
       auto new_return_vars = split_axis::RepairReturnVars(for_stmt->return_vars_, new_iter_args, tile_vars,
                                                           var_replacements, subblock_idx, lane_stride);
       result.push_back(loop_repair::RebuildForStmt(
@@ -607,7 +619,7 @@ std::vector<StmtPtr> LowerStmts(const std::vector<StmtPtr>& stmts, SplitMode mod
       auto new_body = LowerStmts(body, mode, split_dim, tile_vars, subblock_idx, var_replacements, used_names,
                                  lane_stride);
       split_axis::ValidateCarryBackedge(loop_repair::MakeBody(new_body, while_stmt->span_), new_iter_args,
-                                        tile_vars, while_stmt->span_);
+                                        tile_vars, var_replacements, while_stmt->span_);
       auto new_return_vars = split_axis::RepairReturnVars(while_stmt->return_vars_, new_iter_args, tile_vars,
                                                           var_replacements, subblock_idx, lane_stride);
       result.push_back(loop_repair::RebuildWhileStmt(
@@ -615,7 +627,19 @@ std::vector<StmtPtr> LowerStmts(const std::vector<StmtPtr>& stmts, SplitMode mod
       continue;
     }
 
-    // SHARED leaf / ReturnStmt / anything else: pass through unchanged.
+    // A store that IS the return expression reaches neither the affinity gate (it
+    // carries no leaf call of its own) nor split_axis's offset-localization arms, so
+    // without this the ordinary `return pl.tile.store(v, [0, 0], out)` spelling left
+    // both AIV lanes writing from row 0 while each held a different half.
+    if (auto ret = std::dynamic_pointer_cast<const ReturnStmt>(stmt)) {
+      if (auto localized =
+              split_axis::LocalizeReturnStores(ret, tile_vars, var_replacements, subblock_idx, lane_stride)) {
+        result.push_back(localized);
+        continue;
+      }
+    }
+
+    // SHARED leaf / anything else: pass through unchanged.
     result.push_back(stmt);
   }
 

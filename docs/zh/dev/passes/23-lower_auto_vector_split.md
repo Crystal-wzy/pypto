@@ -640,18 +640,104 @@ picked = pl.tile.gather(src, indices, tmp)   # 被拒绝：表被折半了
 
 - **结果为单元素维**时会提前返回——`indices` 为 `[1, N]` 的 gather 结果也是 `[1, N]`，
   结果原封不动，而其下的表仍被折半；
-- **结果为 tuple** 时会整段跳过。`tile.gather_compare` 返回 `Tuple[dst, cdst]`，通用路径
-  （只理解单个 `TileType`）无法折半它——于是它会在已折半的输入之上继续声明全宽元素。
-  消费了被折半操作数的 tuple 返回算子会被拒绝；对 tuple 结果逐元素映射拆分轴尚未实现。
+- **结果为 tuple** 时走自己的路径（见下）：通用块只跟随一个 `result_split_dim`，而 tuple
+  的拆分轴是**逐元素**的。
+
+### tuple 结果——每个元素各有一条拆分轴
+
+`tile.gather_compare` 返回 `Tuple[dst[rows, out_cols], cdst[1, rows]]`。在按行拆分时，
+这两个元素**并不**沿同一条轴移动：`dst` 在 dim 0 折半，而 `cdst`——按行计数连续排布的单行
+——在 dim 1 折半。没有单一的结果轴可循，因此通用路径无法表达。
+
+该映射是**推导出来的，而非声明的**：用折半后节点将要携带的实参重新做一次类型推导，读出每个
+元素移动的是哪条轴。这样新增 tuple 返回算子无需任何注册，映射也不会像逐算子元数据那样过期
+（见 gh#2612 的讨论）。重新推导只提供**轴**；折半本身仍由 `HalveTileShape` 完成，因此奇数
+extent 的逐 lane 局部化与单 `TileType` 路径完全一致。
+
+每个元素都必须恰好在一条轴上折半。元素**原样返回**才是危险情形而非无害情形——算子用每个
+lane 只拥有一半的操作数产生了全宽输出，于是两个 lane 都没有完整答案，而形状看起来仍然正确。
+这也正是 `tile.gather_compare` 的 LEFT_RIGHT 拆分被正确拒绝的原因：它的两个输出都由源的
+**行数**定尺寸，折半列数不会让任何一个移动。
+
+`x = tup[i]` 投影由 `split_axis::RetypeTupleProjection` 依据折半后的 tuple 重新定型，并记录
+每个元素自己的轴，使后续 `tile.store` 偏移正确的维度。**两条**下降路径都要调用它：AUTO 路径
+的亲和性门只把叶子 *call* 送进 `ProcessStmts`，投影若落到其"原样透传"兜底分支，就会在已折半
+的 tuple 之上保留全宽的声明类型。
+
+投影也可以完全不绑定：`pl.tile.store(pair[0], [0, 0], out)` 直接**内联**传入
+`TupleGetItemExpr`，没有任何环节会把它提取成变量。因此任何在 tile 操作数上只匹配 `Var` 的
+代码都会漏掉它，而该操作数之后仍会被替换，于是在逐 lane 数据之上留下全宽的声明类型。
+`split_axis::OperandSplitInfo` 是"这个操作数是否被拆分、沿哪条轴"的唯一答案，绑定的 `Var`
+与内联投影一视同仁；`BuildHalvedCallArgs` 则在折半后的 tuple 之上重建投影，使类型一致性探测
+也看到逐 lane 的操作数。所有消费者都走它们——通用路径的被跟踪输入扫描、`LocalizeStoreOffset`，
+以及 `GetFirstTileArgMemory`（它现在读操作数的**类型**，向量算子不会再被误判成 SHARED 并复制
+到两条 lane）。
+
+所有"这个操作数是否被拆分"的提问都走 `OperandSplitInfo`。这个问题的消费者远不止折半本身，
+而每一处对内联投影答"否"的后果各不相同：
+
+| 提问方 | 答错的代价 |
+| ------ | ---------- |
+| 通用路径的被跟踪输入扫描 | 结果在逐 lane 操作数之上保留全宽类型 |
+| `LocalizeStoreOffset` | 两条 lane 写到同一批行 |
+| `GetFirstTileArgMemory` | 向量算子被判为 SHARED，复制到两条 lane |
+| 绝对索引闸门 | `tile.gather` 的表已减半而索引仍绝对——**无任何诊断**，因为 `gather` 的结果尺寸取自 `indices` |
+| `tile.reshape` / `tile.reinterpret_view` | 在一个即将被折半的操作数上生成全宽视图 + 逐 lane 切片 |
+| `tile.slice` 偏移 | 在已是 lane 局部的偏移上再加 `+ subblock_idx * half`，lane 1 读越界 |
+| V→C 边界 | 合法的 `tile.move(pair[0], target_memory=Mat)` 被当作全宽拒绝 |
+| `RepairIterArgs`（循环初值） | 初值已折半，而携带值、出口及循环之后全部停留在全宽 |
+| `YieldedTileInfo`（回边 / 合并） | **两个方向都错**：全宽携带值被喂 `pl.yield_(pair[1])` 却放行，合法折半的反被拒绝 |
+| `FindFullWidthOperand`（条件 2） | 已分区的投影被报成全宽操作数——误拒 |
+
+pass 里仅剩的 `AsVarLike` 查找只有两类：`OperandSplitInfo` / `ReplacedOperand` 自身的实现，
+以及刻意按变量身份识别**整个 tuple** 的两处（`YieldedHalvedTupleType`、`RetypeTupleProjection`）。
+除此之外任何询问操作数拆分状态的代码都应走该 helper——这才是阻止这类问题按调用点逐个复发的办法。
+
+边界处的 `tile.aic_gather` 也改用 `ReplacedOperand` 构造——它在折半后的 tuple 之上重建投影，
+使 gather 无论哪种写法都是 HALF → FULL 的加倍。
+
+tuple 还会穿过**分支合并与循环携带**，两者都不从 `tile_vars` 读取拆分信息——tuple 变量从不
+在其中。两者改为直接采用折半后的**类型**，其元素本就带着逐元素拆分，没有单一的轴可记录：
+
+| 形态 | 修复者 | 一致性规则 |
+| ---- | ------ | ---------- |
+| `if` 合并 | `RepairIfReturnVars` | 两个分支必须产出相同的折半 tuple |
+| 循环携带 + 出口 | `RepairIterArgs` / `RepairReturnVars` | 回边 `Yield` 必须与携带值一致 |
+
+DSL 对两者都无法写注解，但 `ConvertToSSA` 会为"在分支里被重新赋值的 tuple"合成正是这种 phi，
+而 `pl.range(..., init_values=(tup,))` 可以直接携带一个 tuple。
+
+这里有**两种**不同的失败都会以拒绝告终，诊断信息把它们分开。一是算子**直接拒绝**折半后的
+实参：可能是某条约束在折半后不再成立（`tile.tquant_mx` 要求 `M % 16 == 0`，而 per-lane 的
+`M` 可能破坏它），也可能是 workspace 按完整源尺寸分配——`LowerCompositeOps` 分解之后，
+`tile.tquant_mx_raw` 要求其 `[1, groups]` scratch 与由 `src` 推出的数量精确相等，而那个
+单元素 dim 0 使通用路径不会折半它。重新划分这类 workspace **尚未实现**：它的尺寸算在推导
+函数内部，且其分配语句早已按全宽发射。两种情况下诊断都直接引用算子自己的报错，而不去猜测。
+二是算子**接受**了折半实参但某个元素没有移动，即上面那种"内容错、形状对"的情形。
+
+条件 2（盲操作数兜底）不在这条路径上运行——它是围绕单一结果轴写的。"每个元素都必须移动"这条
+规则覆盖了常见情形：**主**逐 lane 操作数若保持全宽，元素就不再移动，从而被拒绝。它无法覆盖
+任何元素形状都不依赖的**次要**逐 lane 操作数；当前已注册的 tuple 返回算子都没有这类操作数
+（其余 tile 操作数都是已声明的工作区），而新增算子会出现在
+`test_lane_invariant_arg_coverage.py` 的盲操作数清单里，迫使这个问题在合入前被回答。
 
 只在*部分* arity 下才是 scratch 的位置无法声明：`tile.mrgsort_format2` 的 `tmp_or_src2`
 在 3/4 路归并里是第三个已排序输入、在 2 路里才是工作区，而 arity 由位置实参个数决定。
-这类位置保持未分类，全宽时按拒绝处理。
+但实际上并不需要声明——推导函数总是用持有 `tmp` 的那个位置（永远是最后一个）来给结果定尺寸，
+因此类型一致性在任何 arity 下都能判定该位置，其余位置则是必须被分片的真实排序输入。
 
 ### 循环携带值、分支归并与被丢弃的轴
 
-有三处是在折半**周围**改写状态而非折半本身，它们必须遵循同样的轴映射与跟踪规则，
+有四处是在折半**周围**改写状态而非折半本身，它们必须遵循同样的轴映射与跟踪规则，
 否则上面的条件会误判：
+
+- **作为返回表达式出现的 store。** `LocalizeStoreOffset` 把被跟踪 tile 的 `tile.store`
+  移到本 lane 所属的那半目的地，而语句形态决定了它是否会被触及。
+  `return pl.tile.store(v, [0, 0], out)` 是再普通不过的 DSL——没有任何环节把它归一化成
+  赋值——但它既不是 `AssignStmt` 也不是 `EvalStmt`，AUTO 路径的亲和性门也不会转发它
+  （它自身不携带叶子 call）。尾部的 `Substitute` 仍然会换入折半后的 tile，于是两个 lane
+  用不同的数据写了相同的行。`LocalizeReturnStores` 让两条路径都覆盖这种返回形态；
+  "先把 store 绑定到一个名字"从来就不该是正确性的前提。
 
 - **循环携带值。** 一个携带值有三条边，三者必须一致。`iter_arg` 继承其 init 的跟踪信息，
   因此 init 被折半时携带值也变为 lane 局部；循环出口的 `return_var` 再继承之，使后续

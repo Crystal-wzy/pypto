@@ -1530,6 +1530,63 @@ class TestTileBroadcastOps:
         ir_str = str(Program)
         assert "tile.col_expand_add" in ir_str
 
+    def test_col_expand_vector_columns_must_match_target(self):
+        """`dst[i, j] = target[i, j] OP col[0, j]` needs the columns to line up."""
+        span = ir.Span.unknown()
+        target = ir.Var("target", ir.TileType([32, 32], DataType.FP32), span)
+        narrow_col = ir.Var("col", ir.TileType([1, 16], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="last dimension to match the target"):
+            tile.col_expand(target, narrow_col)
+
+    def test_col_expand_rejects_a_rank_one_vector(self):
+        """A bare ``[cols]`` is not the documented ``[1, cols]``.
+
+        Rank 1 has no row axis, so the "single row" check below is vacuous for it and
+        the operand would slip through on the last-dimension match alone. The
+        ``row_expand`` family already requires rank 2; this keeps the pair consistent.
+        """
+        span = ir.Span.unknown()
+        target = ir.Var("target", ir.TileType([32, 32], DataType.FP32), span)
+        rank1_col = ir.Var("col", ir.TileType([32], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="at least 2 dimensions"):
+            tile.col_expand(target, rank1_col)
+
+    def test_col_expand_vector_must_be_a_single_row(self):
+        """A full-height second operand is not a column vector, whatever its width."""
+        span = ir.Span.unknown()
+        target = ir.Var("target", ir.TileType([32, 32], DataType.FP32), span)
+        square_col = ir.Var("col", ir.TileType([32, 32], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match=r"single row \(\[1, cols\]\)"):
+            tile.col_expand_mul(target, square_col)
+
+    def test_col_expand_accepts_the_documented_contract(self):
+        span = ir.Span.unknown()
+        target = ir.Var("target", ir.TileType([32, 32], DataType.FP32), span)
+        col = ir.Var("col", ir.TileType([1, 32], DataType.FP32), span)
+
+        result_type = tile.col_expand_div(target, col).type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.shape == [32, 32]
+
+    def test_col_expand_symbolic_extent_is_not_rejected(self):
+        """An undecidable relation is left to the backend rather than refused here.
+
+        Two *distinct* symbols, so the analyzer can prove neither equality nor
+        inequality — the case that must stay accepted.
+        """
+        span = ir.Span.unknown()
+        one = ir.ConstInt(1, DataType.INDEX, span)
+        rows = ir.ConstInt(32, DataType.INDEX, span)
+        target_cols = ir.Var("target_cols", ir.ScalarType(DataType.INDEX), span)
+        col_cols = ir.Var("col_cols", ir.ScalarType(DataType.INDEX), span)
+        target = ir.Var("target", ir.TileType([rows, target_cols], DataType.FP32), span)
+        col = ir.Var("col", ir.TileType([one, col_cols], DataType.FP32), span)
+
+        assert isinstance(tile.col_expand_sub(target, col).type, ir.TileType)
+
     def test_tile_row_expand_add(self):
         """Test tile.row_expand_add operator - expand row and add to tile."""
 
@@ -8049,6 +8106,38 @@ class TestTileSort32Ops:
         assert valid_width.left is valid_cols
         assert isinstance(valid_width.right, ir.ConstInt)
         assert valid_width.right.value == factor
+
+    def test_idx_shape_must_match_src(self):
+        """idx carries one index per src element, so a mismatched extent is rejected."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([1, 32], DataType.FP32), span)
+        wide_idx = ir.Var("idx", ir.TileType([1, 64], DataType.UINT32), span)
+
+        with pytest.raises(ValueError, match="same shape as src"):
+            tile.sort32(src, wide_idx)
+
+    def test_idx_rank_must_match_src(self):
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([1, 32], DataType.FP32), span)
+        rank1_idx = ir.Var("idx", ir.TileType([32], DataType.UINT32), span)
+
+        with pytest.raises(ValueError, match="same rank as src"):
+            tile.sort32(src, rank1_idx)
+
+    def test_symbolic_idx_extent_is_not_rejected(self):
+        """An undecidable relation is left to the backend rather than refused here.
+
+        Two *distinct* symbols, so the analyzer can prove neither equality nor
+        inequality — the case that must stay accepted.
+        """
+        span = ir.Span.unknown()
+        one = ir.ConstInt(1, DataType.INDEX, span)
+        src_cols = ir.Var("src_cols", ir.ScalarType(DataType.INDEX), span)
+        idx_cols = ir.Var("idx_cols", ir.ScalarType(DataType.INDEX), span)
+        src = ir.Var("src", ir.TileType([one, src_cols], DataType.FP32), span)
+        idx = ir.Var("idx", ir.TileType([one, idx_cols], DataType.UINT32), span)
+
+        assert isinstance(tile.sort32(src, idx).type, ir.TileType)
 
 
 class TestB03TriAndGatherOps:
