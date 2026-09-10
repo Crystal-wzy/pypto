@@ -295,6 +295,16 @@ class UnknownType(Type):
             The singleton UnknownType instance
         """
 
+class VoidType(Type):
+    """Known absence of an SSA result, distinct from UnknownType."""
+
+    def __init__(self) -> None:
+        """Create a void type."""
+
+    @staticmethod
+    def get() -> VoidType:
+        """Get the singleton VoidType instance."""
+
 class ScalarType(Type):
     """Scalar type representation."""
 
@@ -813,6 +823,47 @@ class ArrayType(ShapedType):
     @property
     def extent(self) -> Expr:
         """Number of elements (always a ConstInt)."""
+
+class BufferType(Type):
+    """Physical descriptor for a final device buffer, without a MemRef or address.
+
+    Physical extents are static positive integers. ``valid_shape`` entries are
+    static nonnegative extents or -1 for a runtime valid extent carried by an op
+    operand. An empty valid shape is normalized to the physical shape.
+    """
+
+    shape: Final[Sequence[int]]
+    dtype: Final[DataType]
+    memory_space: Final[MemorySpace]
+    valid_shape: Final[Sequence[int]]
+    blayout: Final[TileLayout]
+    slayout: Final[TileLayout]
+    fractal: Final[int]
+    pad: Final[PadValue]
+    compact: Final[CompactMode]
+
+    def __init__(
+        self,
+        shape: Sequence[int],
+        dtype: DataType,
+        memory_space: MemorySpace,
+        valid_shape: Sequence[int] = (),
+        blayout: TileLayout = TileLayout.row_major,
+        slayout: TileLayout = TileLayout.none_box,
+        fractal: int = 512,
+        pad: PadValue = PadValue.null,
+        compact: CompactMode = CompactMode.null,
+    ) -> None:
+        """Create a static physical buffer descriptor with explicit memory space."""
+
+class MultiBufferType(Type):
+    """Descriptor for an explicit multi-slot allocation of identical buffers."""
+
+    element_type: Final[BufferType]
+    slot_count: Final[int]
+
+    def __init__(self, element_type: BufferType, slot_count: int) -> None:
+        """Create a multi-buffer descriptor with a positive slot count."""
 
 class TupleType(Type):
     """Tuple type representation (contains multiple types)."""
@@ -1382,7 +1433,7 @@ class ConstBool(Expr):
         """Data type of the expression (always DataType.BOOL)."""
 
 class Call(Expr):
-    """Function call expression."""
+    """Function call expression. Expressions in args, attrs, and kwargs must produce a value."""
 
     op: Final[Op]
     """Operation/function."""
@@ -1410,7 +1461,7 @@ class Call(Expr):
           :attr:`arg_directions` shortcut for typed access).
         """
 
-    kwargs: Final[Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue]]
+    kwargs: Final[Mapping[str, Any]]
     """Keyword arguments (metadata)."""
 
     @overload
@@ -1448,7 +1499,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         span: Span,
     ) -> None:
         """Create a function call expression with kwargs.
@@ -1466,7 +1517,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         type: Type,
         span: Span,
     ) -> None:
@@ -1486,7 +1537,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         attrs: Mapping[str, object] | Sequence[tuple[str, object]] | None,
         type: Type,
         span: Span,
@@ -1519,6 +1570,8 @@ class Submit(Expr):
     ``Tuple[<callee return>..., Scalar[TASK_ID]]`` (or just
     ``Scalar[TASK_ID]`` when the callee has no value return); callers unpack
     as ``out, tid = pl.submit(...)``.
+
+    Expressions in attrs and kwargs must produce a value.
 
     ``deps`` is a first-class field carrying the explicit cross-task
     dependencies passed as ``deps=[tid1, tid2, ...]``.
@@ -1568,7 +1621,7 @@ class Submit(Expr):
     def attrs(self) -> Mapping[str, Any]:
         """Compiler-internal node metadata (see :attr:`Call.attrs`)."""
 
-    kwargs: Final[Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue]]
+    kwargs: Final[Mapping[str, Any]]
     """Keyword arguments (metadata)."""
 
     @overload
@@ -1597,7 +1650,7 @@ class Submit(Expr):
         op: Op,
         args: Sequence[Expr],
         deps: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         attrs: Mapping[str, object] | Sequence[tuple[str, object]] | None,
         type: Type,
         span: Span,
