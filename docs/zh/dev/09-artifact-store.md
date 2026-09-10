@@ -2,10 +2,10 @@
 
 内部模块 `pypto.jit.artifact_cache` 实现了
 [RFC #2653](https://github.com/hw-native-sys/pypto/issues/2653) 的存储阶段，提供
-manifest 校验、按 key 加锁、不可变发布和私有构建回退。目前尚未接入 JIT 分发。
-[产物身份基础](08-artifact-identity.md) 中完整工具链清单的自动发现、公共缓存配置和预热
-仍属于独立的后续阶段。下文的显式运行时适配器实现设备阶段晋级和只读加载，但不会
-自动启用持久化缓存。
+manifest 校验、按 key 加锁、不可变发布和私有构建回退。
+[显式启用的 JIT 集成](10-jit-cache.md) 将其接入普通编译、执行和预热。
+下文运行时适配器负责设备阶段晋级和只读加载。
+[产物身份](08-artifact-identity.md) 覆盖依赖内容，而非编译器版本字符串。
 
 ## 适配器契约
 
@@ -231,3 +231,6 @@ include 由单独标识的 SDK/工具链提供。空 include 目录可以在发�
 缓存旁路信号。当前显式适配器不会在拒绝打包后自动调用普通编译器。
 受支持产物一旦 ready，即可迁移并
 在原始 extern 源码目录不存在时加载。
+
+`ArtifactBuild.failure` 提供独立于诊断文字的结构化失败状态：`BuildFailure.INVALID`、
+`STORAGE`、`LOCK` 或 `PUBLICATION`。只读未命中时该字段为 `None`。
