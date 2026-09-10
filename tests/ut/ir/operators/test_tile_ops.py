@@ -6421,6 +6421,149 @@ class TestTileScatterUpdateOps:
         assert isinstance(result_type, ir.TileType)
         assert result_type.tile_view is None
 
+    def test_tile_scatter_update_2d_src_rows_must_match_index_size(self):
+        """`index` names b*s rows and `src` supplies one payload each.
+
+        ``ConvertTensorToTileOps`` already enforces this on the way to ``pto.tscatter``,
+        but only as an INTERNAL_CHECK and only for the tensor path — so a directly
+        written `tile.scatter_update` carried the mismatch to codegen, and the operator's
+        own deduction stayed blind to both operands.
+        """
+        span = ir.Span.unknown()
+        input_type = ir.TileType(_const_dims(span, 16, 64), DataType.FP16)
+        index_type = ir.TileType(_const_dims(span, 2, 4), DataType.INT32)  # b*s = 8
+        bad_src = ir.TileType(_const_dims(span, 16, 64), DataType.FP16)  # 16 rows, not 8
+
+        with pytest.raises(ValueError, match=r"2D src must have b\*s rows"):
+            tile.scatter_update(
+                ir.Var("inp", input_type, span),
+                -2,
+                ir.Var("idx", index_type, span),
+                ir.Var("src", bad_src, span),
+            )
+
+    def test_tile_scatter_update_src_width_must_match_input(self):
+        span = ir.Span.unknown()
+        input_type = ir.TileType(_const_dims(span, 16, 64), DataType.FP16)
+        index_type = ir.TileType(_const_dims(span, 2, 4), DataType.INT32)
+        narrow_src = ir.TileType(_const_dims(span, 8, 32), DataType.FP16)  # d=32, not 64
+
+        with pytest.raises(ValueError, match="last dimension must match input"):
+            tile.scatter_update(
+                ir.Var("inp", input_type, span),
+                -2,
+                ir.Var("idx", index_type, span),
+                ir.Var("src", narrow_src, span),
+            )
+
+    def test_tile_scatter_update_4d_src_leading_dims_must_match_index(self):
+        span = ir.Span.unknown()
+        input_type = ir.TileType(_const_dims(span, 4, 4, 1, 64), DataType.BF16)
+        index_type = ir.TileType(_const_dims(span, 2, 4), DataType.INT32)
+        bad_src = ir.TileType(_const_dims(span, 3, 4, 1, 64), DataType.BF16)  # b=3, not 2
+
+        with pytest.raises(ValueError, match=r"leading dimensions must match index's \[b, s\]"):
+            tile.scatter_update(
+                ir.Var("inp", input_type, span),
+                -2,
+                ir.Var("idx", index_type, span),
+                ir.Var("src", bad_src, span),
+            )
+
+    def test_tile_scatter_update_4d_src_axis_2_must_be_the_declared_singleton(self):
+        """Axis 2 is structural, not a data extent.
+
+        Both declared 4D layouts pin it to one -- input ``[blockNum, blockSize, 1, d]``
+        and src ``[b, s, 1, d]`` -- so a non-unit value is not a bigger scatter, it is a
+        shape that means nothing.
+        """
+        span = ir.Span.unknown()
+        input_type = ir.TileType(_const_dims(span, 4, 4, 1, 64), DataType.BF16)
+        index_type = ir.TileType(_const_dims(span, 2, 4), DataType.INT32)
+        bad_src = ir.TileType(_const_dims(span, 2, 4, 2, 64), DataType.BF16)  # axis 2 = 2
+
+        with pytest.raises(ValueError, match=r"4D src's axis 2 must be the singleton"):
+            tile.scatter_update(
+                ir.Var("inp", input_type, span),
+                -2,
+                ir.Var("idx", index_type, span),
+                ir.Var("src", bad_src, span),
+            )
+
+    def test_tile_scatter_update_4d_input_axis_2_must_be_the_declared_singleton(self):
+        """The same defect one operand over -- the input's layout pins axis 2 too."""
+        span = ir.Span.unknown()
+        bad_input = ir.TileType(_const_dims(span, 4, 4, 2, 64), DataType.BF16)  # axis 2 = 2
+        index_type = ir.TileType(_const_dims(span, 2, 4), DataType.INT32)
+        src_type = ir.TileType(_const_dims(span, 2, 4, 1, 64), DataType.BF16)
+
+        with pytest.raises(ValueError, match=r"4D input's axis 2 must be the singleton"):
+            tile.scatter_update(
+                ir.Var("inp", bad_input, span),
+                -2,
+                ir.Var("idx", index_type, span),
+                ir.Var("src", src_type, span),
+            )
+
+    def test_tile_scatter_update_symbolic_extent_is_not_rejected(self):
+        """An undecidable relation is left to the backend rather than refused here.
+
+        The row relation also holds *symbolically* here: `index` is ``[rows, 1]``, so
+        ``b * s`` simplifies back to ``rows`` and the check must not over-reject it.
+        """
+        span = ir.Span.unknown()
+        rows = ir.Var("rows", ir.ScalarType(DataType.INDEX), span)
+        d_a = ir.Var("d_a", ir.ScalarType(DataType.INDEX), span)
+        d_b = ir.Var("d_b", ir.ScalarType(DataType.INDEX), span)
+        one = ir.ConstInt(1, DataType.INDEX, span)
+
+        result = tile.scatter_update(
+            ir.Var("inp", ir.TileType([rows, d_a], DataType.FP16), span),
+            -2,
+            ir.Var("idx", ir.TileType([rows, one], DataType.INT32), span),
+            ir.Var("src", ir.TileType([rows, d_b], DataType.FP16), span),
+        ).type
+        assert isinstance(result, ir.TileType)
+
+    def test_tile_scatter_update_provably_wrong_symbolic_row_count_is_rejected(self):
+        """Provable is not the same as literal.
+
+        Comparing three `ConstInt`s would skip this entirely: `index` is ``[n, 1]`` so
+        ``b * s == n``, and an ``n + 1`` row count is a mismatch the analyzer can settle
+        without knowing ``n``. Proving against the product catches it here rather than
+        letting it reach lowering, where a dynamic dimension surfaces as an unrelated
+        internal-check failure.
+        """
+        span = ir.Span.unknown()
+        n = ir.Var("n", ir.ScalarType(DataType.INDEX), span)
+        d = ir.Var("d", ir.ScalarType(DataType.INDEX), span)
+        one = ir.ConstInt(1, DataType.INDEX, span)
+        n_plus_1 = ir.add(n, one, span)
+
+        with pytest.raises(ValueError, match=r"2D src must have b\*s rows"):
+            tile.scatter_update(
+                ir.Var("inp", ir.TileType([n, d], DataType.FP16), span),
+                -2,
+                ir.Var("idx", ir.TileType([n, one], DataType.INT32), span),
+                ir.Var("src", ir.TileType([n_plus_1, d], DataType.FP16), span),
+            )
+
+    def test_tile_scatter_update_undecidable_symbolic_row_count_is_accepted(self):
+        """Two unrelated symbols say nothing, so the relation stays the backend's call."""
+        span = ir.Span.unknown()
+        n = ir.Var("n", ir.ScalarType(DataType.INDEX), span)
+        m = ir.Var("m", ir.ScalarType(DataType.INDEX), span)
+        d = ir.Var("d", ir.ScalarType(DataType.INDEX), span)
+        one = ir.ConstInt(1, DataType.INDEX, span)
+
+        result = tile.scatter_update(
+            ir.Var("inp", ir.TileType([n, d], DataType.FP16), span),
+            -2,
+            ir.Var("idx", ir.TileType([n, one], DataType.INT32), span),
+            ir.Var("src", ir.TileType([m, d], DataType.FP16), span),
+        ).type
+        assert isinstance(result, ir.TileType)
+
     @pytest.mark.parametrize(
         ("src_dtype", "dim", "match"),
         [
