@@ -3,8 +3,9 @@
 内部模块 `pypto.jit.artifact_cache` 实现了
 [RFC #2653](https://github.com/hw-native-sys/pypto/issues/2653) 的存储阶段，提供
 manifest 校验、按 key 加锁、不可变发布和私有构建回退。目前尚未接入 JIT 分发。
-[产物身份基础](08-artifact-identity.md) 中完整工具链清单的自动发现、运行时加载器集成、
-公共缓存配置和预热仍属于独立的后续阶段。
+[产物身份基础](08-artifact-identity.md) 中完整工具链清单的自动发现、公共缓存配置和预热
+仍属于独立的后续阶段。下文的显式运行时适配器实现设备阶段晋级和只读加载，但不会
+自动启用持久化缓存。
 
 ## 适配器契约
 
@@ -134,3 +135,99 @@ chmod -R a+rX,a-w -- "$CACHE_ROOT/artifacts"
 此层没有在线垃圾回收、诊断索引、全局缓存统计或自动阶段优先级。
 清理必须在全部消费者停止后离线执行。后续集成必须优先选择 ready，再选择 generated，
 并确保对象整个生命周期内所引用的路径始终有效。
+
+## 显式运行时适配器
+
+内部模块 `pypto.runtime._artifact_runtime` 连接已校验的句柄（handle）和编译程序。
+它实现 RFC #2653 的运行时阶段，不是公共缓存配置 API。调用方必须提供完整的
+`ArtifactKey`、匹配的输入快照，以及列出全部必需生成文件的 `ArtifactSpec`。
+生产环境不能使用占位身份摘要。
+
+发布 `GENERATED` 前，构建函数调用 `pypto.runtime._artifact_sources` 中的
+`package_generated_sources(private_directory, build_kind)`，规范化生成配置中的路径，
+并将支持的 extern 依赖打包进私有目录。存储层随后校验并发布这个自包含目录。
+
+```python
+from pypto.runtime._artifact_runtime import bind_artifact, restore_artifact
+
+# generated_handle is a validated ArtifactHandle for this compiled input snapshot.
+# run_directory is a Path outside store.root, owned by this runtime session.
+bind_artifact(compiled, store, generated_handle, run_directory)
+compiled.load()  # Single-chip: promotes if needed, then assembles live callables.
+ready_handle = compiled._artifact_runtime.handle
+
+# A different process may look up the ready key/spec in a read-only ArtifactStore.
+restored = restore_artifact(readonly_store, ready_handle, another_run_directory)
+restored.load()  # Validates metadata and bytes; does not compile or execute.
+```
+
+分布式程序采用相同的绑定和恢复方式，由现有 runner 或 worker 延迟请求全部子 callable。
+上述 `compiled.load()` 是单芯片接口。目前支持单个单芯片构建，或包含芯片子构建的分布式
+父产物。不支持单芯片多 orchestration 父产物，因为现有 `from_dir` 协议无法在没有实时 IR
+的情况下重建该父对象；应分别持久化受支持的子构建。
+
+### 阶段晋级与加载
+
+1. 执行任何生成配置前，按精确 key 和 spec 校验句柄。计算 ready spec，列出父标记、
+   每个子标记、orchestration 二进制和每个 kernel 二进制。Generated spec 必须声明
+   所有必需的芯片配置；声明的文件缺失时存储校验失败。不含 `kernel_config.py` 的
+   辅助目录会被跳过，与普通分布式重放保持一致。
+2. 通过 `ArtifactStore.get_or_build` 查找 `BINARY_READY`。未命中时，将 generated
+   句柄物化到私有目录。加锁顺序是产物 key 锁，再到私有运行时构建锁。
+3. 使用现有运行时编译器完成全部芯片构建。即使旧上下文标记匹配，也跳过继承的可变
+   二进制缓存和源码旁的二进制文件：generated 身份不能证明这些字节有效。
+   记录传给 `CoreCallable.build` 的最终 kernel
+   字节和传给 `ChipCallable.build` 的 orchestration 字节。编译和组装不会在设备上执行；
+   每个私有编译锁释放后，删除其 `cache/` 目录（包括上下文标记和锁文件）及生成源码旁
+   的 `.o`/`.so` 输出。保留源码、配置、extern 输入、二进制 manifest，以及 `prebuilt/`
+   下每份最终二进制的唯一副本。继承的缓存和旁置二进制文件不再纳入 ready spec。
+   只有全部子构建成功后才能发布 ready 产物。
+4. 读取带版本的 `binary_manifest.json`，在构造任何 callable 前校验所有子项。
+   记录包含相对二进制路径、大小、SHA-256 摘要、平台、运行时配置、函数 ID、签名和
+   诊断名称。分布式父标记列出完整的芯片子构建集合。
+5. 从字节重建 callable。Ready 加载不解析 PTO-ISA、不构造编译器、不获取可写缓存锁、
+   不改写头文件、不执行 `kernel_config.py`，也不写二进制上下文标记或 Python 字节码。
+   仍需要与所提供 key 对应的兼容运行时库。
+
+完整身份和负载清单仍以外层存储 manifest 为准。仅有二进制标记不足以绑定句柄。
+绑定或恢复时仅对整个负载计算一次哈希、恢复一次元数据。加载复用已验证的清单来核对
+内层二进制大小和摘要，不再重复计算相同字节的哈希。直接构造的内部 `ArtifactRuntime`
+在首次加载时校验。晋级过程在生成文件复制、新 ready 负载各自的边界上校验；私有回退
+加载直接校验二进制摘要。存储查找校验与绑定校验相互独立。
+校验结果仅供绑定对象的生命周期内复用，不是进程级缓存；所有使用者释放前，发布的文件
+必须始终存在且不变。新的绑定会重新校验。缺失或损坏的句柄在上述边界、执行之前失败。
+适配器不会捕获设备执行错误并重试操作。
+
+存储或发布失败时，适配器在其生命周期内保留可用的私有目录和实时 callable。
+此时 `handle` 仍是 generated 句柄，`directory` 指向私有二进制输出。重叠的晋级请求
+共享存储层的进程内操作，包括私有回退；跨进程私有结果仍按前文说明各自独立。
+私有目录不会自动删除，所有者必须在所有使用者释放后清理。
+
+### 路径、诊断与 extern 输入
+
+绑定保留新编译对象的实时 IR；从持久化元数据恢复时 `program is None`。绑定在注册到
+worker 前仅重设一次源码路径，之后晋级只更新运行时二进制句柄。编译对象的路径和哈希
+保持稳定，适用于 worker 注册表。未绑定的普通 `from_dir` 重放保留原有可变编译行为。
+
+DFX 输出、依赖捕获和泳道转换写入独立的 `run_directory`。并发运行时会话必须各自选择
+独立目录。名称来自二进制记录，生成的 host orchestration 加载不使用 Python 字节码缓存。
+编译对象或 worker 持有引用期间，已发布产物必须保持存在且不变。
+
+Extern 打包支持递归解析的字面量本地 include，保留相对 include 拓扑和显式 include
+目录顺序。源码目录与显式 include 目录的公共根仅解析一次，支持 workspace 或 home
+上游的符号链接；公共根下的符号链接（包括 `..` 遍历之前经过的链接）要求私有编译。
+扫描器移除注释、连接续行，并根据字面量 `#if 0`/`#if 1` 及其 `#elif`/`#else` 结构
+忽略确定不会生效的分支。条件未知时保守扫描所有可能分支，不实现完整 C 预处理器。
+可能生效的宏 include、绝对路径 include 和未解析的引号 include 要求私有编译。
+非 UTF-8 源码按原始字节复制，仅在 include 扫描时使用替换解码。未解析的尖括号
+include 由单独标识的 SDK/工具链提供。空 include 目录可以在发布时消失，对应缺失的
+`-I` 路径仍然有效；`extra_include_dirs=None` 会规范化为空列表。
+其他引用文件的预处理器或汇编构造不在支持范围内。
+调用方必须在发布前建立完整输入身份；打包器不会发现工具链清单，也不会让任意 C++ 构建
+自动成为封闭构建。`pypto.runtime._artifact_sources` 提供专用的 `ValueError` 子类
+`UnsupportedArtifactInput`，用于表示上述打包限制。适配器可以仅捕获此异常，跳过持久化
+发布并对原始输入进行普通私有编译。打包会修改私有暂存树，回退时应丢弃该树。
+文件系统失败、损坏的输入或配置仍作为不同的错误传播，不能把所有 `ValueError` 都当作
+缓存旁路信号。当前显式适配器不会在拒绝打包后自动调用普通编译器。
+受支持产物一旦 ready，即可迁移并
+在原始 extern 源码目录不存在时加载。
