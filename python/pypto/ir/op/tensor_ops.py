@@ -2158,7 +2158,7 @@ def mrgsort_format2(*args: Expr, exhausted: bool = False, span: Span | None = No
 
 def gather(  # noqa: PLR0913
     input: Expr,
-    dim: int | None = None,
+    dim: int | Expr | None = None,
     index: Expr | None = None,
     *,
     mask_pattern: int | None = None,
@@ -2170,19 +2170,37 @@ def gather(  # noqa: PLR0913
     count_dtype: int | DataType | None = None,
     span: Span | None = None,
 ) -> Call:
-    """Gather elements of ``input`` (tensor-level) — index / mask / compare form.
+    """Gather elements of ``input`` — flat / axis / mask / compare form.
 
     The tensor layer keeps a single unified ``gather`` entry point. Based on
     the arguments, it lowers to one of three C++ ops:
 
-    Index form (``dim`` + ``index``) → ``tensor.gather``::
+    Flat form (``index``, no ``dim``) → ``tensor.gather``::
+
+        output = input.reshape(-1)[index]
+
+        Also accepts ``gather(input, index)``. Runtime indices are 2D INT32;
+        shape and valid shape follow ``index``, dtype follows ``input``
+        (FP16/FP32/INT16/INT32). Indices must address valid source elements;
+        negative indexing and bounds checking are unsupported.
+        Contiguous ND GM sources use ``tile.mgather``; static 2D unboxed
+        row-major Vec sources use ``tile.gather`` with managed packing/scratch.
+        On-chip source rows must be 32-byte aligned unless there is only one row.
+        GM operands accept local distributed windows; tile indices must be
+        unboxed row-major Vec. Physical index columns must be positive static
+        multiples of 16 for FP16/INT16, or 8 for FP32/INT32, including single-row
+        tiles. Pad physical storage and use ``set_validshape`` for narrower
+        valid regions, which need not be aligned.
+
+    Axis form (``dim`` + ``index``) → ``tensor.gather``, for example ``dim=1``::
 
         output[b, k] = input[b, index[b, k]]
 
-        MVP limitation: only rank-2 inputs with ``dim == -1`` (or ``rank - 1``).
+        Lowering supports rank-2/rank-3 inputs and any axis, including negative axes.
         ``index`` must be an INT32 tensor, or INT16 when ``input`` is a 16-bit
-        dtype (FP16/INT16); its shape matches ``input`` on every axis except
-        ``dim``. output shape == ``index.shape``, dtype == ``input.dtype``.
+        dtype (FP16/INT16; INT16 indices require A5). Its rank matches ``input``;
+        non-gather extents cannot exceed the source. Output shape == ``index.shape``,
+        dtype == ``input.dtype``.
 
     Mask form (``mask_pattern=<int>``) → ``tensor.gather_mask``: selects columns
         of each row by a fixed hardware mask. Last-dim shrinks by 2 (P0101/P1010)
@@ -2196,9 +2214,11 @@ def gather(  # noqa: PLR0913
         count_dtype`` (per-row match count).
 
     Args:
-        input: Source tensor (TensorType).
-        dim: (index form) Axis along which to gather. Only ``-1`` / ``rank - 1`` accepted in MVP.
-        index: (index form) Index tensor (TensorType, INT32) with the same rank as ``input``.
+        input: Source tensor; flat form also accepts an on-chip Tile.
+        dim: Axis along which to gather; omit for flat indexing. A tensor/tile
+            in this positional slot is interpreted as the flat index.
+        index: Flat form: 2D INT32 tensor/tile. Axis form: tensor with the same
+            rank as ``input`` and the index dtype constraints above.
         mask_pattern: (mask form, keyword-only) Mask pattern selector in [1, 7].
             1=P0101, 2=P1010, 3=P0001, 4=P0010, 5=P0100, 6=P1000, 7=P1111
         output_dtype: (mask form, keyword-only) Optional output dtype with the same
@@ -2217,6 +2237,10 @@ def gather(  # noqa: PLR0913
         Compare form returns a TupleType-result Call.
     """
     actual_span = _get_span_or_capture(span)
+    if isinstance(dim, Expr) and isinstance(dim.type, (_ir_core.TensorType, _ir_core.TileType)):
+        if index is not None:
+            raise ValueError("gather() received indices both positionally and through index")
+        index, dim = dim, None
     is_index = dim is not None or index is not None
     is_mask = mask_pattern is not None
     is_compare = kvalue is not None or cmp_mode is not None or out_cols is not None
@@ -2249,21 +2273,18 @@ def gather(  # noqa: PLR0913
         if count_dtype is not None:
             cmp_kwargs["count_dtype"] = count_dtype
         return _ir_core.create_op_call("tensor.gather_compare", [input, kvalue], cmp_kwargs, actual_span)
-    if not is_index:
+    if index is None:
         raise ValueError(
-            "gather() requires (dim, index) for index form, mask_pattern=<int> for mask form, "
+            "gather() requires index (optionally dim), mask_pattern=<int> for mask form, "
             "or (kvalue=..., cmp_mode=..., out_cols=...) for compare form"
         )
-    if dim is None or index is None:
-        raise ValueError("gather() index form requires both dim and index")
     if output_dtype is not None:
         raise ValueError("gather() output_dtype is only valid for the mask form; use mask_pattern=<int>")
-    if isinstance(dim, _ir_core.ConstInt):
-        dim_val = int(dim.value)
-    elif isinstance(dim, int):
-        dim_val = dim
-    else:
+    if dim is None:
+        return _ir_core.create_op_call("tensor.gather", [input, index], {}, actual_span)
+    if not isinstance(dim, (int, _ir_core.ConstInt)):
         raise TypeError(f"dim must be int or ConstInt, got {type(dim)}")
+    dim_val = int(dim.value) if isinstance(dim, _ir_core.ConstInt) else dim
     return _ir_core.create_op_call("tensor.gather", [input, index], {"dim": dim_val}, actual_span)
 
 
