@@ -25,6 +25,13 @@ from typing import TYPE_CHECKING, Any, TypeGuard
 import torch
 
 from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities
+from pypto._target import (
+    ExecutionMode,
+    _parse_platform,
+    _platform_string,
+    _resolve_target,
+    _warn_deprecated_platform,
+)
 from pypto.backend import BackendType
 from pypto.pypto_core.ir import ParamDirection, Program, Role, level_to_linqu_level
 from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
@@ -41,6 +48,7 @@ from .compiled_program import (
     _meta_error,
     _param_info_to_dict,
     _ParamInfo,
+    _reload_platform,
     _remove_meta,
     _to_torch_dtype,
     _write_debug_runner,
@@ -185,7 +193,9 @@ class DistributedCompiledProgram:
 
     **One-shot dispatch**::
 
-        compiled = ir.compile(MyProgram, platform="a2a3", distributed_config=dc)
+        from pypto.runtime import ExecutionMode
+
+        compiled = ir.compile(MyProgram, execution_mode=ExecutionMode.ONBOARD, distributed_config=dc)
         compiled(host_inputs, host_outputs)   # blocks until all ranks finish
 
     **Persistent dispatch** (repeated launches without re-registering)::
@@ -206,6 +216,7 @@ class DistributedCompiledProgram:
         *,
         backend_type: BackendType = BackendType.Ascend910B,
         platform: str | None = None,
+        execution_mode: ExecutionMode | None = None,
         distributed_config: DistributedConfig | None = None,
         _param_infos: list[_ParamInfo] | None = None,
         _output_indices: list[int] | None = None,
@@ -227,7 +238,11 @@ class DistributedCompiledProgram:
         self._program = program
         self._output_dir = Path(output_dir).resolve()
         self._backend_type = backend_type
-        self._platform = platform or _default_platform(backend_type)
+        self._platform = (
+            platform or _default_platform(backend_type)
+            if execution_mode is None
+            else _platform_string(*_resolve_target(backend_type, execution_mode, platform))
+        )
         self._distributed_config = distributed_config or DistributedConfig()
         self._param_infos = _param_infos
         self._output_indices = _output_indices
@@ -295,6 +310,7 @@ class DistributedCompiledProgram:
         *,
         platform: str | None = None,
         backend_type: BackendType | None = None,
+        execution_mode: ExecutionMode | None = None,
         distributed_config: DistributedConfig | None = None,
     ) -> "DistributedCompiledProgram":
         """Reconstruct a distributed program from an existing ``build_output/`` dir.
@@ -309,11 +325,15 @@ class DistributedCompiledProgram:
             output_dir: A build directory produced by a prior ``ir.compile`` of
                 a distributed (L3+) program. Must contain
                 ``distributed_meta.json``.
-            platform: Override the persisted platform (e.g. swap ``a2a3sim`` →
+            platform: Deprecated; use backend_type and execution_mode.
+                Override the persisted platform (e.g. swap ``a2a3sim`` →
                 ``a2a3`` to replay on hardware). ``None`` keeps the persisted
                 value.
+            execution_mode: Override the execution mode, retaining the persisted
+                backend unless backend_type is also supplied.
             backend_type: Override the persisted codegen backend. ``None`` keeps
-                the persisted value.
+                the persisted value. An override retains the saved execution mode
+                unless execution_mode or a legacy platform is also supplied.
             distributed_config: Override the persisted run config (e.g. to
                 replay on a different set of ``device_ids``). ``None`` rebuilds
                 the :class:`DistributedConfig` recorded at compile time.
@@ -328,6 +348,8 @@ class DistributedCompiledProgram:
             ValueError: ``distributed_meta.json`` is unreadable, malformed, or
                 records a ``schema`` version incompatible with this pypto build.
         """
+        if platform is not None:
+            _warn_deprecated_platform("DistributedCompiledProgram.from_dir")
         meta_path = Path(output_dir).resolve() / _DISTRIBUTED_META_FILENAME
         if not meta_path.exists():
             raise FileNotFoundError(
@@ -340,6 +362,13 @@ class DistributedCompiledProgram:
         # of an enum member -- surfaces as one ValueError naming the file and
         # the recompile fix, rather than whichever internal exception it raised.
         meta = _load_meta(meta_path, filename=_DISTRIBUTED_META_FILENAME, schema=_META_SCHEMA)
+        platform = _reload_platform(
+            meta["backend_type"],
+            meta["platform"],
+            backend_type=backend_type,
+            execution_mode=execution_mode,
+            platform=platform,
+        )
         param_infos = meta["param_infos"]
         output_indices = [i for i, p in enumerate(param_infos) if p.direction == ParamDirection.Out]
         # ``return_types`` contents are never inspected at runtime — only the
@@ -371,6 +400,16 @@ class DistributedCompiledProgram:
     def program(self) -> Program | None:
         """Post-pass IR, or ``None`` for a program reconstructed via :meth:`from_dir`."""
         return self._program
+
+    @property
+    def backend_type(self) -> BackendType:
+        """Code generation backend stored with this artifact."""
+        return self._backend_type
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """Simulator or onboard execution for this artifact."""
+        return _parse_platform(self._platform)[1]
 
     @property
     def platform(self) -> str:

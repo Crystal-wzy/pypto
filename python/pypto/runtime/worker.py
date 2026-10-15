@@ -20,16 +20,16 @@ and call the returned :class:`RegistrationHandle`.
 
 Example — implicit reuse::
 
-    from pypto.runtime import ChipWorker, RunConfig
+    from pypto.runtime import ChipWorker, ExecutionMode, RunConfig
 
-    with ChipWorker(config=RunConfig(platform="a2a3")):
+    with ChipWorker(config=RunConfig(execution_mode=ExecutionMode.ONBOARD)):
         out1 = Add(*tensors1)   # uses active ChipWorker
         out2 = Mul(*tensors2)   # reuses same ChipWorker
     # close() runs once on exit
 
 Example — explicit dispatch::
 
-    w = ChipWorker(config=RunConfig(platform="a2a3"))
+    w = ChipWorker(config=RunConfig(execution_mode=ExecutionMode.ONBOARD))
     try:
         out = w.run(compiled_add, a, b)
         h = w.register(compiled_mul)        # pre-register hot path
@@ -48,6 +48,8 @@ import weakref
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
+from pypto._target import ExecutionMode
+from pypto.backend import BackendType
 from pypto.pypto_core.passes import RuntimeKind, runtime_kind_to_name
 
 from .runner import RunConfig
@@ -458,6 +460,16 @@ class ChipWorker(Worker):
         return self._level
 
     @property
+    def backend_type(self) -> BackendType:
+        """Target architecture selected by this worker's configuration."""
+        return self._config.backend_type
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """Simulator or onboard execution."""
+        return self._config.execution_mode
+
+    @property
     def platform(self) -> str:
         return self._config.platform
 
@@ -539,7 +551,8 @@ class ChipWorker(Worker):
             raise ValueError(
                 f"CompiledProgram.platform={compiled.platform!r} does not match "
                 f"ChipWorker.platform={self.platform!r}. Compile for the matching "
-                f"platform, or construct ChipWorker(config=RunConfig(platform={compiled.platform!r}))."
+                "platform, or construct ChipWorker(config=RunConfig("
+                "backend_type=compiled.backend_type, execution_mode=compiled.execution_mode))."
             )
         if compiled.runtime_name != self._runtime:
             raise ValueError(
