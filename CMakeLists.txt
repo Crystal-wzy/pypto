@@ -270,8 +270,8 @@ set(PYPTO_SOURCES
     src/ir/transforms/lower_pipeline_loops_pass.cpp
     src/ir/transforms/lower_pipeline_to_slots_pass.cpp
     src/ir/transforms/canonicalize_io_order_pass.cpp
-    src/ir/transforms/structural_equal.cpp
-    src/ir/transforms/structural_hash.cpp
+    src/ir/transforms/structural_comparison.cpp
+    src/ir/transforms/utils/signature_symbols.cpp
     src/ir/transforms/utils/acc_init_builder.cpp
     src/ir/transforms/utils/narrow_loop_carry.cpp
     src/ir/transforms/utils/buffer_root_collector.cpp

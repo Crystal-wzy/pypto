@@ -463,7 +463,7 @@ class TestHashTypeLadderParity:
         assert not missing, (
             f"Type classes with no structural_hash coverage: {sorted(missing)}. "
             "Add a factory to _TYPE_FACTORIES, and a matching branch to "
-            "HashType in src/ir/transforms/structural_hash.cpp."
+            "DispatchType in src/ir/transforms/structural_comparison.cpp."
         )
 
     def test_array_type_is_usable_as_a_dict_key(self):
@@ -574,13 +574,8 @@ class TestHashTypeLadderParity:
             rhs, enable_auto_mapping=True
         )
 
-    def test_auto_mapped_window_buffers_of_different_size_hash_together(self):
-        """Regression: differing buffer fields must not split the hash.
-
-        Under auto-mapping these two types are ``structural_equal`` (EqualVar
-        maps the buffers), so they must hash alike even though the buffers
-        differ in size and staging flags.
-        """
+    def test_auto_mapping_preserves_window_buffer_fields(self):
+        """Mapping storage identities must still compare sizes and staging flags."""
         first = ir.DistributedTensorType(
             _dims(64),
             DataType.FP32,
@@ -597,8 +592,8 @@ class TestHashTypeLadderParity:
                 _span(),
             ),
         )
-        assert ir.structural_equal(first, second, enable_auto_mapping=True)
-        assert ir.structural_hash(first, enable_auto_mapping=True) == ir.structural_hash(
+        assert not ir.structural_equal(first, second, enable_auto_mapping=True)
+        assert ir.structural_hash(first, enable_auto_mapping=True) != ir.structural_hash(
             second, enable_auto_mapping=True
         )
 
@@ -685,6 +680,60 @@ class TestHashTypeLadderParity:
         assert isinstance(ir.structural_hash(param_type), int)
         assert isinstance(hash(param_type), int)
         assert isinstance(ir.structural_hash(Mod), int)
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("ordinary_first", [False, True])
+def test_loop_var_dtype_remains_exact_with_shared_constants(reuse, ordinary_first):
+    span = ir.Span.unknown()
+
+    def build(dtype):
+        i = ir.Var("i", ir.ScalarType(dtype), span)
+        one = ir.ConstInt(1, dtype, span)
+        ordinary = ir.EvalStmt(one, span)
+        loop = ir.ForStmt(
+            i,
+            ir.ConstInt(0, dtype, span),
+            one,
+            one if reuse else ir.ConstInt(1, dtype, span),
+            [],
+            ir.EvalStmt(i, span),
+            [],
+            span,
+        )
+        return ir.SeqStmts([ordinary, loop] if ordinary_first else [loop, ordinary], span)
+
+    lhs, rhs = build(DataType.INDEX), build(DataType.INT64)
+    assert not ir.structural_equal(lhs, rhs)
+    assert ir.structural_hash(lhs) != ir.structural_hash(rhs)
+
+
+@pytest.mark.parametrize("type_kind", ["tensor", "tuple"])
+@pytest.mark.parametrize("auto_mapping", [False, True])
+def test_repeated_variable_with_large_type(type_kind, auto_mapping):
+    """Repeated uses preserve identity and share the complete variable hash."""
+    span = ir.Span.unknown()
+    size = 1024
+    scalar = ir.ScalarType(DataType.INT64)
+    if type_kind == "tensor":
+        shape = [ir.ConstInt(i + 1, DataType.INDEX, span) for i in range(size)]
+        type_ = ir.TensorType(shape, DataType.FP32)
+    else:
+        type_ = ir.TupleType([ir.TupleType([scalar, scalar])] * size)
+    variable = ir.Var("value", type_, span)
+    renamed = ir.Var("renamed", type_, span) if auto_mapping else variable
+    left = ir.SeqStmts([ir.EvalStmt(variable, span) for _ in range(size)], span)
+    right = ir.SeqStmts([ir.EvalStmt(renamed, span) for _ in range(size)], span)
+    assert ir.structural_equal(left, right, enable_auto_mapping=auto_mapping)
+    assert ir.structural_hash(left, enable_auto_mapping=auto_mapping) == ir.structural_hash(
+        right, enable_auto_mapping=auto_mapping
+    )
+    other = ir.Var("other", type_, span)
+    distinct = ir.SeqStmts([*left.stmts[:-1], ir.EvalStmt(other, span)], span)
+    assert not ir.structural_equal(left, distinct, enable_auto_mapping=auto_mapping)
+    assert ir.structural_hash(left, enable_auto_mapping=auto_mapping) != ir.structural_hash(
+        distinct, enable_auto_mapping=auto_mapping
+    )
 
 
 if __name__ == "__main__":
