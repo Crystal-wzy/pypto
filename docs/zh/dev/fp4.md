@@ -34,6 +34,51 @@ nibble 单位，使多行 pitch 与 Tile / pto-isa 一致。在 `FP4E2M1X2` 上�
 或在无自动打包时用逻辑 `pl.FP4` 多行 ND，可能导致 GM 行 stride 错位——见 issue
 [#2754](https://github.com/hw-native-sys/pypto/issues/2754)。
 
+## 通过 UB alias 解码 UINT8 carrier（Ascend950）
+
+GM 保持 UINT8 打包字节，在 UB 内使用零拷贝 FP4E2M1X2 视图（zero-copy view）：
+
+```python
+import pypto.language as pl
+
+
+@pl.jit(auto_scope=False)
+def decode_bytes(
+    packed: pl.Tensor[[32, 256], pl.UINT8],
+    output: pl.Out[pl.Tensor[[32, 512], pl.BF16]],
+):
+    with pl.spmd(1):
+        row = pl.tile.get_block_idx() * 32
+        payload = pl.tile.load(packed, [row, 0], [32, 256])
+        fp4 = pl.reinterpret_view(payload, pl.FP4E2M1X2)
+        decoded = pl.cast(fp4, pl.BF16)
+        pl.tile.store(decoded, [row, 0], output)
+    return output
+```
+
+`payload` 与 `fp4` 的 carrier shape 都是 `[32,256]`，在同一 UB 地址共享
+8,192 字节。数值 cast 将末轴展开为新的 BF16 `[32,512]` tile，并使用原生
+`TCVT`。GM 输入仍采用 UINT8 字节寻址（本例为 `row * 256`）；不会生成 FP4 GM
+partition 或软件 nibble 解码序列。
+
+alias 仅接受 UINT8 → FP4E2M1X2，要求二维 packed row-major Vec tile、
+`slayout=none_box`、无显式 stride，且 tile `start_offset` 为零。显式 `shape`
+必须与源 shape 完全相同。carrier `valid_shape` 保留，随后 cast 展开其末轴。
+逆向 alias、逻辑 FP4 alias、tensor alias 及通过此 alias 改变 shape 均被拒绝。
+GM load 可使用非零偏移；它与 UB tile 的 `start_offset` 不同。
+
+源 tile 必须具有显式地址的内存引用（MemRef），其字节跨度必须等于静态 carrier
+元素数。非连续 UB 列切片（包括其 alias 和 reshape）以及 `tile.tpop_from_aic`
+等无 MemRef 的输入，会在生成 FP4 转换前被拒绝。请直接从 UINT8 GM 加载所需窗口，
+得到连续 UB tile 后再创建 alias。包括中间视图在内，alias 的 UB 字节偏移必须
+为静态值；GM load 仍可使用运行时偏移。
+
+**PTOAS 0.65 足以支持 PYPTO 和 DSA_RP 内存规划器**：两者生成有显式地址的
+类型 alias，并通过 A5 逐位测试。此 alias 会拒绝 PTOAS 内存规划器，因为 0.65
+的 `pto.treshape` 不支持 packed FP4。其他 reinterpret-view dtype 保持原有
+规划器支持。本路径不修复通用 typed FP4 GM partition 偏移、不引入 PackFp4、
+不增加 tensor alias。
+
 ## Cast 策略（Ascend950）
 
 `LegalizeTileCast` 对 FP4 族如下处理：
@@ -90,6 +135,7 @@ def fp4x2_to_fp8(
 | 手写 `pl.FP4E2M1X2` | ✅ | packed 路径的首选前端；**仅 ND** |
 | 无 PackFp4 的逻辑 `pl.FP4` | ⚠️ | Prefer Warning；A5 in-core 仍支持逻辑 FP4，并与 FP4E2M1X2 并存 |
 | GM ExpandPackedFp4\*（carrier→nibble） | ✅ | `make_tensor_view` / partition 末轴（ND） |
+| UINT8 → FP4E2M1X2 UB alias | ✅ | 二维 packed row-major Vec；carrier shape 不变；仅 PYPTO / DSA_RP |
 | `FP4E2M1X2` ↔ BF16 cast | ✅ | 静默原生 hop；结果 stride 重建为连续 |
 | `FP4E2M1X2` → FP8\* cast | ⚠️ | Warning；更推荐 LUT / 主机 |
 | `FP4` ↔ `FP4E2M1X2` cast | ❌ | 拒绝 |

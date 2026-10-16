@@ -38,6 +38,57 @@ pto-isa. Using logical widths on `FP4E2M1X2` (or logical `pl.FP4` multi-row ND
 without automatic pack) can mis-size GM row strides — see issue
 [#2754](https://github.com/hw-native-sys/pypto/issues/2754).
 
+## Decode a UINT8 carrier through a UB alias (Ascend950)
+
+Keep packed bytes as UINT8 in GM, then use a zero-copy FP4E2M1X2 view in UB:
+
+```python
+import pypto.language as pl
+
+
+@pl.jit(auto_scope=False)
+def decode_bytes(
+    packed: pl.Tensor[[32, 256], pl.UINT8],
+    output: pl.Out[pl.Tensor[[32, 512], pl.BF16]],
+):
+    with pl.spmd(1):
+        row = pl.tile.get_block_idx() * 32
+        payload = pl.tile.load(packed, [row, 0], [32, 256])
+        fp4 = pl.reinterpret_view(payload, pl.FP4E2M1X2)
+        decoded = pl.cast(fp4, pl.BF16)
+        pl.tile.store(decoded, [row, 0], output)
+    return output
+```
+
+`payload` and `fp4` both have carrier shape `[32,256]` and occupy the same
+8,192 bytes at the same UB address. The numerical cast expands the last axis
+and writes a fresh BF16 `[32,512]` tile through native `TCVT`. GM input addressing
+continues to use UINT8 byte offsets (`row * 256` for this shape); there is no
+FP4 GM partition and no software nibble-decoding sequence.
+
+The alias accepts only UINT8 → FP4E2M1X2, 2D packed row-major Vec tiles with
+`slayout=none_box`, no explicit strides, and zero tile `start_offset`. An
+explicit `shape` must match the source shape exactly. Carrier `valid_shape`
+is preserved; the subsequent cast expands its last axis. Reverse aliases,
+logical FP4 aliases, tensor aliases, and reshaping through this alias are
+rejected. GM load offsets may be nonzero; they are distinct from a UB tile's
+`start_offset`.
+
+The source must have an address-backed MemRef whose byte span equals the
+static carrier element count. Noncontiguous UB column slices (including aliases
+and reshapes of them) and MemRef-less inputs such as `tile.tpop_from_aic` are
+rejected before emitting the FP4 conversion. Load the desired window directly
+from UINT8 GM into a dense UB tile instead. The alias also requires a static UB
+byte offset, including through intermediate views; a GM load may still use
+runtime offsets.
+
+PTOAS **0.65 is sufficient with PYPTO and DSA_RP memory planning**. Both emit
+address-backed typed aliases and pass bitwise A5 tests. The PTOAS memory planner
+is rejected for this alias: its `pto.treshape` primitive rejects packed FP4 in
+0.65. Other reinterpret-view dtypes retain their existing planner support.
+This path does not fix generic typed-FP4 GM partition offsets, introduce
+PackFp4, or add tensor aliasing.
+
 ## Cast policy (Ascend950)
 
 `LegalizeTileCast` treats the FP4 family as follows:
@@ -94,6 +145,7 @@ Legend: ✅ supported · ⚠️ partial / Warning · ❌ unsupported · ⏳ not 
 | Hand-written `pl.FP4E2M1X2` | ✅ | Preferred frontend for packed paths; **ND only** |
 | Logical `pl.FP4` without PackFp4 | ⚠️ | Prefer warning; A5 in-core still supports legacy logical FP4 alongside FP4E2M1X2 |
 | GM ExpandPackedFp4\* (carrier→nibble) | ✅ | `make_tensor_view` / partition last axis (ND) |
+| UINT8 → FP4E2M1X2 UB alias | ✅ | 2D packed row-major Vec; same carrier shape; PYPTO / DSA_RP only |
 | `FP4E2M1X2` ↔ BF16 cast | ✅ | Silent native hop; result strides rebuilt contiguous |
 | `FP4E2M1X2` → FP8\* cast | ⚠️ | Warning; prefer LUT / host |
 | `FP4` ↔ `FP4E2M1X2` cast | ❌ | Rejected |
