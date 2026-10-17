@@ -40,6 +40,7 @@
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/result_alias_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
@@ -51,7 +52,7 @@ namespace ir {
 namespace {
 
 // =============================================================================
-// Cycle detection in the Inline → Inline call graph
+// Cycle detection and callee-first order in the Inline → Inline call graph
 // =============================================================================
 
 class CalledInlineCollector : public IRVisitor {
@@ -76,7 +77,8 @@ class CalledInlineCollector : public IRVisitor {
   const std::unordered_set<std::string>& inline_names_;
 };
 
-void DetectInlineCycles(const std::unordered_map<std::string, FunctionPtr>& inline_fns) {
+std::vector<std::string> InlineExpansionOrder(
+    const std::unordered_map<std::string, FunctionPtr>& inline_fns) {
   std::unordered_set<std::string> inline_names;
   for (const auto& [n, _] : inline_fns) inline_names.insert(n);
 
@@ -91,6 +93,7 @@ void DetectInlineCycles(const std::unordered_map<std::string, FunctionPtr>& inli
   std::unordered_map<std::string, Color> color;
   for (const auto& [n, _] : inline_fns) color[n] = Color::White;
   std::vector<std::string> stack;
+  std::vector<std::string> order;
 
   std::function<void(const std::string&)> dfs = [&](const std::string& u) {
     color[u] = Color::Gray;
@@ -110,11 +113,13 @@ void DetectInlineCycles(const std::unordered_map<std::string, FunctionPtr>& inli
     }
     stack.pop_back();
     color[u] = Color::Black;
+    order.push_back(u);
   };
 
   for (const auto& [n, _] : inline_fns) {
     if (color.at(n) == Color::White) dfs(n);
   }
+  return order;
 }
 
 // =============================================================================
@@ -205,6 +210,105 @@ struct SplicedInlineBody {
 };
 
 using InlineFunctionMap = std::unordered_map<std::string, FunctionPtr>;
+
+struct InlineParamBindings {
+  std::unordered_set<const Var*> rebound;
+  std::unordered_set<const Var*> local_bindings;
+};
+
+using InlineParamBindingMap = std::unordered_map<std::string, InlineParamBindings>;
+
+// Direct substitution at def-sites is safe only while a shaped parameter keeps
+// naming its own storage. If any definition can change that binding, use one
+// callee-local handle for the entire call, initialized before its control flow.
+// Writes through that handle still alias the argument's storage; value-producing
+// assignments and loop/branch results cannot retarget the caller's variable.
+// Collect this alongside the existing def/use walk, without per-param scans.
+class InlineParamDefCollector : public var_collectors::VarDefUseCollector {
+ public:
+  explicit InlineParamDefCollector(const std::vector<VarPtr>& params) {
+    for (const auto& param : params) {
+      params_.insert(param.get());
+      aliases_.try_emplace(param.get());
+    }
+  }
+
+  // Alias edges are deliberately undirected: a mutable alias may change on a
+  // later loop iteration or in another branch. Only a component whose every
+  // definition preserves one parameter's storage permits direct substitution.
+  // One graph walk handles cycles and backedges in O(nodes + alias edges).
+  std::unordered_set<const Var*> LocalBindings() const {
+    std::unordered_set<const Var*> visited;
+    std::unordered_set<const Var*> result;
+    for (const auto& [start, edges] : aliases_) {
+      if (!visited.insert(start).second) continue;
+      std::vector<const Var*> pending{start};
+      std::vector<const Var*> params;
+      bool changes_value = false;
+      while (!pending.empty()) {
+        const Var* var = pending.back();
+        pending.pop_back();
+        if (params_.count(var)) params.push_back(var);
+        changes_value |= value_defs_.count(var) > 0 || (params_.count(var) == 0 && var_defs.count(var) == 0);
+        for (const Var* source : aliases_.at(var)) {
+          if (visited.insert(source).second) pending.push_back(source);
+        }
+      }
+      if (changes_value || params.size() > 1) result.insert(params.begin(), params.end());
+    }
+    return result;
+  }
+
+ protected:
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    ExprPtr source = op->value_;
+    if (auto call = As<Call>(source)) {
+      auto index = ResultAliasedArgIndex(call);
+      source = index ? call->args_[*index] : nullptr;
+    }
+    auto source_var = AsVarLike(source);
+    aliases_.try_emplace(op->var_.get());
+    if (source_var) {
+      aliases_[op->var_.get()].push_back(source_var.get());
+      aliases_[source_var.get()].push_back(op->var_.get());
+    } else {
+      // Submit results (tuple projections) and unknown calls conservatively
+      // require a local handle; they are not converted into ordinary Calls.
+      value_defs_.insert(op->var_.get());
+    }
+    VarDefUseCollector::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ForStmtPtr& op) override {
+    RecordResults(op->return_vars_);
+    RecordResults(op->iter_args_);
+    VarDefUseCollector::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    RecordResults(op->return_vars_);
+    RecordResults(op->iter_args_);
+    VarDefUseCollector::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfStmtPtr& op) override {
+    RecordResults(op->return_vars_);
+    VarDefUseCollector::VisitStmt_(op);
+  }
+
+ private:
+  template <typename VarPtrT>
+  void RecordResults(const std::vector<VarPtrT>& vars) {
+    for (const auto& var : vars) {
+      aliases_.try_emplace(var.get());
+      value_defs_.insert(var.get());
+    }
+  }
+
+  std::unordered_set<const Var*> params_;
+  std::unordered_set<const Var*> value_defs_;
+  std::unordered_map<const Var*, std::vector<const Var*>> aliases_;
+};
 
 // Conflicting argument extents may leave a callee dimension unbound. Reject it
 // only if it survives cloning; a helper using just the actual arguments remains
@@ -402,9 +506,9 @@ class VarUseCollector : public IRVisitor {
 
 // Transfer an inline call-site's ``kAttrDumpVars`` onto the spliced callee body.
 //
-// The dump entries are caller arg Vars; ``CloneInlineBody`` has already
-// substituted each in for its matching callee param, so a tagged arg consumed
-// inside the callee now appears verbatim in the spliced body. Two carriers are
+// The dump entries include caller arg Vars and any local handles introduced
+// for them by ``CloneInlineBody``. Transfer runs before recursively expanding
+// nested inline calls, so each call can remap its own bindings. Two carriers are
 // stamped (both round-trip and are tracked by Var identity downstream):
 //
 //   * Dispatch scopes (``pl.at`` / ``pl.spmd`` / ``pl.cluster`` / ``pl.graph``)
@@ -412,8 +516,8 @@ class VarUseCollector : public IRVisitor {
 //     the same scope-level carrier ``pl.dump_tag`` seeds at parse, printed back
 //     as each construct's ``dumps=``. The outliner later maps it onto the
 //     synthesised dispatch.
-//   * Nested cross-function (``GlobalVar``) Calls that take a tagged arg get it
-//     merged into the Call's ``kAttrDumpVars``. This is what makes a tag survive
+//   * Nested cross-function (``GlobalVar``) Calls and Submits that take a tagged
+//     arg get it merged into their ``kAttrDumpVars``. This makes a tag survive
 //     *multi-level* inlining: when the callee itself just forwards the arg into
 //     a deeper ``self.foo(...)`` (no scope of its own consumes it), the tag
 //     rides that Call so the next inline iteration (or the final dispatch, if
@@ -439,23 +543,38 @@ class InlineDumpVarTransfer : public IRMutator {
   // a dump mark off it (and ``pl.split_aiv`` has no ``dumps=`` to print one as).
   // The enclosing InCore scope carries the mark instead.
 
-  ExprPtr VisitExpr_(const CallPtr& op) override {
+  ExprPtr VisitExpr_(const CallPtr& op) override { return AttachCall(op); }
+  ExprPtr VisitExpr_(const SubmitPtr& op) override { return AttachCall(op); }
+
+ private:
+  template <typename CallT>
+  ExprPtr AttachCall(const std::shared_ptr<const CallT>& op) {
     // Recurse first so nested args (this pass runs pre-flatten, so a call arg
-    // may itself be a dispatch Call) are mutated before we stamp the attr.
+    // may itself be a dispatch Call) and Submit deps are visited before stamping.
+    // MutableCopy preserves the Call/Submit kind and all launch fields.
     auto mutated_expr = IRMutator::VisitExpr_(op);
-    auto mutated_call = As<Call>(mutated_expr);
+    auto mutated_call = As<CallT>(mutated_expr);
     // Only cross-function dispatches carry a round-trippable dump attr; skip
     // builtin tile/tensor ops (OpExpr callee).
     if (!mutated_call || !As<GlobalVar>(mutated_call->op_)) return mutated_expr;
-    auto existing = mutated_call->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
+    auto existing = mutated_call->template GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
     auto merged = Merge(existing, ArgVarSet(mutated_call->args_));
     if (!Changed(existing, merged)) return mutated_expr;
+    // Dispatch dump attrs use positional-argument order in the parser and
+    // printer. Preserve every selection while retaining that roundtrip order.
+    std::unordered_set<const Var*> selected;
+    for (const auto& var : merged) selected.insert(var.get());
+    merged.clear();
+    for (const auto& arg : mutated_call->args_) {
+      if (auto var = AsVarLike(arg); var && selected.count(var.get())) {
+        merged.push_back(var);
+      }
+    }
     auto result = MutableCopy(mutated_call);
     result->attrs_ = WithDumpVarsAttr(mutated_call->attrs_, std::move(merged));
     return result;
   }
 
- private:
   template <typename ScopeT>
   StmtPtr Attach(const std::shared_ptr<const ScopeT>& op) {
     // Recurse first so nested scopes / dispatch calls also receive their tags.
@@ -604,8 +723,9 @@ class NestedInlineCallHoister : public IRMutator {
 class InlineCallsMutator : public IRMutator {
  public:
   InlineCallsMutator(const std::unordered_map<std::string, FunctionPtr>& inline_fns,
-                     const FunctionPtr& caller, const InlineFunctionMap& functions)
-      : inline_fns_(inline_fns), functions_(functions) {
+                     const FunctionPtr& caller, const InlineFunctionMap& functions,
+                     const InlineParamBindingMap& param_bindings)
+      : inline_fns_(inline_fns), functions_(functions), param_bindings_(param_bindings) {
     // Signature dimensions are in scope throughout the caller, including when
     // a particular inline call receives only locally allocated buffers.
     for (const auto& param : caller->params_) {
@@ -691,7 +811,7 @@ class InlineCallsMutator : public IRMutator {
     for (const auto& stmt : op->stmts_) {
       // Pull nested inline calls onto statements of their own first; SpliceHoisted
       // then treats each as an ordinary call site, so a hoist and the splice it
-      // enables land in the same fixpoint iteration.
+      // enables land in the same traversal.
       if (auto hoisted = HoistNestedInlineCalls(stmt)) {
         new_stmts.push_back(SpliceHoisted(*hoisted, stmt->span_));
         any_changed = true;
@@ -849,33 +969,35 @@ class InlineCallsMutator : public IRMutator {
   //      propagate types using the same mappings as subsequent caller uses.
   //   4. Split it into pre-return statements and trailing return values;
   //      reject any non-trailing return.
-  SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<ExprPtr>& args) {
+  SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
+                                    std::vector<VarPtr> dump_vars) {
     INTERNAL_CHECK_SPAN(callee->params_.size() == args.size(), callee->span_)
         << "Internal error: inline call to '" << callee->name_ << "' has " << args.size()
         << " argument(s) but callee expects " << callee->params_.size()
         << " (parser/type-checker should have caught arity mismatch before InlineFunctions)";
 
-    var_collectors::VarDefUseCollector def_collector;
-    def_collector.VisitStmt(callee->body_);
+    // Callee-first preprocessing caches alias classification on expanded bodies,
+    // but materialization still needs every syntactic def in the original body.
+    // Clone that original below so types/dump tags flow through nested calls.
+    const auto& bindings = param_bindings_.at(callee->name_);
 
     // 1. Build the seed substitution map for DeepClone:
     //    - Each param Var → its actual-arg Expr. The same substitution is
     //      consulted at both use-sites and def-sites of the param, so a
     //      rebinding `out = pl.assemble(out, ...)` where `out` is a param
     //      becomes `q_out = pl.assemble(q_out, ...)` when the actual arg is
-    //      the Var `q_out` (the natural pre-SSA in-place semantics for
-    //      pl.Out, tensor / tile and Array parameters).
+    //      the Var `q_out` and the shaped binding is proven to keep that
+    //      storage. Array and explicit scalar output conventions are preserved.
     //    - Some actual args are instead bound to a fresh Var ahead of the body,
     //      and that Var is substituted — exactly the IR the parser emits when
     //      the caller names the argument itself (`cr = c[r]; f(x, cr)`):
     //        * A rebound param whose arg is not an assignable Var (a slice
     //          `c[r]`, an IterArg, a computed scalar). Substituting it would put
     //          that Expr on the LHS of the rebinding.
-    //        * A rebound pass-by-value param — a plain scalar that is neither
-    //          `pl.Out` nor `pl.InOut`. Substituting it at the def-site would
-    //          splice the callee's `n = n + 1` onto the caller's own Var, so
-    //          every later read of the caller's argument would see the callee's
-    //          update.
+    //        * A rebound plain scalar, or a tensor / tile whose binding may
+    //          change. The local handle preserves storage writes without
+    //          splicing `t = add(t, t)` onto the caller's own Var. It is bound
+    //          before the body so SSA carries it through branches and loops.
     //        * A computed tensor / tile arg (a `Call`, e.g. `a[r]`). Python
     //          evaluates it once at the call; substituting it would re-evaluate
     //          it at every use, inside the callee's `pl.spmd` / `pl.pipeline` /
@@ -887,43 +1009,40 @@ class InlineCallsMutator : public IRMutator {
     //      using the same binding rules as cross-function return-type deduction.
     auto seed = DeduceCallTypeBindings(callee->params_, args);
     std::vector<StmtPtr> arg_bindings;
+    std::unordered_set<const Var*> tagged_args;
+    for (const auto& var : dump_vars) {
+      if (var) tagged_args.insert(var.get());
+    }
     for (size_t i = 0; i < callee->params_.size(); ++i) {
       const VarPtr& param = callee->params_[i];
       ExprPtr actual = args[i];
       const TypePtr actual_type = actual->GetType();
       // The same assignment targets IRMutator::VisitStmt_(AssignStmtPtr) accepts.
       const bool assignable = As<Var>(actual) || As<MemRef>(actual);
-      const bool rebound = def_collector.var_defs.count(param.get()) > 0;
+      const bool rebound = bindings.rebound.count(param.get()) > 0;
       const bool computed_shaped =
           As<Call>(actual) && actual_type && (AsTensorTypeLike(actual_type) || As<TileType>(actual_type));
-      // Whether a rebinding of this param is pass-by-value, as in Python, and so
-      // must NOT land on the caller's own Var. Only a plain scalar is: every
-      // other param kind names storage the callee rebinds in place.
-      //   * A tensor / tile / Array param is a handle. Its rebinding IS the
-      //     in-place update — `c[...] = v` parses as
-      //     `c = pl.tensor.assemble(c, ...)` and `a[i] = v` as
-      //     `a = pl.array.update_element(a, i, v)` — so the caller must see it.
-      //     `@pl.jit.inline` strips Out/InOut from shaped params for exactly
-      //     this reason, so direction alone cannot be the test. Binding a
-      //     temporary here is also not merely redundant: it emits a bare
-      //     `arr_inline0 = arr` alias, and orchestration codegen can only
-      //     declare an array Var from `array.create` or an alias onto a backing
-      //     array, never from its type.
-      //   * An explicit `pl.Out` / `pl.InOut` scalar is the author opting in.
-      // Substituting a pass-by-value arg at the *def*-site would splice the
-      // callee's `n = n + 1` onto the caller's Var and silently change every
-      // later read of it.
+      // Scalar value rebinding and shaped-handle rebinding stay callee-local.
+      // Direction alone cannot classify the latter: @pl.jit.inline strips
+      // Out/InOut, and even an explicitly annotated output can be rebound to
+      // a new value without writing its old storage. Array's existing update
+      // convention is separate: a bare array alias is not codegen-declarable.
       const ParamDirection direction = callee->param_directions_[i];
       const TypePtr param_type = param->GetType();
-      const bool pass_by_value_rebind = param_type && As<ScalarType>(param_type) &&
-                                        direction != ParamDirection::Out &&
-                                        direction != ParamDirection::InOut;
+      const bool scalar_value_rebind = As<ScalarType>(param_type) && direction != ParamDirection::Out &&
+                                       direction != ParamDirection::InOut;
+      const bool shaped_value_rebind = (AsTensorTypeLike(param_type) || As<TileType>(param_type)) &&
+                                       bindings.local_bindings.count(param.get()) > 0;
+      const bool pass_by_value_rebind = scalar_value_rebind || shaped_value_rebind;
       if ((rebound && (!assignable || pass_by_value_rebind)) || computed_shaped) {
         INTERNAL_CHECK_SPAN(actual_type, actual->span_)
             << "Internal error: argument bound at the call site for inline parameter '" << param->name_hint_
             << "' of '" << callee->name_ << "' has no type";
         auto bound = std::make_shared<Var>(FreshName(param->name_hint_), actual_type, actual->span_);
         arg_bindings.push_back(std::make_shared<const AssignStmt>(bound, actual, actual->span_));
+        if (auto var = AsVarLike(actual); var && tagged_args.count(var.get())) {
+          dump_vars.push_back(bound);
+        }
         actual = bound;
       }
       seed[param.get()] = actual;
@@ -934,6 +1053,12 @@ class InlineCallsMutator : public IRMutator {
     //    Pre-seeding fresh Vars would bypass that remapping: seeded replacements
     //    are intentionally used verbatim to preserve the caller's arguments.
     auto renamed_body = DeepClone(callee->body_, seed, /*clone_def_vars=*/true, FreshName).cloned_body;
+    // Transfer before nested inlining: a nested helper may introduce another
+    // local handle and needs the tag on its call to map that handle in turn.
+    if (!dump_vars.empty()) {
+      InlineDumpVarTransfer attacher(std::move(dump_vars));
+      renamed_body = attacher.VisitStmt(renamed_body);
+    }
     // Preserve seeded caller bindings even when a writeback refines
     // the RHS view; subsequent caller uses must still observe the rebinding.
     for (const auto& param : callee->params_) {
@@ -1117,9 +1242,8 @@ class InlineCallsMutator : public IRMutator {
     return pending;
   }
 
-  // Splice each statement of a hoisted sequence as an ordinary call site. Doing
-  // it here rather than deferring to the next fixpoint iteration keeps the
-  // pass within its `inline_fns.size() + 1` iteration bound.
+  // Splice each statement of a hoisted sequence as an ordinary call site,
+  // including nested inline calls exposed by the hoist in this traversal.
   StmtPtr SpliceHoisted(const std::vector<StmtPtr>& work, const Span& span) {
     changed_ = true;
     std::vector<StmtPtr> out;
@@ -1141,9 +1265,9 @@ class InlineCallsMutator : public IRMutator {
         call = As<Call>(VisitExpr(call));
         call_dump_vars = call->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
         if (auto assign = As<AssignStmt>(stmt)) {
-          spliced = SpliceAssignCallSite(callee, call->args_, assign->var_, assign->span_);
+          spliced = SpliceAssignCallSite(callee, call->args_, assign->var_, assign->span_, call_dump_vars);
         } else if (auto eval = As<EvalStmt>(stmt)) {
-          spliced = SpliceInlineCallAsEval(callee, CloneInlineBody(callee, call->args_));
+          spliced = SpliceInlineCallAsEval(callee, CloneInlineBody(callee, call->args_, call_dump_vars));
         }
       }
     }
@@ -1156,18 +1280,11 @@ class InlineCallsMutator : public IRMutator {
           if (auto callee = LookupInlineCallee(call)) {
             call = As<Call>(VisitExpr(call));
             call_dump_vars = call->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
-            spliced = SpliceInlineCallAsReturn(callee, CloneInlineBody(callee, call->args_), ret->span_);
+            spliced = SpliceInlineCallAsReturn(callee, CloneInlineBody(callee, call->args_, call_dump_vars),
+                                               ret->span_);
           }
         }
       }
-    }
-    // Carry the call-site selective-dump tags onto the spliced scopes — the
-    // inline Call node (which held ``kAttrDumpVars``) is about to be destroyed,
-    // so the dump intent must move onto the surviving scope bodies (see
-    // InlineDumpVarTransfer) to reach the outliner by Var identity.
-    if (spliced.has_value() && !call_dump_vars.empty()) {
-      InlineDumpVarTransfer attacher(std::move(call_dump_vars));
-      for (auto& s : *spliced) s = attacher.VisitStmt(s);
     }
     return spliced;
   }
@@ -1178,8 +1295,9 @@ class InlineCallsMutator : public IRMutator {
   // Function::return_types_ here: an annotation such as ``tuple[T, Scalar]``
   // is one TupleType entry even though the IR ReturnStmt has two values.
   std::vector<StmtPtr> SpliceAssignCallSite(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
-                                            const VarPtr& lhs, const Span& span) {
-    auto body = CloneInlineBody(callee, args);
+                                            const VarPtr& lhs, const Span& span,
+                                            const std::vector<VarPtr>& dump_vars) {
+    auto body = CloneInlineBody(callee, args, dump_vars);
     if (InlineReturnsTuple(callee)) {
       std::vector<ExprPtr> sub;
       auto stmts = SpliceInlineCallAsTupleSub(callee, std::move(body), sub);
@@ -1211,6 +1329,7 @@ class InlineCallsMutator : public IRMutator {
   std::unordered_set<const Var*> preserved_vars_;
   const std::unordered_map<std::string, FunctionPtr>& inline_fns_;
   const InlineFunctionMap& functions_;
+  const InlineParamBindingMap& param_bindings_;
   std::unordered_set<const Var*> caller_dimensions_;
   bool changed_ = false;
   // LHS Var → return values, populated by SpliceAssignCallSite for multi-return
@@ -1233,11 +1352,12 @@ namespace pass {
  *
  * Algorithm:
  *  1. Collect all FunctionType::Inline functions in the program.
- *  2. Detect cycles in the Inline → Inline call graph (raise on cycle).
- *  3. Iterate all non-Inline AND Inline functions, splicing top-level
+ *  2. Detect cycles and order Inline functions with callees before callers.
+ *  3. Build expanded analysis copies of Inline functions in that order, splicing top-level
  *     `LHS = inline_call(...)` or `EvalStmt(inline_call(...))` statements
  *     with the inlined body (alpha-rename + param substitution).
- *  4. Repeat (3) to fixpoint so that Inline-calls-Inline is fully expanded.
+ *  4. Expand remaining functions by cloning original helper bodies, using the
+ *     expanded copies to classify parameter bindings before each clone.
  *  5. Drop all Inline functions from the program.
  *
  * Edge cases:
@@ -1278,54 +1398,54 @@ Pass InlineFunctions() {
     // Fast path: nothing to do
     if (inline_fns.empty()) return program;
 
-    // Cycle detection
-    DetectInlineCycles(inline_fns);
-
-    // Iterate to fixpoint. Each iteration mutates every function (incl. Inline
-    // ones, so that Inline-calls-Inline expands too). The loop terminates after
-    // at most (inline_fns.size() + 1) iterations because each iteration either
-    // makes progress or hits the fixpoint.
+    // The same O(functions + call edges) DFS checks cycles and orders callees
+    // before callers. Classify parameter definitions only after nested inline
+    // calls have exposed their intrinsic alias/value-producing operations.
+    const auto expansion_order = InlineExpansionOrder(inline_fns);
     std::unordered_map<std::string, FunctionPtr> current;
     for (const auto& [gvar, fn] : program->functions_) {
       current[fn->name_] = fn;
     }
 
-    const size_t max_iters = inline_fns.size() + 1;
-    for (size_t iter = 0; iter < max_iters; ++iter) {
-      bool any_changed = false;
-
-      // Refresh inline_fns view to point at the *latest* bodies — important
-      // because a previous iteration may have inlined Inline-calls-Inline.
-      std::unordered_map<std::string, FunctionPtr> latest_inline;
-      for (const auto& [name, fn] : inline_fns) {
-        latest_inline[name] = current[name];
+    InlineParamBindingMap param_bindings;
+    auto expand = [&](const std::string& name) {
+      auto& fn = current.at(name);
+      InlineCallsMutator mutator(inline_fns, fn, current, param_bindings);
+      auto new_body = mutator.VisitStmt(fn->body_);
+      if (mutator.Changed()) {
+        auto updated = MutableCopy(fn);
+        updated->body_ = new_body;
+        fn = updated;
       }
+    };
 
-      for (auto& [name, fn] : current) {
-        InlineCallsMutator mutator(latest_inline, fn, current);
-        auto new_body = mutator.VisitStmt(fn->body_);
-        if (mutator.Changed()) {
-          auto updated = MutableCopy(fn);
-          updated->body_ = new_body;
-          fn = updated;
-          any_changed = true;
-        }
+    // Cache one expanded analysis body per helper. Keep inline_fns original:
+    // emitted clones need nested call sites for type/dump-tag specialization.
+    // Traversal cost includes the materialized analysis and output IR, which
+    // can be larger than the original program; no fixpoint rescans are needed.
+    for (const auto& name : expansion_order) {
+      const auto& original = inline_fns.at(name);
+      var_collectors::VarDefUseCollector original_defs;
+      original_defs.VisitStmt(original->body_);
+      InlineParamBindings bindings;
+      for (const auto& param : original->params_) {
+        if (original_defs.var_defs.count(param.get())) bindings.rebound.insert(param.get());
       }
-
-      if (!any_changed) break;
-
-      INTERNAL_CHECK(iter + 1 < max_iters) << "InlineFunctions did not reach a fixpoint within " << max_iters
-                                           << " iterations; this indicates a bug or an undetected cycle";
+      expand(name);
+      // expand replaces only the body, retaining original parameter identities.
+      // Compute the graph conclusion once, never rescan it at every clone site.
+      InlineParamDefCollector expanded_defs(original->params_);
+      expanded_defs.VisitStmt(current.at(name)->body_);
+      bindings.local_bindings = expanded_defs.LocalBindings();
+      param_bindings.emplace(name, std::move(bindings));
     }
 
-    // Drop inline functions and rebuild the program
+    // Expand surviving callers and drop the fully expanded helper definitions.
     std::vector<FunctionPtr> kept_functions;
     for (const auto& [gvar, fn] : program->functions_) {
-      auto it = current.find(fn->name_);
-      INTERNAL_CHECK(it != current.end()) << "Internal error: function '" << fn->name_ << "' missing";
-      const auto& latest = it->second;
-      if (latest->func_type_ == FunctionType::Inline) continue;
-      kept_functions.push_back(latest);
+      if (fn->func_type_ == FunctionType::Inline) continue;
+      expand(fn->name_);
+      kept_functions.push_back(current.at(fn->name_));
     }
 
     return std::make_shared<Program>(kept_functions, program->name_, program->span_);
