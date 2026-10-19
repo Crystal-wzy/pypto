@@ -1096,7 +1096,12 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   const bool storage_call = std::exchange(force_recorded_call_, false) || HasStorageType(op->GetType()) ||
                             std::any_of(op->args_.begin(), op->args_.end(),
                                         [&](const ExprPtr& arg) { return HasStorageType(arg->GetType()); });
-  if (!storage_call &&
+  // Simplify can fold a dynamic flag operand to ConstInt without changing the
+  // operation to its static form. The public API treats constants as static
+  // event_id attributes, so use the lossless dump to preserve this operand.
+  const bool folded_flag = (IsOp(op, "system.set_flag") || IsOp(op, "system.wait_flag")) &&
+                           op->args_.size() == 1 && As<ConstInt>(op->args_[0]);
+  if (!storage_call && !folded_flag &&
       (!distributed_type || (comm_domain_depth_ == 0 && !distributed_type->window_buffer_.has_value()))) {
     PrintCall(op);
     return;
@@ -1334,6 +1339,32 @@ void IRPythonPrinter::PrintCall(const CallPtr& op) {
     }
     stream_ << "}";
   };
+
+  // Flag IR keeps the event as either an attribute or the sole dynamic
+  // operand. Print the public src/dst/event order explicitly; generic Call
+  // printing would put the dynamic operand before src_pipe and dst_pipe.
+  if (IsOp(op, "system.set_flag") || IsOp(op, "system.wait_flag")) {
+    const auto src = static_cast<PipeType>(op->GetKwarg<int>("src_pipe"));
+    const auto dst = static_cast<PipeType>(op->GetKwarg<int>("dst_pipe"));
+    stream_ << "src_pipe=" << prefix_ << ".PipeType." << PipeTypeToString(src) << ", dst_pipe=" << prefix_
+            << ".PipeType." << PipeTypeToString(dst) << ", event_id=";
+    if (op->args_.empty()) {
+      stream_ << op->GetKwarg<int>("event_id");
+    } else {
+      INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+          << "Internal error: flag has multiple event operands";
+      VisitExpr(op->args_[0]);
+    }
+    if (op->HasKwarg("core_type")) {
+      const auto core = op->GetKwarg<std::string>("core_type");
+      const char* member = CoreTypeToKernelMember(core, /*is_syncall=*/false);
+      INTERNAL_CHECK_SPAN(member, op->span_) << "Internal error: flag has invalid core_type " << core;
+      stream_ << ", core_type=" << prefix_ << ".KernelType." << member;
+    }
+    print_serialized_attrs(true);
+    stream_ << ")";
+    return;
+  }
 
   // reinterpret_view keeps dtype as the second public-API input and shape as a
   // keyword-only optional input, while the IR stores shape positionally and
