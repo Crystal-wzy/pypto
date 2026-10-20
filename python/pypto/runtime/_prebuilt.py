@@ -14,6 +14,7 @@ import importlib
 import json
 import shutil
 import stat
+from glob import escape
 from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import Any, cast
@@ -81,6 +82,22 @@ def write_chip_binaries(
     runtime_config: dict[str, Any],
 ) -> None:
     """Record final device bytes in a private build, after successful compilation."""
+    # Keep every registration while storing identical immutable bytes once.
+    binaries: dict[bytes, dict[str, Any]] = {}
+    kernel_records: list[dict[str, Any]] = []
+    for kernel, binary in kernels:
+        binary_record = binaries.get(binary)
+        if binary_record is None:
+            binary_record = _save_bytes(directory, f"prebuilt/kernel_{len(binaries)}.bin", binary)
+            binaries[binary] = binary_record
+        kernel_records.append(
+            {
+                "func_id": kernel["func_id"],
+                "name": kernel.get("name", str(kernel["func_id"])),
+                "signature": _encode_signature(kernel.get("signature", [])),
+                "binary": binary_record,
+            }
+        )
     record = {
         "schema": _BINARY_SCHEMA,
         "platform": platform,
@@ -92,15 +109,7 @@ def write_chip_binaries(
             "signature": _encode_signature(orchestration.get("signature", [])),
             "binary": _save_bytes(directory, "prebuilt/orchestration.bin", orchestration_binary),
         },
-        "kernels": [
-            {
-                "func_id": kernel["func_id"],
-                "name": kernel.get("name", str(kernel["func_id"])),
-                "signature": _encode_signature(kernel.get("signature", [])),
-                "binary": _save_bytes(directory, f"prebuilt/kernel_{index}.bin", binary),
-            }
-            for index, (kernel, binary) in enumerate(kernels)
-        ],
+        "kernels": kernel_records,
     }
     (directory / BINARY_MANIFEST).write_bytes(encode_manifest(record))
 
@@ -152,6 +161,16 @@ def _build_outputs(config: ModuleType) -> set[Path]:
         if not entry.get("external", False)
         for suffix in (".o", ".so")
     }
+    # Generated raw outputs include the 24-hex code digest. Match only that
+    # compiler-owned naming contract, including stale digests inherited from
+    # GENERATED. Configured inputs always win over an output-shaped filename.
+    digest_pattern = "[0-9a-f]" * 24
+    for kernel in config.KERNELS:
+        if kernel.get("external") or kernel.get("builtin") or not kernel.get("code_name"):
+            continue
+        source = Path(kernel["source"])
+        for suffix in (".o", ".so"):
+            sidecars.update(source.parent.glob(f"{escape(source.stem)}_{digest_pattern}{suffix}"))
     return sidecars - sources
 
 
@@ -170,7 +189,7 @@ def _prune_build_outputs(chip: Path) -> None:
 
 
 def ready_spec(directory: Path, generated: ArtifactSpec, *, metadata_only: bool = False) -> ArtifactSpec:
-    """Declare every final binary and child manifest before looking up READY."""
+    """Declare READY manifests before compilation determines shared binary paths."""
     from ._artifact_sources import read_kernel_config  # noqa: PLC0415
 
     required = set(generated.required_files) | {BINARY_MANIFEST}
@@ -199,7 +218,10 @@ def ready_spec(directory: Path, generated: ArtifactSpec, *, metadata_only: bool 
         cache = prefix / "cache"
         required = {p for p in required if p not in sidecars and not Path(p).is_relative_to(cache)}
         required.update(str(prefix / path) for path in (BINARY_MANIFEST, "prebuilt/orchestration.bin"))
-        required.update(str(prefix / "prebuilt" / f"kernel_{i}.bin") for i in range(len(config.KERNELS)))
+        # Binary sharing is known only after compilation, whereas this spec is
+        # also used to look up READY before compiling. Each child manifest names
+        # its actual binary files; prepare_prebuilt validates every reference
+        # before publication, and the artifact inventory protects them on load.
     return ArtifactSpec(
         ArtifactState.BINARY_READY,
         generated.build_kind,
@@ -222,7 +244,12 @@ def _read_json(root: Path) -> dict[str, Any]:
     return record_map
 
 
-def _binary(root: Path, record: Any, validated_files: dict[Path, dict[str, Any]] | None) -> bytes:
+def _binary(
+    root: Path,
+    record: Any,
+    validated_files: dict[Path, dict[str, Any]] | None,
+    cache: dict[Path, tuple[bytes, str]],
+) -> bytes:
     if not isinstance(record, dict):
         raise ValueError(f"Invalid prebuilt binary record in {root}")
     record_map = cast("dict[str, Any]", record)
@@ -233,7 +260,8 @@ def _binary(root: Path, record: Any, validated_files: dict[Path, dict[str, Any]]
     path = _relative_file(root, record_map["path"])
     if path.stat().st_size != record_map["size"]:
         raise ValueError(f"Prebuilt binary size mismatch: {path}")
-    data = path.read_bytes()
+    cached = cache.get(path)
+    data = cached[0] if cached is not None else path.read_bytes()
     if len(data) != record_map["size"]:
         raise ValueError(f"Prebuilt binary size mismatch: {path}")
     # Attachment already hashed the immutable payload. Match the inner record
@@ -241,9 +269,14 @@ def _binary(root: Path, record: Any, validated_files: dict[Path, dict[str, Any]]
     entry = validated_files.get(path) if validated_files is not None else None
     if validated_files is not None and (entry is None or entry["size"] != len(data)):
         raise ValueError(f"Prebuilt binary is absent from the validated inventory: {path}")
-    digest = entry["sha256"] if entry is not None else hashlib.sha256(data).hexdigest()
+    digest = (
+        entry["sha256"]
+        if entry is not None
+        else (cached[1] if cached is not None else hashlib.sha256(data).hexdigest())
+    )
     if digest != record_map["sha256"]:
         raise ValueError(f"Prebuilt binary digest mismatch: {path}")
+    cache[path] = (data, digest)
     return data
 
 
@@ -251,6 +284,7 @@ def _read_chip(
     root: Path, platform: str, validated_files: dict[Path, dict[str, Any]] | None
 ) -> dict[str, Any]:
     record = _read_json(root)
+    binary_cache: dict[Path, tuple[bytes, str]] = {}
     if set(record) != {"schema", "platform", "runtime_name", "runtime_config", "orchestration", "kernels"}:
         raise ValueError(f"Invalid prebuilt chip fields: {root}")
     if record["platform"] != platform:
@@ -273,7 +307,7 @@ def _read_chip(
         if not isinstance(orch[name], str) or not orch[name] or "\x00" in orch[name]:
             raise ValueError(f"Invalid prebuilt orchestration {name}: {root}")
     _signature(orch["signature"])
-    orch["binary"] = _binary(root, orch["binary"], validated_files)
+    orch["binary"] = _binary(root, orch["binary"], validated_files, binary_cache)
     kernels_list: Any = record["kernels"]
     if not isinstance(kernels_list, list):
         raise ValueError(f"Invalid prebuilt kernel list: {root}")
@@ -291,7 +325,7 @@ def _read_chip(
         if not isinstance(kernel["name"], str) or not kernel["name"]:
             raise ValueError(f"Invalid prebuilt kernel name: {root}")
         _signature(kernel["signature"])
-        kernel["binary"] = _binary(root, kernel["binary"], validated_files)
+        kernel["binary"] = _binary(root, kernel["binary"], validated_files, binary_cache)
     return record
 
 
