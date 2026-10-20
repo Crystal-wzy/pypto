@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -41,6 +42,7 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/buffer_valid_analysis.h"
 #include "pypto/ir/transforms/utils/buffer_view_analysis.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -116,13 +118,15 @@ class BufferKernelSupport : public IRVisitor {
         supported &= view.valid_shape.size() == tile->shape_.size();
         for (size_t i = 0; supported && i < view.valid_shape.size(); ++i) {
           const auto valid = As<ConstInt>(view.valid_shape[i]);
-          supported &= valid && valid->value_ > 0 && valid->value_ <= As<ConstInt>(tile->shape_[i])->value_;
+          const auto scalar = As<ScalarType>(view.valid_shape[i]->GetType());
+          supported &= valid ? valid->value_ >= 0 && valid->value_ <= As<ConstInt>(tile->shape_[i])->value_
+                             : space == MemorySpace::Vec && scalar &&
+                                   (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt());
+          if (space != MemorySpace::Vec) supported &= valid && valid->value_ > 0;
         }
       }
       if (const auto memory = tile->memref_.value_or(nullptr)) {
-        const auto offset = As<ConstInt>(memory->byte_offset_);
-        supported &= !memory->is_pinned_ && memory->slot_count_ == 1 && !memory->slot_index_ && offset &&
-                     offset->value_ >= 0 && offset->value_ % 32 == 0;
+        supported &= !memory->is_pinned_ && memory->slot_count_ == 1 && !memory->slot_index_;
       }
     } else if (auto tensor = As<TensorType>(type)) {
       supported &= StaticShape(tensor->shape_) &&
@@ -148,6 +152,18 @@ class BufferKernelSupport : public IRVisitor {
       return;
     }
     CheckType(expr->GetType());
+    if (const auto var = AsVarLike(expr)) {
+      if (const auto tile = As<TileType>(var->GetType())) {
+        if (const auto memory = tile->memref_.value_or(nullptr)) {
+          const auto offset = As<ConstInt>(memory->byte_offset_);
+          const auto view = views_.Get(var);
+          // Only a slice with a known typed parent can carry a symbolic
+          // member offset. Allocation origins themselves remain static.
+          supported &= offset ? offset->value_ >= 0 && offset->value_ % 32 == 0
+                              : view.window && view.root && view.row_bytes.has_value();
+        }
+      }
+    }
     IRVisitor::VisitExpr(expr);
   }
 
@@ -187,6 +203,9 @@ class BufferKernelSupport : public IRVisitor {
   void VisitStmt_(const AssignStmtPtr& assign) override {
     IRVisitor::VisitStmt_(assign);
     if (!supported) return;
+    if (As<ScalarType>(assign->var_->GetType())) {
+      scalar_multiples_.emplace(assign->var_.get(), KnownAlignmentMultiple(assign->value_));
+    }
     if (IsMatrixType(assign->var_->GetType())) {
       ExprPtr source = assign->value_;
       if (auto call = As<Call>(source);
@@ -205,6 +224,15 @@ class BufferKernelSupport : public IRVisitor {
     auto var = AsVarLike(source);
     auto alias = tensor_aliases_.find(var.get());
     if (alias != tensor_aliases_.end()) tensor_aliases_.emplace(assign->var_.get(), alias->second);
+  }
+
+  void VisitStmt_(const EvalStmtPtr& eval) override {
+    if (auto call = As<Call>(eval->expr_); call && IsOp(call, "tile.set_validshape")) {
+      // Metadata version tracking and lowering require an explicit SSA result.
+      supported = false;
+      return;
+    }
+    IRVisitor::VisitStmt_(eval);
   }
 
   void VisitStmt_(const ReturnStmtPtr& ret) override {
@@ -305,6 +333,9 @@ class BufferKernelSupport : public IRVisitor {
                    GetIntKwarg(call->kwargs_, "st_phase", 0) == 0 &&
                    !GetOptionalDoubleKwarg(call->kwargs_, "pre_quant") &&
                    !GetKwargOr<bool>(call->kwargs_, "pre_relu", false);
+    } else if (IsOp(call, "tile.set_validshape")) {
+      supported &= call->args_.size() == 3 && call->kwargs_.empty() && !views_.IsWindow(call->args_[0]) &&
+                   As<TileType>(call->GetType())->GetMemorySpace() == MemorySpace::Vec;
     } else if (IsOp(call, "tile.slice") || IsOp(call, "tile.assemble")) {
       CheckWindowCall(call);
     } else if (IsOp(call, "tile.reshape") || IsOp(call, "tile.reinterpret_view")) {
@@ -313,7 +344,8 @@ class BufferKernelSupport : public IRVisitor {
       const auto source_bytes = TileBytes(source);
       supported &= source && destination && source->GetMemorySpace() == MemorySpace::Vec &&
                    destination->GetMemorySpace() == MemorySpace::Vec && source_bytes &&
-                   source_bytes == TileBytes(destination) && views_.HasDenseRowPitch(call->args_[0]);
+                   source_bytes == TileBytes(destination) && views_.HasDenseRowPitch(call->args_[0]) &&
+                   (!views_.IsWindow(call->args_[0]) || views_.Get(call->args_[0]).offsets.has_value());
       if (IsOp(call, "tile.reshape")) {
         supported &= call->args_.size() == 2 && call->kwargs_.empty() && source && destination &&
                      source->dtype_ == destination->dtype_;
@@ -339,6 +371,49 @@ class BufferKernelSupport : public IRVisitor {
   }
 
  private:
+  static constexpr int64_t kWindowAlignmentBytes = 32;
+
+  // Cache scalar SSA facts and expression nodes once. Unknown values have no
+  // guaranteed factor beyond one; arithmetic preserves only proven multiples.
+  int64_t KnownAlignmentMultiple(const ExprPtr& expr) {
+    const auto cached = expression_multiples_.find(expr.get());
+    if (cached != expression_multiples_.end()) return cached->second;
+    int64_t multiple = 1;
+    if (const auto constant = As<ConstInt>(expr)) {
+      multiple = std::gcd(constant->value_ % kWindowAlignmentBytes, kWindowAlignmentBytes);
+    } else if (const auto var = AsVarLike(expr)) {
+      const auto found = scalar_multiples_.find(var.get());
+      if (found != scalar_multiples_.end()) multiple = found->second;
+    } else if (const auto cast = As<Cast>(expr)) {
+      const auto source = GetScalarDtype(cast->operand_);
+      const auto target = GetScalarDtype(cast);
+      const auto integer = [](DataType dtype) {
+        return dtype == DataType::INDEX || dtype.IsSignedInt() || dtype.IsUnsignedInt();
+      };
+      if (integer(source) && integer(target) && source.GetBit() >= 5 && target.GetBit() >= 5) {
+        multiple = KnownAlignmentMultiple(cast->operand_);
+      }
+    } else if (const auto binary = As<BinaryExpr>(expr);
+               binary && (As<Add>(expr) || As<Sub>(expr) || As<Mul>(expr))) {
+      const auto lhs = KnownAlignmentMultiple(binary->left_);
+      const auto rhs = KnownAlignmentMultiple(binary->right_);
+      multiple = As<Mul>(expr) ? std::gcd(lhs * rhs, kWindowAlignmentBytes) : std::gcd(lhs, rhs);
+    }
+    expression_multiples_.emplace(expr.get(), multiple);
+    return multiple;
+  }
+
+  std::optional<int64_t> WindowOffsetResidue(const ExprPtr& offset, int64_t stride_bytes) {
+    const auto stride = stride_bytes % kWindowAlignmentBytes;
+    if (const auto constant = As<ConstInt>(offset)) {
+      const auto residue =
+          (constant->value_ % kWindowAlignmentBytes + kWindowAlignmentBytes) % kWindowAlignmentBytes;
+      return residue * stride % kWindowAlignmentBytes;
+    }
+    if (KnownAlignmentMultiple(offset) * stride % kWindowAlignmentBytes == 0) return 0;
+    return std::nullopt;
+  }
+
   void CheckWindowCall(const CallPtr& call) {
     const bool slice = IsOp(call, "tile.slice");
     if (call->args_.size() < 3) {
@@ -355,11 +430,24 @@ class BufferKernelSupport : public IRVisitor {
       supported = false;
       return;
     }
+    // Explicit-valid slices and assemble destinations bypass slice
+    // canonicalization. Prove their byte address alignment independently,
+    // using the inherited parent pitch rather than the window's own width.
+    const auto row_bytes = views_.Get(call->args_[0]).row_bytes;
+    const auto row_residue =
+        row_bytes ? WindowOffsetResidue(offsets->elements_[0], *row_bytes) : std::nullopt;
+    const auto col_residue =
+        WindowOffsetResidue(offsets->elements_[1], static_cast<int64_t>(window->dtype_.GetBit() / 8));
+    supported &= row_residue && col_residue && (*row_residue + *col_residue) % kWindowAlignmentBytes == 0;
     for (size_t i = 0; i < 2; ++i) {
       const auto offset = As<ConstInt>(offsets->elements_[i]);
-      supported &=
-          offset && offset->value_ >= 0 &&
-          offset->value_ <= As<ConstInt>(parent->shape_[i])->value_ - As<ConstInt>(window->shape_[i])->value_;
+      const auto scalar = As<ScalarType>(offsets->elements_[i]->GetType());
+      const auto limit = As<ConstInt>(parent->shape_[i])->value_ - As<ConstInt>(window->shape_[i])->value_;
+      // Dynamic bounds remain the slice/assemble caller's precondition. They
+      // never establish a precise range for alias analysis.
+      supported &= limit >= 0 && scalar &&
+                   (scalar->dtype_ == DataType::INDEX || scalar->dtype_.IsSignedInt()) &&
+                   (!offset || (offset->value_ >= 0 && offset->value_ <= limit));
     }
     if (slice) {
       supported &= call->kwargs_.empty() && call->args_.size() <= 5;
@@ -377,7 +465,7 @@ class BufferKernelSupport : public IRVisitor {
       // a destination with a different pitch needs a separate transfer recipe.
       const auto source_view = views_.Get(call->args_[1]);
       supported &= source_view.row_bytes && source_view.row_bytes == views_.Get(call->args_[0]).row_bytes &&
-                   (!source_view.window || (source_view.root && source_view.offsets));
+                   (!source_view.window || (source_view.root && source_view.slice));
     }
     if (!views_.IsWindow(call->args_[0])) {
       const auto memory = parent->memref_.value_or(nullptr);
@@ -561,6 +649,8 @@ class BufferKernelSupport : public IRVisitor {
   Region* region_ = nullptr;
   const std::vector<TypePtr>& return_types_;
   BufferViewAnalysis views_;
+  std::unordered_map<const Var*, int64_t> scalar_multiples_;
+  std::unordered_map<const Expr*, int64_t> expression_multiples_;
   std::unordered_map<const Var*, TileTypePtr> window_parents_;
   std::unordered_map<const Var*, ParamDirection> directions_;
   std::unordered_map<const Var*, VarPtr> tensor_aliases_;
@@ -591,6 +681,7 @@ FunctionPtr SelectBufferFunction(const FunctionPtr& function, bool device_helper
     support.CheckType(type);
   }
   support.VisitStmt(function->body_);
+  if (support.supported) support.supported = BufferValidAnalysis(function->body_).supported();
   auto selected = std::make_shared<Function>(*function);
   selected->attrs_.emplace_back(kAttrBufferIrSelected, support.supported &&
                                                            (support.has_load || support.has_fill) &&
