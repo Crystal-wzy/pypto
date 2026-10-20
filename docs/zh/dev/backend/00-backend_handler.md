@@ -64,12 +64,27 @@ if (backend::GetBackendType() != backend::BackendType::Ascend910) { ... }
 | `GetL0cMAlignment(dtype)` | L0C 切分、dbC 容量与分配共同使用的物理 M 行对齐 | INT32 为 32；其余为 16 | 16 |
 | `BuildCrossCoreTransferView(dest, view)` | 跨核传输边界处的 tile 视图 | Mat/Left/Right 转 NZ；Vec 保持原样 | Mat/Left/Right 转 NZ（a5 硬件要求边界为 fractal）；Vec 保持原样 |
 
+## 内存容量来源
+
+`BackendHandler::GetCapacityBytes(memory_space)` 调用 handler 所属后端的
+`Backend::GetMemSize()`。SoC 是容量的唯一来源；handler 不重复保存数值，也不乘以核数
+或 die 数。查询返回一个匹配内存组件的字节容量，类型为 `uint64_t`；SoC 未建模该空间
+时返回 `0`。若多个核都有该空间，返回第一个匹配组件的容量。未建模不表示硬件没有该内存。
+
+L0A、L0B、L0C、Bias、L1 分别使用 `MemorySpace::Left`、`Right`、`Acc`、`Bias`、`Mat`。
+同一个接口也能查询 `Vec` 和 scale 内存。Python 接口为
+`handler.get_capacity_bytes(memory_space)`。两种语言原有的五个独立容量方法均由该统一查询
+替代。即使尚未配置全局目标，或者当前配置了另一种后端，显式查询该后端的 handler 仍能
+返回正确容量。对齐规则、最小 tile 维度和成本模型参数仍与容量分别维护。
+
 ## 新增后端流程
 
 1. 在 `src/backend/<arch>/backend_<arch>.cpp` 中实现 `Backend<Arch>` 子类，
    并把源文件加入 `CMakeLists.txt`。
 2. 在 `src/backend/<arch>/backend_<arch>_handler.cpp` 中实现
-   `Backend<Arch>Handler` 子类。
+   `Backend<Arch>Handler` 子类。以所属后端引用初始化基类，该后端的生命周期必须长于
+   handler。内置 handler 使用后端单例；后端构造期间不能反过来请求 handler，避免单例
+   初始化重入。
 3. 让 `Backend<Arch>::GetHandler()` 返回你的 handler 单例。
 4. 在 `src/backend/common/backend.cpp` 中给 `GetBackendInstance` 和
    `BackendTypeToString` 各加一行，并在 `BackendType` 枚举中添加新值。

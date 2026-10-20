@@ -19,6 +19,7 @@ import pickle
 
 import pytest
 from pypto.pypto_core import backend as _backend_core
+from pypto.pypto_core import ir as _ir_core
 from pypto.runtime import CompileOptions, ExecutionMode, RunConfig
 
 
@@ -139,3 +140,33 @@ class TestGlobalHandlerAccessor:
     def test_global_handler_raises_when_not_configured(self):
         with pytest.raises(ValueError, match="Backend type not configured"):
             _backend_core.get_handler()
+
+    @pytest.mark.parametrize(
+        "configured_backend",
+        [None, _backend_core.BackendType.Ascend910, _backend_core.BackendType.Ascend950],
+    )
+    @pytest.mark.parametrize(
+        "queried_backend", [_backend_core.BackendType.Ascend910, _backend_core.BackendType.Ascend950]
+    )
+    def test_capacity_queries_use_owning_soc(self, configured_backend, queried_backend):
+        """An explicit handler must work before target selection and for the other target."""
+        if configured_backend is not None:
+            _backend_core.set_backend_type(configured_backend)
+        backend = _backend_core.get_backend_instance(queried_backend)
+        handler = backend.get_handler()
+
+        # In particular, Acc and Bias differ between architectures. Reading the
+        # active target instead of this handler's owner would return wrong limits.
+        for memory_space in _ir_core.MemorySpace.__members__.values():
+            assert handler.get_capacity_bytes(memory_space) == backend.get_mem_size(memory_space)
+        # Scale memories distinguish an unmodeled space from a modeled A5 space.
+        expected_scale = 4096 if queried_backend == _backend_core.BackendType.Ascend950 else 0
+        assert handler.get_capacity_bytes(_ir_core.MemorySpace.LeftScale) == expected_scale
+        assert handler.get_capacity_bytes(_ir_core.MemorySpace.ScalarLocal) == 0
+        assert _backend_core.is_backend_configured() == (configured_backend is not None)
+        if configured_backend is not None:
+            assert _backend_core.get_backend_type() == configured_backend
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
