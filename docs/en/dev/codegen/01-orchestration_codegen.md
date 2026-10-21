@@ -76,6 +76,15 @@ This allows extensible operation codegen without modifying the core visitor.
 #include "orchestration_api.h"
 ```
 
+The runtime SDK supplies include paths and helper sources from its `build_config.py`.
+HBG's orchestration API lives under `src/common/host_build_graph/host/orchestration/`;
+Graph code also includes `host_build_graph/host/graph_boundary_match.h`.
+Builtin entry templates access the HBG context through `current_orch_context()`
+and the TensorMap/RingBuffer context through `current_runtime()`.
+
+Both runtimes use `launch_spec.set_block_num()` on A2/A3 and A5 to set the
+per-task logical block count. This setter is independent of `PassContext.runtime`.
+
 ### Phase 2–3: Entry Points
 
 ```cpp

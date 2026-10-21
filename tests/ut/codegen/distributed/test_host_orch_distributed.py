@@ -1214,7 +1214,7 @@ def test_every_next_level_reports_the_selected_runtime(tmp_path, runtime):
 
 
 @pytest.mark.parametrize("ascend_backend", [BackendType.Ascend950], indirect=True)
-def test_backend_950_materializes_allreduce_with_core_num_launch(tmp_path, ascend_backend):
+def test_backend_950_materializes_allreduce_with_block_num_launch(tmp_path, ascend_backend):
     @pl.program
     class Prog:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -1240,7 +1240,7 @@ def test_backend_950_materializes_allreduce_with_core_num_launch(tmp_path, ascen
 
     base = "next_levels/builtin.tensor.allreduce__sum__fp32"
     entry_cpp = files[f"{base}/orchestration/builtin_tensor_allreduce__sum__fp32.cpp"]
-    assert "params.launch_spec.set_core_num(core_num)" in entry_cpp
+    assert "params.launch_spec.set_block_num(core_num)" in entry_cpp
 
 
 def test_host_allreduce_ring_builtin_codegen_uses_ring_next_level_callable_key():

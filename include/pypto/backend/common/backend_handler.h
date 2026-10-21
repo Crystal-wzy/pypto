@@ -145,10 +145,9 @@ class BackendHandler {
   [[nodiscard]] virtual std::string GetPtoTargetArch() const = 0;
 
   /**
-   * @brief Method name used on `launch_spec` to set the per-task core count.
+   * @brief Method name used on `launch_spec` to set the per-task logical block count.
    *
-   * Different runtimes expose different APIs for the same concept
-   * (Ascend910: "set_block_num"; Ascend950: "set_core_num").
+   * Both supported architectures and runtimes use "set_block_num".
    */
   [[nodiscard]] virtual std::string GetLaunchSpecCoreCountMethod() const = 0;
 

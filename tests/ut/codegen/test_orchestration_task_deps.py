@@ -14,12 +14,13 @@ import re
 import pypto.language as pl
 import pytest
 from _orchestration_codegen_common import (
+    _assert_orchestration_compiles,
     _generate_orch_code,
     _generate_orch_from_transformed_program,
     _generate_orch_full_pipeline,
 )
 from pypto import backend, passes
-from pypto.backend import BackendType
+from pypto.backend import BackendType, pto_backend
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 
@@ -1323,9 +1324,15 @@ def test_spmd_submit_core_num_variable_emits_var_reference():
     assert not m.group(1).strip().isdigit(), f"core_num was constant-folded, expected a var: {m.group(1)!r}"
 
 
-def test_spmd_submit_950_backend_emits_set_core_num():
-    """On Ascend950 the launch spec uses set_core_num (vs set_block_num on 910B),
-    via the backend handler's GetLaunchSpecCoreCountMethod()."""
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+        passes.RuntimeKind.HOST_BUILD_GRAPH,
+    ],
+)
+def test_spmd_submit_950_backend_uses_block_count_api(tmp_path, runtime):
+    """Both A5 runtimes must compile with Simpler's unified block-count API."""
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend950)
 
@@ -1333,25 +1340,37 @@ def test_spmd_submit_950_backend_emits_set_core_num():
     class P:
         @pl.function(type=pl.FunctionType.AIV)
         def k(
-            self, x: pl.Tensor[[128], pl.FP32], out: pl.Out[pl.Tensor[[128], pl.FP32]]
-        ) -> pl.Tensor[[128], pl.FP32]:
-            t = pl.load(x, [0], [128])
-            out = pl.store(t, [0], out)
+            self, x: pl.Tensor[[1, 128], pl.FP32], out: pl.Out[pl.Tensor[[1, 128], pl.FP32]]
+        ) -> pl.Tensor[[1, 128], pl.FP32]:
+            t = pl.load(x, [0, 0], [1, 128])
+            out = pl.store(t, [0, 0], out)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
         def main(
-            self, x: pl.Tensor[[128], pl.FP32], out: pl.Out[pl.Tensor[[128], pl.FP32]]
-        ) -> pl.Tensor[[128], pl.FP32]:
+            self, x: pl.Tensor[[1, 128], pl.FP32], out: pl.Out[pl.Tensor[[1, 128], pl.FP32]]
+        ) -> pl.Tensor[[1, 128], pl.FP32]:
             with pl.manual_scope():
                 out, _ = pl.spmd_submit(self.k, x, out, core_num=4)
             return out
 
     # Property-only verification (see test_spmd_submit_aic_direct_dispatch).
-    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+    with passes.PassContext(
+        [passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)], runtime=runtime
+    ):
         code = _generate_orch_code(P)
-    assert "params_t0.launch_spec.set_core_num(4);" in code, code
-    assert "set_block_num" not in code, code
+    main_cpp = tmp_path / "main.cpp"
+    main_cpp.write_text(code)
+    _assert_orchestration_compiles(main_cpp, runtime_name=passes.runtime_kind_to_name(runtime), arch="a5")
+    assert "params_t0.launch_spec.set_block_num(4);" in code, code
+
+    # Lower with the requested runtime, then exercise Python codegen after that
+    # context has ended: selecting the setter no longer needs a codegen context.
+    with passes.PassContext([], runtime=runtime):
+        program = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(P)
+    files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True, runtime=runtime)
+    main_cpp.write_text(files["orchestration/main.cpp"])
+    _assert_orchestration_compiles(main_cpp, runtime_name=passes.runtime_kind_to_name(runtime), arch="a5")
 
 
 def test_compiler_dep_carry_array_sized_by_outer_loop_trip_count():

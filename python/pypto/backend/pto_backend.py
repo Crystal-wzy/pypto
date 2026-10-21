@@ -2016,6 +2016,13 @@ def _materialize_builtin_next_levels(
             "kernel_name": spec.entry_symbol + "_kernel",
             "template_package": spec.template_dir[1:],
             "runtime": _passes.runtime_kind_to_name(runtime),
+            # HBG orchestration has a host-only context; TMR uses its runtime
+            # context. Templates must select the API of their compiled runtime.
+            "orchestration_context_accessor": (
+                "current_orch_context"
+                if runtime == _passes.RuntimeKind.HOST_BUILD_GRAPH
+                else "current_runtime"
+            ),
         }
         variables.update(spec.template_vars)
         for template in sorted(templates_dir.iterdir(), key=lambda item: item.name):

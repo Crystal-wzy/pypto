@@ -49,7 +49,7 @@ if (backend::GetBackendType() != backend::BackendType::Ascend910) { ... }
 | 方法 | 用途 | Ascend910 | Ascend950 |
 | ---- | ---- | --------- | --------- |
 | `GetPtoTargetArch()` | `module attributes {pto.target_arch = "..."}` | `"a2a3"` | `"a5"` |
-| `GetLaunchSpecCoreCountMethod()` | `launch_spec` 上设置核数的运行时 API 名 | `"set_block_num"` | `"set_core_num"` |
+| `GetLaunchSpecCoreCountMethod()` | `launch_spec` 上设置逻辑 block 数量的运行时 API 名 | `"set_block_num"` | `"set_block_num"` |
 | `GetDefaultSimPlatform()` | 默认仿真平台名 | `"a2a3sim"` | `"a5sim"` |
 | `GetExtraPtoasFlags()` | ptoas 额外参数 | `[]` | `["--pto-arch", "a5"]` |
 | `HonorsHighPrecisionAlgorithm()` | PTO-ISA 是否会根据 `high_precision=True` 生成的 `precisionType` 属性选择不同算法；为 false 时两个 PTO 发射路径（Tile 算子回调与 Buffer IR）都会告警该请求被丢弃 | `false` | `true` |

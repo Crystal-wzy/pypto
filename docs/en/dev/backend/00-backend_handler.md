@@ -52,7 +52,7 @@ to global state.
 | Method | Purpose | Ascend910 | Ascend950 |
 | ------ | ------- | --------- | --------- |
 | `GetPtoTargetArch()` | `module attributes {pto.target_arch = "..."}` | `"a2a3"` | `"a5"` |
-| `GetLaunchSpecCoreCountMethod()` | runtime API name on `launch_spec` | `"set_block_num"` | `"set_core_num"` |
+| `GetLaunchSpecCoreCountMethod()` | runtime API name for the logical block count on `launch_spec` | `"set_block_num"` | `"set_block_num"` |
 | `GetDefaultSimPlatform()` | default simulator platform | `"a2a3sim"` | `"a5sim"` |
 | `GetExtraPtoasFlags()` | extra ptoas flags | `[]` | `["--pto-arch", "a5"]` |
 | `HonorsHighPrecisionAlgorithm()` | PTO-ISA selects a distinct algorithm from the `precisionType` attribute that `high_precision=True` emits; when false, both PTO emitters (Tile op callbacks and Buffer IR) warn that the request is dropped | `false` | `true` |
