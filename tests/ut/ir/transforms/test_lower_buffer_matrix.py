@@ -99,6 +99,112 @@ class ExplicitMatmul:
 """)
 
 
+@pytest.mark.parametrize("size,operand", [(448, "FP32"), (320, "FP32"), (512, "BF16")])
+@pytest.mark.parametrize("enable_buffer_ir", [False, True])
+def test_single_c_mn_grid_keeps_accumulator_declarations_local(
+    tmp_path: Path, size: int, operand: str, enable_buffer_ir: bool
+) -> None:
+    # These three geometries fit with a single, sequentially drained L0C tile.
+    # Prologue declarations incorrectly extend the independent stage lifetimes
+    # across the loop backedge and make native PTOAS request 160--256 KiB.
+    program = pl.parse_program(f"""
+@pl.program
+class SingleCGrid:
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(self, a: pl.Tensor[[{size}, 64], pl.{operand}],
+               b: pl.Tensor[[64, {size}], pl.{operand}],
+               out: pl.Out[pl.Tensor[[{size}, {size}], pl.FP32]]
+    ) -> pl.Tensor[[{size}, {size}], pl.FP32]:
+        lhs = pl.load(a, [0, 0], [{size}, 64], target_memory=pl.MemorySpace.Mat)
+        rhs = pl.load(b, [0, 0], [64, {size}], target_memory=pl.MemorySpace.Mat)
+        return pl.store(pl.matmul(lhs, rhs), [0, 0], out)
+""")
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS, enable_buffer_ir=enable_buffer_ir):
+        lowered = PassManager(OptimizationStrategy.Default).run_passes(program)
+    if enable_buffer_ir:
+        kernel = lowered.get_function("kernel")
+        assert kernel is not None and isinstance(kernel.body, ir.SeqStmts)
+        # Loop-local MAD destinations must be declared in their loop. Unrolled
+        # boundary MADs legitimately keep function-scope declarations.
+        loops = [stmt for stmt in statements(lowered) if isinstance(stmt, ir.ForStmt)]
+        assert loops
+        for loop in loops:
+            assert isinstance(loop.body, ir.SeqStmts)
+            local_accumulators = {
+                stmt.var.name_hint
+                for stmt in loop.body.stmts
+                if isinstance(stmt, ir.AssignStmt)
+                and isinstance(stmt.var.type, ir.BufferType)
+                and stmt.var.type.memory_space == ir.MemorySpace.Acc
+            }
+            for stmt in loop.body.stmts:
+                if isinstance(stmt, ir.EvalStmt) and isinstance(stmt.expr, ir.Call):
+                    if stmt.expr.op.name == ir.get_op("buffer.matmul").name:
+                        destination = stmt.expr.args[-1]
+                        assert isinstance(destination, ir.Var)
+                        assert destination.name_hint in local_accumulators
+        assert any(d.memory_space == ir.MemorySpace.Acc for d, _ in _allocations(lowered))
+    _compile_native(tmp_path, lowered, BackendType.Ascend910, addressed=False)
+
+
+@pytest.mark.parametrize(
+    "ascend_backend",
+    [
+        BackendType.Ascend910,
+        pytest.param(
+            BackendType.Ascend950,
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=RuntimeError,
+                reason="Pre-existing PTOAS A5 packing: a 64-KiB Left buffer followed by two 32-KiB buffers",
+            ),
+        ),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("enable_buffer_ir", [False, True])
+def test_ptoas_chained_matmul_retains_native_compilation(
+    tmp_path: Path, ascend_backend: BackendType, enable_buffer_ir: bool
+) -> None:
+    # This is the original system-test geometry, not an allocator workaround.
+    # Forcing PTOAS to single-C made its native greedy allocator request 96 KiB
+    # of Left storage against 64 KiB on A2/A3. Preserve its pre-policy chooser
+    # behavior and compile the complete, unchanged chain through both IR routes.
+    # A5 already fails on the pre-policy base: its native whole-buffer reuse
+    # cannot subdivide the dead producer buffer for the two consumer buffers.
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[256, 256], pl.BF16],
+            b: pl.Tensor[[256, 256], pl.BF16],
+            e: pl.Tensor[[256, 64], pl.BF16],
+            out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+        ) -> pl.Tensor[[256, 64], pl.FP32]:
+            tile_a = pl.load(a, [0, 0], [256, 256], target_memory=pl.MemorySpace.Mat)
+            tile_b = pl.load(b, [0, 0], [256, 256], target_memory=pl.MemorySpace.Mat)
+            c = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
+            cb = pl.cast(c, pl.BF16, mode="rint")
+            tile_e = pl.load(e, [0, 0], [256, 64], target_memory=pl.MemorySpace.Mat)
+            d = pl.matmul(cb, tile_e, out_dtype=pl.FP32)
+            out = pl.store(d, [0, 0], out)
+            return out
+
+    try:
+        with passes.PassContext(
+            [], memory_planner=passes.MemoryPlanner.PTOAS, enable_buffer_ir=enable_buffer_ir
+        ):
+            lowered = PassManager(OptimizationStrategy.Default).run_passes(Before)
+        _compile_native(tmp_path, lowered, ascend_backend, addressed=False)
+    except RuntimeError as error:
+        if ascend_backend == BackendType.Ascend950:
+            # Only this diagnosed native overflow is an expected failure; a
+            # different backend error must fail, and native success must XPASS.
+            assert "left overflow, requires 786432 bits while 524288 bits available" in str(error)
+        raise
+
+
 @pytest.mark.parametrize("ascend_backend", _BACKENDS, indirect=True)
 @pytest.mark.parametrize("planner", _PLANNERS)
 @pytest.mark.parametrize(
@@ -154,6 +260,21 @@ def test_init_cond_selects_explicit_initializing_and_accumulating_writes(
     branches: int,
 ) -> None:
     lowered = _lower(_conditional_accumulation(init_cond), planner)
+    if planner == passes.MemoryPlanner.PTOAS:
+        kernel = lowered.get_function("kernel")
+        assert kernel is not None and isinstance(kernel.body, ir.SeqStmts)
+        # The seed, carry and final store share storage across region boundaries.
+        # Unlike local temporaries, this declaration must continue to dominate
+        # the loop and both arms of a runtime initialization predicate.
+        assert (
+            sum(
+                isinstance(stmt, ir.AssignStmt)
+                and isinstance(stmt.var.type, ir.BufferType)
+                and stmt.var.type.memory_space == ir.MemorySpace.Acc
+                for stmt in kernel.body.stmts
+            )
+            == 1
+        )
     names = _call_names(lowered)
     assert (names["buffer.matmul"], names["buffer.matmul_acc"]) == (initializing, accumulating)
     conditionals = [statement for statement in statements(lowered) if isinstance(statement, ir.IfStmt)]

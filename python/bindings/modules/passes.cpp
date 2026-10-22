@@ -361,9 +361,10 @@ void BindPass(nb::module_& m) {
            nb::arg("enable_pypto_l0c_double_buffer") = false, nb::arg("runtime") = kDefaultRuntimeKind,
            nb::arg("enable_buffer_ir") = true,
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
-           "optional disabled diagnostic checks, memory planner selection, the experimental "
-           "legacy-PyPTO chooser-emitted L0C double-buffer (dbC=2) opt-in, and the target Simpler "
-           "runtime ABI, and default-on whole-kernel Buffer IR selection")
+           "optional disabled diagnostic checks, memory planner selection, the stored legacy "
+           "L0C double-buffer compatibility flag, the target Simpler runtime ABI, and default-on "
+           "whole-kernel Buffer IR selection. Automatic dbC remains disabled for PyPTO and DSA-RP; "
+           "PTOAS retains its existing selection regardless of the flag")
       .def("__enter__",
            [](PassContext& self) -> PassContext& {
              self.EnterContext();
@@ -382,8 +383,7 @@ void BindPass(nb::module_& m) {
       .def("get_memory_planner", &PassContext::GetMemoryPlanner,
            "Get the memory planner selection for this context")
       .def("get_enable_pypto_l0c_double_buffer", &PassContext::GetEnablePyptoL0cDoubleBuffer,
-           "Whether chooser-emitted L0C double-buffering (dbC=2) is enabled under the legacy PyPTO "
-           "memory planner")
+           "Return the stored legacy flag; it does not override the planner's automatic dbC policy")
       .def("get_runtime", &PassContext::GetRuntime, "Get the target Simpler runtime ABI for this context")
       .def("get_enable_buffer_ir", &PassContext::GetEnableBufferIR,
            "Whether supported whole kernels use Buffer IR")
@@ -591,10 +591,10 @@ void BindPass(nb::module_& m) {
              "tail. Plain tile.matmul may also use an M/N grid with direct-GM placement or an\n"
              "on-chip Mat scratch for chained matmul consumers; compatible f32->bf16/f16 rint\n"
              "casts fold into the FIXPIPE writeback. Full-K grids support output-, A-, and\n"
-             "B-stationary schedules. dbC=2 is enabled automatically under DSA_RP and PTOAS\n"
-             "and available as a legacy-PyPTO opt-in. Under PyPTO, a canonical already-L0 stationary-panel "
-             "pipeline\n"
-             "may automatically use two L0C slots when its post-lowering Acc footprint fits.\n"
+             "B-stationary schedules. Automatic dbC is excluded before selection for PyPTO and DSA-RP;\n"
+             "PTOAS retains its existing selection, independently of the legacy opt-in flag.\n"
+             "Existing L0 pipelines are not automatically\n"
+             "marked for accumulator double buffering; explicit buffering attributes are preserved.\n"
              "Mat-resident tile.matmul_bias is supported with accumulator-typed bias, bias-once K\n"
              "reduction, and bias-capacity-bounded N-window reloads followed by Mat-to-Bias moves. Other\n"
              "already-L0-sized and unsupported regimes are left untouched;\n"
