@@ -95,11 +95,45 @@ void VerifyCodegenTargetFunctionMatchesProgram(const ProgramPtr& program, const 
 
 }  // namespace
 
+void VerifyVFInfrastructureCodegenPreconditions(const ProgramPtr& program) {
+  INTERNAL_CHECK(program != nullptr) << "VF infrastructure check requires a program";
+  // PR1 persists these semantics but does not lower them. Check the whole tree
+  // before emitting anything: the base scope visitor would otherwise erase the
+  // register boundary and ordinary scf.for emission would ignore Require.
+  class VFInfrastructureChecker : public ir::IRVisitor {
+   public:
+    void VisitFunction(const ir::FunctionPtr& func) override {
+      // A bare register parameter has no scope to trigger the check below and
+      // would otherwise fall through to PTO's default pointer parameter ABI.
+      if (ir::IsInCoreType(func->func_type_)) {
+        for (const auto& param : func->params_) {
+          CHECK_SPAN(!ir::As<ir::RegType>(param->GetType()), param->span_)
+              << "RegType parameters are not supported by PTO code generation for "
+              << ir::FunctionTypeToString(func->func_type_) << " function '" << func->name_ << "'";
+        }
+      }
+      ir::IRVisitor::VisitFunction(func);
+    }
+
+    void VisitStmt_(const ir::RegScopeStmtPtr& op) override {
+      CHECK_SPAN(false, op->span_) << "RegScopeStmt code generation is not supported yet";
+    }
+    void VisitStmt_(const ir::ForStmtPtr& op) override {
+      CHECK_SPAN(op->hardware_loop_policy_ == ir::HardwareLoopPolicy::Auto, op->span_)
+          << "HardwareLoopPolicy.Require code generation is not supported yet";
+      ir::IRVisitor::VisitStmt_(op);
+    }
+  } checker;
+  checker.VisitProgram(program);
+}
+
 void VerifyOrchestrationCodegenPreconditions(const ProgramPtr& program, const FunctionPtr& func) {
   INTERNAL_CHECK(program != nullptr)
       << "Internal error: GenerateOrchestration preconditions — program must not be null";
   INTERNAL_CHECK(func != nullptr)
       << "Internal error: GenerateOrchestration preconditions — function must not be null";
+
+  VerifyVFInfrastructureCodegenPreconditions(program);
 
   // Codegen assumes hierarchy references resolved, explicit RuntimeScopeStmt
   // materialization, and a stamped iter_arg carry plan on every ForStmt.
@@ -128,6 +162,8 @@ void VerifyOrchestrationCodegenPreconditions(const ProgramPtr& program, const Fu
 void VerifyDistributedCodegenPreconditions(const ProgramPtr& program) {
   INTERNAL_CHECK(program != nullptr)
       << "Internal error: DistributedCodegen preconditions — program must not be null";
+
+  VerifyVFInfrastructureCodegenPreconditions(program);
 
   DistributedTensorUseCollector collector;
   collector.VisitProgram(program);
