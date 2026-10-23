@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <any>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -174,10 +173,6 @@ std::vector<std::pair<std::string, std::any>> WithSplitAttrs(const FunctionPtr& 
     }
   }
   return attrs;
-}
-
-ExprPtr MakeIndexConst(int64_t value, const Span& span) {
-  return std::make_shared<ConstInt>(value, DataType::INDEX, span);
 }
 
 TypePtr WithZeroValidShape(const TypePtr& type, const Span& span) {
