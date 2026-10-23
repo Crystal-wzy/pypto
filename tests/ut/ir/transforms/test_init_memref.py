@@ -493,6 +493,99 @@ class TestSliceView:
     """tile.slice is a view op: output shares the input's base Ptr with an
     accumulated byte offset and a smaller view size."""
 
+    @pytest.mark.parametrize("run_simplify", [False, True])
+    def test_nested_constant_origin_folds_without_freezing_loop_metadata(self, run_simplify):
+        """Constant SSA origins fold while loop-carried and indexed origins stay dynamic."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIC)
+            def main(
+                self,
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                pool = pl.tile.create([128, 16], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                row: pl.Scalar[pl.INDEX] = 16
+                for iteration in pl.range(2):
+                    base: pl.Scalar[pl.INDEX] = 32
+                    fixed_row = base * 2
+                    constant_view = pl.tile.slice(pool, [16, 16], [fixed_row, 0])
+                    carried_view = pl.tile.slice(pool, [16, 16], [row, 0])
+                    indexed_view = pl.tile.slice(pool, [16, 16], [iteration * 16, 0])
+                    _first = pl.tile.store(constant_view, [0, 0], output)
+                    _second = pl.tile.store(carried_view, [0, 0], output)
+                    _third = pl.tile.store(indexed_view, [0, 0], output)
+                    row = row + 16
+                return output
+
+        after = passes.convert_to_ssa()(Before)
+        if run_simplify:
+            after = passes.simplify()(after)
+        after = passes.init_mem_ref()(after)
+        found = {}
+
+        class Origins(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                for name in ("constant_view", "carried_view", "indexed_view"):
+                    if op.var.name_hint.startswith(name):
+                        assert isinstance(op.var.type, ir.TileType)
+                        assert op.var.type.memref is not None
+                        assert isinstance(op.value, ir.Call)
+                        origins = op.value.args[2]
+                        assert isinstance(origins, ir.MakeTuple)
+                        found[name] = (op.var.type.memref.byte_offset_, origins.elements[0])
+                super().visit_assign_stmt(op)
+
+        Origins().visit_stmt(next(iter(after.functions.values())).body)
+        assert set(found) == {"constant_view", "carried_view", "indexed_view"}
+        constant_offset, constant_origin = found["constant_view"]
+        assert isinstance(constant_offset, ir.ConstInt), str(constant_offset)
+        assert constant_offset.value == 64 * 16 * 4
+        assert isinstance(constant_origin, ir.ConstInt)
+        assert constant_origin.value == 64
+        for name in ("carried_view", "indexed_view"):
+            offset, origin = found[name]
+            assert not isinstance(offset, ir.ConstInt)
+            assert not isinstance(origin, ir.ConstInt)
+
+    @pytest.mark.parametrize(
+        ("column", "expected_offset", "expected_size"), [(128, 8192, 8192), (8, 32, 15872)]
+    )
+    def test_named_origins_use_the_same_acc_layout_as_literals(self, column, expected_offset, expected_size):
+        """Constant origins must reach both NZ layout selection and byte-offset computation."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIC)
+            def main(self, output: pl.Out[pl.Tensor[[16, 128], pl.FP32]]):
+                pool = pl.tile.create([16, 256], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                for _iteration in pl.range(2):
+                    zero: pl.Scalar[pl.INDEX] = 0
+                    col: pl.Scalar[pl.INDEX] = column
+                    window = pl.tile.slice(pool, [16, 128], [zero, col])
+                    _stored = pl.tile.store(window, [0, 0], output)
+
+        after = passes.init_mem_ref()(passes.convert_to_ssa()(Before))
+        windows = []
+
+        class Windows(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                if op.var.name_hint.startswith("window"):
+                    windows.append(op)
+                super().visit_assign_stmt(op)
+
+        Windows().visit_stmt(next(iter(after.functions.values())).body)
+        assert len(windows) == 1
+        memref = windows[0].var.type.memref
+        assert isinstance(memref.byte_offset_, ir.ConstInt)
+        assert memref.byte_offset_.value == expected_offset
+        assert memref.size_ == expected_size
+        origins = windows[0].value.args[2].elements
+        assert all(isinstance(origin, ir.ConstInt) for origin in origins)
+        assert [origin.value for origin in origins] == [0, column]
+
     def test_slice_nonzero_byte_offset_and_alloc_dedup(self):
         """tile.slice views share the source's base Ptr; only one alloc per base.
 
@@ -1138,6 +1231,112 @@ class TestYieldMemRef:
 
 class TestDynamicValidShape:
     """Regression tests for dynamic valid_shape Var handling in phi-node return vars."""
+
+    @pytest.mark.parametrize("run_simplify", [False, True])
+    def test_nested_valid_shape_propagates_through_transpose_view(self, run_simplify):
+        """Load/view metadata folds constants while retaining runtime extents and storage aliases."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                source: pl.Tensor[[16, 32], pl.FP32],
+                runtime_rows: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[32, 16], pl.FP32]],
+            ) -> pl.Tensor[[32, 16], pl.FP32]:
+                for _iteration in pl.range(2):
+                    base: pl.Scalar[pl.INDEX] = 4
+                    valid_rows = base * 2
+                    constant_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[valid_rows, 32], target_memory=pl.Mem.Vec
+                    )
+                    constant_view = pl.tile.transpose_view(constant_tile)
+                    _constant_store = pl.tile.store(constant_view, [0, 0], output)
+                    runtime_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[runtime_rows, 32], target_memory=pl.Mem.Vec
+                    )
+                    runtime_view = pl.tile.transpose_view(runtime_tile)
+                    _runtime_store = pl.tile.store(runtime_view, [0, 0], output)
+                return output
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                source: pl.Tensor[[16, 32], pl.FP32],
+                runtime_rows: pl.Scalar[pl.INDEX],
+                output: pl.Out[pl.Tensor[[32, 16], pl.FP32]],
+            ) -> pl.Tensor[[32, 16], pl.FP32]:
+                for _iteration in pl.range(2):
+                    constant_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[8, 32], target_memory=pl.Mem.Vec
+                    )
+                    constant_view = pl.tile.transpose_view(constant_tile)
+                    _constant_store = pl.tile.store(constant_view, [0, 0], output)
+                    runtime_tile = pl.tile.load(
+                        source, [0, 0], [16, 32], valid_shape=[runtime_rows, 32], target_memory=pl.Mem.Vec
+                    )
+                    runtime_view = pl.tile.transpose_view(runtime_tile)
+                    _runtime_store = pl.tile.store(runtime_view, [0, 0], output)
+                return output
+
+        after = passes.convert_to_ssa()(Before)
+        expected = passes.convert_to_ssa()(Expected)
+        if run_simplify:
+            after = passes.simplify()(after)
+            expected = passes.simplify()(expected)
+        after = passes.init_mem_ref()(after)
+        expected = passes.init_mem_ref()(expected)
+        ir.assert_structural_equal(without_call_memrefs(after), without_call_memrefs(expected))
+
+        function = next(iter(after.functions.values()))
+        runtime_rows = function.params[1]
+        found: dict[str, ir.AssignStmt] = {}
+        names = (
+            "constant_tile",
+            "constant_view",
+            "_constant_store",
+            "runtime_tile",
+            "runtime_view",
+            "_runtime_store",
+        )
+
+        class Assignments(ir.IRVisitor):
+            def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
+                for name in names:
+                    if op.var.name_hint.startswith(name):
+                        found[name] = op
+                super().visit_assign_stmt(op)
+
+        Assignments().visit_stmt(function.body)
+        assert set(found) == set(names)
+        for prefix, valid_rows in (("constant", 8), ("runtime", runtime_rows)):
+            loaded = found[f"{prefix}_tile"]
+            viewed = found[f"{prefix}_view"]
+            stored = found[f"_{prefix}_store"]
+            for assignment, shape, valid in (
+                (loaded, [16, 32], [valid_rows, 32]),
+                (viewed, [32, 16], [32, valid_rows]),
+            ):
+                assert isinstance(assignment.value, ir.Call)
+                for tile_type in (assignment.var.type, assignment.value.type):
+                    assert isinstance(tile_type, ir.TileType)
+                    assert all(isinstance(dim, ir.ConstInt) for dim in tile_type.shape)
+                    assert [cast(ir.ConstInt, dim).value for dim in tile_type.shape] == shape
+                    assert tile_type.tile_view is not None
+                    for extent, expected_extent in zip(tile_type.tile_view.valid_shape, valid, strict=True):
+                        if isinstance(expected_extent, int):
+                            assert isinstance(extent, ir.ConstInt) and extent.value == expected_extent
+                        else:
+                            assert extent.same_as(expected_extent), "runtime valid_shape lost its definition"
+            assert isinstance(loaded.var.type, ir.TileType)
+            assert isinstance(viewed.var.type, ir.TileType)
+            assert loaded.var.type.memref is not None
+            assert viewed.var.type.memref is loaded.var.type.memref
+            assert isinstance(viewed.value, ir.Call) and viewed.value.args[0].same_as(loaded.var)
+            assert isinstance(stored.value, ir.Call) and stored.value.args[0].same_as(viewed.var)
 
     def test_if_phi_preserves_dynamic_valid_shape_vars(self):
         """IfStmt phi return vars must not clone Vars in TileView.valid_shape (issue #870).

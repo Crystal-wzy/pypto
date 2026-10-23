@@ -241,8 +241,7 @@ class TestRangeAwareSimplification:
             @pl.function
             def main(self, out: pl.Tensor[[8], pl.INT64]):
                 for i in pl.range(8):
-                    y: pl.Scalar[pl.INT64] = 0
-                    pl.tensor.write(out, [i], y)
+                    pl.tensor.write(out, [i], pl.const(0, pl.INT64))
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
@@ -301,8 +300,7 @@ class TestRangeAwareSimplification:
             def main(self, out: pl.Tensor[[8, 4], pl.INT64]):
                 for i in pl.range(8):
                     for j in pl.range(4):
-                        y: pl.Scalar[pl.INT64] = 0
-                        pl.tensor.write(out, [i, j], y)
+                        pl.tensor.write(out, [i, j], pl.const(0, pl.INT64))
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
@@ -332,8 +330,7 @@ class TestIfBranchConstraint:
             def main(self, out: pl.Tensor[[8], pl.INT64]):
                 for i in pl.range(8):
                     if i < 4:
-                        y: pl.Scalar[pl.INT64] = 0
-                        pl.tensor.write(out, [i], y)
+                        pl.tensor.write(out, [i], pl.const(0, pl.INT64))
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
@@ -360,11 +357,9 @@ class TestIfBranchConstraint:
             def main(self, out: pl.Tensor[[8], pl.INT64]):
                 for i in pl.range(8):
                     if i < 4:
-                        y: pl.Scalar[pl.INT64] = 0
-                        pl.tensor.write(out, [i], y)
+                        pl.tensor.write(out, [i], pl.const(0, pl.INT64))
                     else:
-                        y2: pl.Scalar[pl.INT64] = 0
-                        pl.tensor.write(out, [i], y2)
+                        pl.tensor.write(out, [i], pl.const(0, pl.INT64))
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
@@ -390,11 +385,9 @@ class TestIfBranchConstraint:
             def main(self, out: pl.Tensor[[16], pl.INT64]):
                 for i in pl.range(16):
                     if i < 8:
-                        y: pl.Scalar[pl.INT64] = 0
-                        pl.tensor.write(out, [i], y)
+                        pl.tensor.write(out, [i], pl.const(0, pl.INT64))
                     else:
-                        z: pl.Scalar[pl.INT64] = 0
-                        pl.tensor.write(out, [i], z)
+                        pl.tensor.write(out, [i], pl.const(0, pl.INT64))
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
@@ -818,8 +811,7 @@ class TestControlFlow:
             def main(self, out: pl.Tensor[[8], pl.INT64]):
                 for i in pl.range(8):
                     if i < 4:
-                        y: pl.Scalar[pl.INT64] = 0
-                        pl.tensor.write(out, [i], y)
+                        pl.tensor.write(out, [i], pl.const(0, pl.INT64))
                         break
                     else:
                         y2: pl.Scalar[pl.INT64] = i
@@ -849,8 +841,7 @@ class TestControlFlow:
                 for i in pl.range(8):
                     with pl.at(level=pl.Level.CORE_GROUP):
                         if i < 4:
-                            y: pl.Scalar[pl.INT64] = 0
-                            pl.tensor.write(out, [i], y)
+                            pl.tensor.write(out, [i], pl.const(0, pl.INT64))
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
@@ -1116,6 +1107,662 @@ class TestScalarConstantPropagation:
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
+
+
+class TestNestedScalarConstantPropagation:
+    """Nested constants fold at every use without freezing runtime control flow."""
+
+    def test_branch_interval_does_not_escape_to_a_later_guard(self):
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, cond: pl.Scalar[pl.BOOL], x: pl.Scalar[pl.INDEX], out: pl.Tensor[[1], pl.INDEX]):
+                if cond:
+                    x = 1
+                if 0 <= x:
+                    pl.tensor.write(out, [0], x)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Before)
+
+    def test_single_trip_clone_preserves_multiple_assignments(self):
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INDEX], out: pl.Tensor[[2], pl.INDEX]):
+                for i in pl.range(2):
+                    for _j in pl.range(1):
+                        x: pl.Scalar[pl.INDEX] = 1
+                        x = n
+                        pl.tensor.write(out, [i], x)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INDEX], out: pl.Tensor[[2], pl.INDEX]):
+                for i in pl.range(2):
+                    x: pl.Scalar[pl.INDEX] = 1
+                    x = n
+                    pl.tensor.write(out, [i], x)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    @pytest.mark.parametrize("value", [1.00000001, -1.00000001])
+    def test_float_rounding_keeps_both_branches(self, value):
+        span = ir.Span.unknown()
+        literal = ir.ConstFloat(value, DataType.FP32, span)
+        rounded = ir.ConstFloat(1.0 if value > 0 else -1.0, DataType.FP32, span)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, out: pl.Tensor[[2], pl.INDEX]):
+                for i in pl.range(2):
+                    x: pl.Scalar[pl.FP32] = literal
+                    if x == rounded:
+                        pl.tensor.write(out, [i], pl.const(1, pl.INDEX))
+                    else:
+                        pl.tensor.write(out, [i], pl.const(2, pl.INDEX))
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, out: pl.Tensor[[2], pl.INDEX]):
+                for i in pl.range(2):
+                    if literal == rounded:
+                        pl.tensor.write(out, [i], pl.const(1, pl.INDEX))
+                    else:
+                        pl.tensor.write(out, [i], pl.const(2, pl.INDEX))
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_comm_domain_rebuilds_after_scalar_and_yield_slot_dce(self):
+        before = pl.parse_program("""
+@pl.program
+class Before:
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def main(self, cond: pl.Scalar[pl.BOOL], out: pl.Tensor[[2], pl.INDEX]):
+        with pl._dump.comm_domain(name="domain", devices=[0, 1], slots=[]):
+            for i in pl.range(2):
+                value: pl.Scalar[pl.INDEX] = 1
+                pl.tensor.write(out, [i], value)
+            if cond:
+                pl.tensor.write(out, [0], pl.const(2, pl.INDEX))
+                unused = pl.yield_(1)
+            else:
+                pl.tensor.write(out, [0], pl.const(3, pl.INDEX))
+                unused = pl.yield_(2)
+""")
+        expected = pl.parse_program("""
+@pl.program
+class Expected:
+    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+    def main(self, cond: pl.Scalar[pl.BOOL], out: pl.Tensor[[2], pl.INDEX]):
+        with pl._dump.comm_domain(name="domain", devices=[0, 1], slots=[]):
+            for i in pl.range(2):
+                pl.tensor.write(out, [i], pl.const(1, pl.INDEX))
+            if cond:
+                pl.tensor.write(out, [0], pl.const(2, pl.INDEX))
+            else:
+                pl.tensor.write(out, [0], pl.const(3, pl.INDEX))
+""")
+        after = passes.simplify()(before)
+        ir.assert_structural_equal(after, expected)
+
+    def test_nested_slice_and_assemble_origins(self):
+        """A nested alias chain folds for both reading and writing a window."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                cond: pl.Scalar[pl.BOOL],
+                source: pl.Tensor[[8, 8], pl.FP32],
+                out: pl.Tensor[[8, 8], pl.FP32],
+            ):
+                for _iteration in pl.range(2):
+                    if cond:
+                        base: pl.Scalar[pl.INDEX] = 1
+                        row: pl.Scalar[pl.INDEX] = base * 2
+                        alias: pl.Scalar[pl.INDEX] = row
+                        window = pl.tensor.slice(source, [4, 8], [alias, 0])
+                        _result = pl.tensor.assemble(out, window, [row, 0])
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                cond: pl.Scalar[pl.BOOL],
+                source: pl.Tensor[[8, 8], pl.FP32],
+                out: pl.Tensor[[8, 8], pl.FP32],
+            ):
+                for _iteration in pl.range(2):
+                    if cond:
+                        window = pl.tensor.slice(source, [4, 8], [2, 0])
+                        _result = pl.tensor.assemble(out, window, [2, 0])
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_nested_load_and_store_origins(self):
+        """Constant propagation also reaches transfer ops with different signatures."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, source: pl.Tensor[[8, 4], pl.FP32], out: pl.Tensor[[8, 4], pl.FP32]):
+                for _iteration in pl.range(2):
+                    row: pl.Scalar[pl.INDEX] = 4
+                    loaded = pl.tile.load(source, [row, 0], [4, 4], target_memory=pl.Mem.Vec)
+                    _result = pl.tile.store(loaded, [row, 0], out)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, source: pl.Tensor[[8, 4], pl.FP32], out: pl.Tensor[[8, 4], pl.FP32]):
+                for _iteration in pl.range(2):
+                    loaded = pl.tile.load(source, [4, 0], [4, 4], target_memory=pl.Mem.Vec)
+                    _result = pl.tile.store(loaded, [4, 0], out)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_nested_shape_updates_call_and_assignment_types(self):
+        """Folding a shape must update the Call and its binding together."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self):
+                for _iteration in pl.range(2):
+                    rows: pl.Scalar[pl.INDEX] = 4
+                    created: pl.Tensor[[rows, 8], pl.FP32] = pl.tensor.create([rows, 8], dtype=pl.FP32)
+                    _reshaped: pl.Tensor[[rows * 2, 4], pl.FP32] = pl.tensor.reshape(created, [rows * 2, 4])
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self):
+                for _iteration in pl.range(2):
+                    created: pl.Tensor[[4, 8], pl.FP32] = pl.tensor.create([4, 8], dtype=pl.FP32)
+                    _reshaped: pl.Tensor[[8, 4], pl.FP32] = pl.tensor.reshape(created, [8, 4])
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    @pytest.mark.parametrize("dtype", [pl.INT32, pl.INT64])
+    def test_nested_typed_constants_round_trip(self, dtype):
+        """Substituting a typed literal into a Call must preserve its dtype."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, out: pl.Tensor[[2], dtype]):
+                for i in pl.range(2):
+                    literal: pl.Scalar[dtype] = pl.const(7, dtype)
+                    derived: pl.Scalar[dtype] = literal
+                    pl.tensor.write(out, [i], derived)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, out: pl.Tensor[[2], dtype]):
+                for i in pl.range(2):
+                    pl.tensor.write(out, [i], pl.const(7, dtype))
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+        reparsed = pl.parse_program(ir.python_print(after))
+        ir.assert_structural_equal(reparsed, after)
+
+    @pytest.mark.parametrize("bool_as_int", [False, True])
+    def test_nested_float_and_bool_constants_round_trip(self, bool_as_int):
+        """Float and boolean literals retain their IR kinds and types after substitution."""
+        span = ir.Span.unknown()
+        true_value = ir.ConstInt(1, DataType.BOOL, span) if bool_as_int else ir.ConstBool(True, span)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, floats: pl.Tensor[[2], pl.FP32], flags: pl.Tensor[[2], pl.BOOL]):
+                for i in pl.range(2):
+                    float_value: pl.Scalar[pl.FP32] = pl.const(3.5, pl.FP32)
+                    flag: pl.Scalar[pl.BOOL] = true_value
+                    pl.tensor.write(floats, [i], float_value)
+                    pl.tensor.write(flags, [i], flag)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, floats: pl.Tensor[[2], pl.FP32], flags: pl.Tensor[[2], pl.BOOL]):
+                for i in pl.range(2):
+                    pl.tensor.write(floats, [i], pl.const(3.5, pl.FP32))
+                    pl.tensor.write(flags, [i], true_value)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+        reparsed = pl.parse_program(ir.python_print(after))
+        ir.assert_structural_equal(reparsed, after)
+
+    def test_for_carry_does_not_fold_to_its_constant_initializer(self):
+        """A carry changes each iteration even when its first value is literal."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, out: pl.Tensor[[2], pl.INDEX]):
+                for i, (carry,) in pl.range(2, init_values=(pl.const(3, pl.INDEX),)):
+                    pl.tensor.write(out, [i], carry)
+                    next_value: pl.Scalar[pl.INDEX] = carry + 1
+                    _result = pl.yield_(next_value)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Before)
+
+    def test_if_result_does_not_fold_to_one_branch_constant(self):
+        """Both branch-local constants fold, but the merged value stays dynamic."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, cond: pl.Scalar[pl.BOOL], out: pl.Tensor[[1], pl.INDEX]):
+                if cond:
+                    then_value: pl.Scalar[pl.INDEX] = 2
+                    selected = pl.yield_(then_value)
+                else:
+                    else_value: pl.Scalar[pl.INDEX] = 4
+                    selected = pl.yield_(else_value)
+                pl.tensor.write(out, [0], selected)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, cond: pl.Scalar[pl.BOOL], out: pl.Tensor[[1], pl.INDEX]):
+                if cond:
+                    selected = pl.yield_(pl.const(2, pl.INDEX))
+                else:
+                    selected = pl.yield_(pl.const(4, pl.INDEX))
+                pl.tensor.write(out, [0], selected)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_while_constants_fold_without_freezing_the_carry(self):
+        """A local constant folds while the while-condition still reads its carry."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, out: pl.Tensor[[4], pl.INDEX]):
+                for (carry,) in pl.while_(init_values=(pl.const(0, pl.INDEX),)):
+                    pl.cond(carry < 4)
+                    step: pl.Scalar[pl.INDEX] = 1
+                    pl.tensor.write(out, [carry], step)
+                    next_value: pl.Scalar[pl.INDEX] = carry + step
+                    _result = pl.yield_(next_value)
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, out: pl.Tensor[[4], pl.INDEX]):
+                for (carry,) in pl.while_(init_values=(pl.const(0, pl.INDEX),)):
+                    pl.cond(carry < 4)
+                    pl.tensor.write(out, [carry], pl.const(1, pl.INDEX))
+                    next_value: pl.Scalar[pl.INDEX] = carry + 1
+                    _result = pl.yield_(next_value)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_allocated_offset_keeps_its_scalar_definition(self):
+        """A scalar used only by an allocated MemRef's offset must remain defined."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, source: pl.Tensor[[8, 8], pl.FP32]):
+                for _iteration in pl.range(2):
+                    offset: pl.Scalar[pl.INDEX] = 4
+                    view: pl.Tensor[[4, 8], pl.FP32, pl.MemRef("mem", offset * 32, 128)] = pl.tensor.slice(
+                        source, [4, 8], [0, 0]
+                    )
+                    pl.tensor.write(view, [0, 0], pl.const(1.0, pl.FP32))
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Before)
+
+        def view_memref(program: ir.Program) -> ir.MemRef:
+            function = next(iter(program.functions.values()))
+            loop = next(stmt for stmt in ir.flatten_to_stmts(function.body) if isinstance(stmt, ir.ForStmt))
+            view = next(
+                stmt.var
+                for stmt in ir.flatten_to_stmts(loop.body)
+                if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint == "view"
+            )
+            view_type = view.type
+            assert isinstance(view_type, ir.TensorType)
+            assert view_type.memref is not None
+            return view_type.memref
+
+        assert view_memref(after) is view_memref(Before)
+
+    def test_allocated_memref_tracks_a_rebuilt_loop_carry(self):
+        """Imported allocated storage follows a new carry without freezing its address."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, source: pl.Tensor[[2, 8], pl.FP32]):
+                initial: pl.Scalar[pl.INDEX] = 0
+                seed: pl.Scalar[pl.INDEX] = initial
+                for _iteration, (carry,) in pl.range(2, init_values=(seed,)):
+                    view: pl.Tensor[[1, 8], pl.FP32, pl.MemRef("mem", carry * 32, 32)] = pl.tensor.slice(
+                        source, [1, 8], [carry, 0]
+                    )
+                    alias = view
+                    pl.tensor.write(view, [0, 0], pl.const(1.0, pl.FP32))
+                    pl.tensor.write(alias, [0, 1], pl.const(2.0, pl.FP32))
+                    next_value: pl.Scalar[pl.INDEX] = carry + 1
+                    _result = pl.yield_(next_value)
+
+        def loop_of(program: ir.Program) -> ir.ForStmt:
+            function = next(iter(program.functions.values()))
+            return next(stmt for stmt in ir.flatten_to_stmts(function.body) if isinstance(stmt, ir.ForStmt))
+
+        old_carry = loop_of(Before).iter_args[0]
+        after = passes.simplify()(Before)
+        loop = loop_of(after)
+        carry = loop.iter_args[0]
+        assert not carry.same_as(old_carry), "the initializer must actually rebuild the carry"
+        assert isinstance(carry.initValue, ir.ConstInt) and carry.initValue.value == 0
+
+        statements = ir.flatten_to_stmts(loop.body)
+        views = [
+            stmt.var.type
+            for stmt in statements
+            if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint in {"view", "alias"}
+        ]
+        assert len(views) == 2
+        view_type, alias_type = views
+        assert isinstance(view_type, ir.TensorType) and isinstance(alias_type, ir.TensorType)
+        memref = view_type.memref
+        assert memref is not None and not memref.is_pinned_
+        assert alias_type.memref is memref
+        assert isinstance(memref.byte_offset_, ir.Mul), "the address must remain iteration-dependent"
+        assert memref.byte_offset_.left.same_as(carry)
+        assert memref.slot_count_ == 1 and memref.size_ == 32
+
+        writes = [stmt.expr for stmt in statements if isinstance(stmt, ir.EvalStmt)]
+        assert len(writes) == 2
+        for write in writes:
+            assert isinstance(write, ir.Call)
+            assert write.op.name == ir.get_op("tensor.write").name
+            result_type, input_type = write.type, write.args[0].type
+            assert isinstance(result_type, ir.TensorType) and isinstance(input_type, ir.TensorType)
+            assert result_type.memref is memref and input_type.memref is memref
+
+    @pytest.mark.parametrize("loop_kind", ["for", "while"])
+    @pytest.mark.parametrize("tensor_first", [True, False], ids=["tensor-first", "scalar-first"])
+    @pytest.mark.parametrize("fold_initializer", [True, False], ids=["alias-init", "unchanged-init"])
+    def test_loop_header_storage_rebinding_is_order_independent(
+        self, loop_kind: str, tensor_first: bool, fold_initializer: bool
+    ):
+        """All carry definitions must exist before rebinding any carry's storage type."""
+        span = ir.Span.unknown()
+        index_type = ir.ScalarType(DataType.INDEX)
+
+        def const(value: int) -> ir.ConstInt:
+            return ir.ConstInt(value, DataType.INDEX, span)
+
+        source_type = ir.TensorType([1, 8], DataType.FP32)
+        source = ir.Var("source", source_type, span)
+        sink = ir.Var("sink", ir.TensorType([8, 8], DataType.FP32), span)
+        initial = ir.Var("initial", index_type, span)
+        seed = ir.Var("seed", index_type, span)
+        scalar = ir.IterArg("scalar", index_type, seed if fold_initializer else const(0), span)
+        storage = ir.MemRef(
+            ir.Var("mem", ir.PtrType(), span),
+            ir.Mul(scalar, const(32), DataType.INDEX, span),
+            32,
+            span,
+            slots=2,
+            slot=scalar,
+        )
+        carried_type = ir.TensorType([1, 8], DataType.FP32, storage)
+        tensor = ir.IterArg("tensor", carried_type, source, span)
+        alias = ir.Var("alias", carried_type, span)
+        next_scalar = ir.Var("next_scalar", index_type, span)
+        tensor_result = ir.Var("tensor_result", source_type, span)
+        scalar_result = ir.Var("scalar_result", index_type, span)
+
+        def ordered(tensor_value: ir.Expr, scalar_value: ir.Expr) -> list[ir.Expr]:
+            return [tensor_value, scalar_value] if tensor_first else [scalar_value, tensor_value]
+
+        def write(destination: ir.Var, row: ir.Expr, column: int) -> ir.Call:
+            return ir.create_op_call(
+                "tensor.write",
+                [
+                    destination,
+                    ir.MakeTuple([row, const(column)], span),
+                    ir.ConstFloat(1.0, DataType.FP32, span),
+                ],
+                span,
+            )
+
+        body = ir.SeqStmts(
+            [
+                ir.AssignStmt(alias, tensor, span),
+                ir.EvalStmt(write(tensor, const(0), 0), span),
+                ir.EvalStmt(write(alias, const(0), 1), span),
+                ir.AssignStmt(next_scalar, ir.Add(scalar, const(1), DataType.INDEX, span), span),
+                ir.YieldStmt(ordered(tensor, next_scalar), span),
+            ],
+            span,
+        )
+        arguments = [tensor, scalar] if tensor_first else [scalar, tensor]
+        results = [tensor_result, scalar_result] if tensor_first else [scalar_result, tensor_result]
+        if loop_kind == "for":
+            before_loop = ir.ForStmt(
+                ir.Var("iteration", index_type, span),
+                const(0),
+                const(2),
+                const(1),
+                arguments,
+                body,
+                results,
+                span,
+            )
+        else:
+            before_loop = ir.WhileStmt(
+                ir.Lt(scalar, const(2), DataType.BOOL, span), arguments, body, results, span
+            )
+        function = ir.Function(
+            "main",
+            [source, sink],
+            [],
+            ir.SeqStmts(
+                [
+                    ir.AssignStmt(initial, const(0), span),
+                    ir.AssignStmt(seed, initial, span),
+                    before_loop,
+                    ir.EvalStmt(write(tensor_result, const(0), 0), span),
+                    ir.EvalStmt(write(sink, scalar_result, 0), span),
+                ],
+                span,
+            ),
+            span,
+        )
+        before = ir.Program([function], "imported_loop_header", span)
+        # Imported allocated metadata may refer to a later header binder. The DSL
+        # infers carries' types from their outer initializers, so it cannot print/parse
+        # this header type. Keep pass verification and check the complete IR below.
+        instruments: list[passes.PassInstrument] = [
+            passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)
+        ]
+        with passes.PassContext(instruments):
+            after = passes.simplify()(before)
+        after_function = after.get_function("main")
+        assert after_function is not None
+        loop = next(
+            stmt
+            for stmt in ir.flatten_to_stmts(after_function.body)
+            if isinstance(stmt, (ir.ForStmt, ir.WhileStmt))
+        )
+        tensor_index, scalar_index = (0, 1) if tensor_first else (1, 0)
+        new_tensor, new_scalar = loop.iter_args[tensor_index], loop.iter_args[scalar_index]
+        assert isinstance(new_scalar.initValue, ir.ConstInt) and new_scalar.initValue.value == 0
+        assert new_scalar.same_as(scalar) != fold_initializer
+        assert new_tensor.same_as(tensor) != fold_initializer
+        tensor_type = new_tensor.type
+        assert isinstance(tensor_type, ir.TensorType) and tensor_type.memref is not None
+        memref = tensor_type.memref
+        assert memref.is_pinned_ is False and memref.slot_count_ == 2
+        assert isinstance(memref.byte_offset_, ir.Mul), "the address must remain iteration-dependent"
+        assert memref.byte_offset_.left.same_as(new_scalar), "storage names a discarded scalar carry"
+        assert memref.slot_index_ is not None and memref.slot_index_.same_as(new_scalar)
+        assert (memref is storage) != fold_initializer
+
+        statements = ir.flatten_to_stmts(loop.body)
+        alias_assignment = next(stmt for stmt in statements if isinstance(stmt, ir.AssignStmt))
+        assert alias_assignment.value.same_as(new_tensor)
+        alias_type = alias_assignment.var.type
+        assert isinstance(alias_type, ir.TensorType) and alias_type.memref is memref
+        writes = [stmt.expr for stmt in statements if isinstance(stmt, ir.EvalStmt)]
+        assert len(writes) == 2
+        for write_call, destination in zip(writes, [new_tensor, alias_assignment.var], strict=True):
+            assert isinstance(write_call, ir.Call) and write_call.args[0].same_as(destination)
+            write_type = write_call.type
+            assert isinstance(write_type, ir.TensorType) and write_type.memref is memref
+        update = next(
+            stmt for stmt in statements if isinstance(stmt, ir.AssignStmt) and stmt is not alias_assignment
+        )
+        assert isinstance(update.value, ir.Add) and update.value.left.same_as(new_scalar)
+        yielded = next(stmt for stmt in statements if isinstance(stmt, ir.YieldStmt))
+        assert yielded.value[tensor_index].same_as(new_tensor)
+        assert yielded.value[scalar_index].same_as(update.var)
+        if isinstance(loop, ir.WhileStmt):
+            assert isinstance(loop.condition, ir.Lt) and loop.condition.left.same_as(new_scalar)
+
+        properties = passes.IRPropertySet()
+        properties.insert(passes.IRProperty.SSAForm)
+        properties.insert(passes.IRProperty.UseAfterDef)
+        diagnostics = passes.PropertyVerifierRegistry.verify(properties, after)
+        assert not diagnostics, [diagnostic.message for diagnostic in diagnostics]
+
+    def test_if_result_storage_tracks_a_rebuilt_nested_loop_carry(self):
+        """A retained branch result must share its yielded views' rebound storage."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, source: pl.Tensor[[2, 8], pl.FP32], cond: pl.Scalar[pl.BOOL]):
+                for _outer in pl.range(2):
+                    initial: pl.Scalar[pl.INDEX] = 0
+                    seed: pl.Scalar[pl.INDEX] = initial
+                    for _inner, (carry,) in pl.range(2, init_values=(seed,)):
+                        view: pl.Tensor[[1, 8], pl.FP32, pl.MemRef("mem", carry * 32, 32)] = pl.tensor.slice(
+                            source, [1, 8], [carry, 0]
+                        )
+                        if cond:
+                            then_view = view
+                            selected = pl.yield_(then_view)
+                        else:
+                            else_view = view
+                            selected = pl.yield_(else_view)
+                        pl.tensor.write(selected, [0, 0], pl.const(1.0, pl.FP32))
+                        next_value: pl.Scalar[pl.INDEX] = carry + 1
+                        _result = pl.yield_(next_value)
+
+        def inner_loop(program: ir.Program) -> ir.ForStmt:
+            function = next(iter(program.functions.values()))
+            outer = next(stmt for stmt in ir.flatten_to_stmts(function.body) if isinstance(stmt, ir.ForStmt))
+            return next(stmt for stmt in ir.flatten_to_stmts(outer.body) if isinstance(stmt, ir.ForStmt))
+
+        original_loop = inner_loop(Before)
+        old_carry = original_loop.iter_args[0]
+        old_branch = next(
+            stmt for stmt in ir.flatten_to_stmts(original_loop.body) if isinstance(stmt, ir.IfStmt)
+        )
+        after = passes.simplify()(Before)
+        loop = inner_loop(after)
+        carry = loop.iter_args[0]
+        assert not carry.same_as(old_carry)
+        assert isinstance(carry.initValue, ir.ConstInt) and carry.initValue.value == 0
+
+        statements = ir.flatten_to_stmts(loop.body)
+        branch = next(stmt for stmt in statements if isinstance(stmt, ir.IfStmt))
+        result = branch.return_vars[0]
+        assert not result.same_as(old_branch.return_vars[0]), "the phi definition must adopt its rebound type"
+        result_type = result.type
+        assert isinstance(result_type, ir.TensorType) and result_type.memref is not None
+        memref = result_type.memref
+        assert isinstance(memref.byte_offset_, ir.Mul)
+        assert memref.byte_offset_.left.same_as(carry), "the phi still names the discarded carry"
+        assert branch.else_body is not None
+        for body in (branch.then_body, branch.else_body):
+            yielded = next(stmt for stmt in ir.flatten_to_stmts(body) if isinstance(stmt, ir.YieldStmt))
+            yielded_type = yielded.value[0].type
+            assert isinstance(yielded_type, ir.TensorType)
+            assert yielded_type.memref is memref
+
+        write = next(stmt.expr for stmt in statements if isinstance(stmt, ir.EvalStmt))
+        assert isinstance(write, ir.Call)
+        assert write.args[0].same_as(result), "the consumer must reference the rebuilt phi definition"
+        write_type = write.type
+        assert isinstance(write_type, ir.TensorType) and write_type.memref is memref
+
+        properties = passes.IRPropertySet()
+        properties.insert(passes.IRProperty.SSAForm)
+        properties.insert(passes.IRProperty.UseAfterDef)
+        diagnostics = passes.PropertyVerifierRegistry.verify(properties, after)
+        assert not diagnostics, [diagnostic.message for diagnostic in diagnostics]
+
+    def test_if_result_used_only_in_a_slot_index_survives(self):
+        """The selected slot is a live phi even when its only use is a type field."""
+        buffers = pl.MemRef(slots=2)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                cond: pl.Scalar[pl.BOOL],
+                source: pl.Tensor[[4, 4], pl.FP32],
+                out: pl.Tensor[[4, 4], pl.FP32],
+            ):
+                if cond:
+                    slot = pl.yield_(0)
+                else:
+                    slot = pl.yield_(1)
+                loaded: pl.Tile[[4, 4], pl.FP32, buffers[slot], pl.Mem.Vec] = pl.tile.load(
+                    source, [0, 0], [4, 4], target_memory=pl.Mem.Vec
+                )
+                _result = pl.tile.store(loaded, [0, 0], out)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Before)
+
+    def test_for_result_used_only_in_a_slot_index_survives(self):
+        """A return slot keeps the loop's yielded value live through type metadata."""
+        buffers = pl.MemRef(slots=2)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, source: pl.Tensor[[4, 4], pl.FP32], out: pl.Tensor[[4, 4], pl.FP32]):
+                for _iteration, (_slot,) in pl.range(2, init_values=(pl.const(0, pl.INDEX),)):
+                    final_slot = pl.yield_(1)
+                loaded: pl.Tile[[4, 4], pl.FP32, buffers[final_slot], pl.Mem.Vec] = pl.tile.load(
+                    source, [0, 0], [4, 4], target_memory=pl.Mem.Vec
+                )
+                _result = pl.tile.store(loaded, [0, 0], out)
+
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Before)
 
 
 # ============================================================================
@@ -2023,6 +2670,126 @@ class TestSpmdScopeCoreNum:
 
 
 class TestManualScopeSubmit:
+    @pytest.mark.parametrize("normalization", ["simplify", "init_mem_ref"])
+    @pytest.mark.parametrize("loop_kind", ["for", "while"])
+    def test_rebuilt_carry_keeps_spmd_scope_dependency_in_scope(self, normalization: str, loop_kind: str):
+        """Pre-outline dependencies and runtime predicates must follow rebuilt loop carries."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, t: pl.Tensor[[4, 8], pl.FP32]) -> pl.Tensor[[4, 8], pl.FP32]:
+                return t
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, t: pl.Tensor[[4, 8], pl.FP32], gates: pl.Tensor[[4, 8], pl.INT32]
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                initial: pl.Scalar[pl.INDEX] = 0
+                seed: pl.Scalar[pl.INDEX] = initial
+                with pl.manual_scope():
+                    first_tid = pl.system.task_dummy(deps=[])
+                    dependency_seed: pl.Scalar[pl.TASK_ID] = first_tid
+                    for _i, (count, dependency) in pl.range(2, init_values=(seed, dependency_seed)):
+                        with pl.spmd(4, deps=[dependency], predicate=(gates[count, 0] > 0)) as next_tid:
+                            self.kernel(t)
+                        final_count, _final_tid = pl.yield_(count + 1, next_tid)
+                pl.tensor.write(t, [final_count, 0], pl.const(1.0, pl.FP32))
+                return t
+
+        properties = passes.IRPropertySet()
+        properties.insert(passes.IRProperty.SSAForm)
+        properties.insert(passes.IRProperty.UseAfterDef)
+
+        def verify(program: ir.Program):
+            diagnostics = passes.PropertyVerifierRegistry.verify(properties, program)
+            assert not diagnostics, [diagnostic.message for diagnostic in diagnostics]
+
+        def collect(program: ir.Program):
+            loops: list[ir.ForStmt | ir.WhileStmt] = []
+            scopes: list[ir.SpmdScopeStmt] = []
+
+            class Collector(ir.IRVisitor):
+                def visit_for_stmt(self, op):
+                    loops.append(op)
+                    super().visit_for_stmt(op)
+
+                def visit_while_stmt(self, op):
+                    loops.append(op)
+                    super().visit_while_stmt(op)
+
+                def visit_spmd_scope_stmt(self, op):
+                    scopes.append(op)
+                    super().visit_spmd_scope_stmt(op)
+
+            Collector().visit_program(program)
+            return loops[0], scopes[0]
+
+        program = passes.convert_to_ssa()(Before)
+        if loop_kind == "while":
+            # Reuse the exact SSA carry group and scope body, changing only the
+            # loop kind and its condition so both carry-rebuilding paths are covered.
+            class ToWhile(ir.IRMutator):
+                def visit_for_stmt(self, op):
+                    count = next(
+                        carry
+                        for carry in op.iter_args
+                        if isinstance(carry.type, ir.ScalarType) and carry.type.dtype == DataType.INDEX
+                    )
+                    condition = ir.Lt(count, ir.ConstInt(2, DataType.INDEX, op.span), DataType.BOOL, op.span)
+                    return ir.WhileStmt(condition, op.iter_args, op.body, op.return_vars, op.span)
+
+            program = ToWhile().visit_program(program)
+        verify(program)
+        old_loop, old_scope = collect(program)
+        old_count = next(
+            carry
+            for carry in old_loop.iter_args
+            if isinstance(carry.type, ir.ScalarType) and carry.type.dtype == DataType.INDEX
+        )
+        old_dependency = next(
+            carry
+            for carry in old_loop.iter_args
+            if isinstance(carry.type, ir.ScalarType) and carry.type.dtype == DataType.TASK_ID
+        )
+        # Keep semantic verification without print/reparse so a stale dependency
+        # is reported as a use outside its binder, not an incidental text mismatch.
+        with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+            program = getattr(passes, normalization)()(program)
+        loop, scope = collect(program)
+        count = next(
+            carry
+            for carry in loop.iter_args
+            if isinstance(carry.type, ir.ScalarType) and carry.type.dtype == DataType.INDEX
+        )
+        dependency = next(
+            carry
+            for carry in loop.iter_args
+            if isinstance(carry.type, ir.ScalarType) and carry.type.dtype == DataType.TASK_ID
+        )
+        assert not dependency.same_as(old_dependency), "the constant seed must rebuild the carry group"
+        assert not count.same_as(old_count)
+        assert scope.attrs["manual_dep_edges"][0].same_as(dependency)
+        predicate = scope.attrs["predicate"]
+        assert isinstance(predicate, (ir.Gt, ir.Lt)), "dispatch must still depend on a runtime tensor read"
+        # Full Simplify canonicalizes read > 0 to 0 < read; constant-only
+        # normalization retains the original comparison orientation.
+        read = predicate.left if isinstance(predicate, ir.Gt) else predicate.right
+        threshold = predicate.right if isinstance(predicate, ir.Gt) else predicate.left
+        assert isinstance(threshold, ir.ConstInt) and threshold.value == 0
+        while isinstance(read, ir.Cast):
+            read = read.operand
+        assert isinstance(read, ir.Call) and read.op.name == ir.get_op("tensor.read").name
+        indices = read.args[1]
+        assert isinstance(indices, ir.MakeTuple) and indices.elements[0].same_as(count)
+        if isinstance(loop, ir.WhileStmt):
+            assert isinstance(loop.condition, ir.Lt) and loop.condition.left.same_as(count)
+        assert isinstance(scope.core_num, ir.ConstInt) and scope.core_num.value == 4
+        if normalization == "simplify":
+            assert scope.body.same_as(old_scope.body), "only dispatch attrs need rewriting"
+            assert scope.core_num.same_as(old_scope.core_num)
+        verify(program)
+
     def test_folds_shape_into_submit_arg_preserving_submit(self):
         """A top-level constant folds into a tensor shape that feeds a
         pl.submit inside pl.manual_scope.
@@ -2162,11 +2929,9 @@ class TestDeadIfReturnVarsDCE:
             @pl.function(strict_ssa=True)
             def main(self, cond: pl.Scalar[pl.BOOL], out: pl.Tensor[[1], pl.INDEX]):
                 if cond:
-                    t1_0: pl.Scalar[pl.INDEX] = 1
-                    pl.tensor.write(out, [0], t1_0)
+                    pl.tensor.write(out, [0], pl.const(1, pl.INDEX))
                 else:
-                    t1_1: pl.Scalar[pl.INDEX] = 2
-                    pl.tensor.write(out, [0], t1_1)
+                    pl.tensor.write(out, [0], pl.const(2, pl.INDEX))
 
         ssa_form = passes.convert_to_ssa()(Before)
         after = passes.simplify()(ssa_form)
