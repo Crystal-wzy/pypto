@@ -62,6 +62,7 @@ import copy
 import functools
 import inspect
 import json
+import math
 import os
 import re
 import textwrap
@@ -1983,13 +1984,24 @@ def _extract_local_tensor_metas(
         shape = _resolve_shape(shape_node)
         if shape is None:
             return None
-        # A reshape re-groups the dims a layout describes, so the source layout
-        # need not hold on the result — but claiming ND instead would be the
-        # same silent mis-declaration. Decline the meta and let _build_params
-        # raise its clear "missing type annotation" error.
+        # Other non-ND reshapes reinterpret layout coordinates, so claiming ND
+        # would mis-declare the result. The whole static NZ buffer is the one
+        # exception: its rank-1 physical view needs no coordinate rewrite.
+        # Match BlockNzTensorViews::IsWholeTensorFlatten; symbolic bounds do
+        # not prove the runtime element count. The reshape result is ND.
         if src_meta.layout not in (None, _ir.TensorLayout.ND):
-            return None
-        return TensorMeta(shape=shape, dtype=src_meta.dtype)
+            whole_nz_flatten = (
+                src_meta.layout == _ir.TensorLayout.NZ
+                and len(shape) == 1
+                and type(shape[0]) is int
+                and all(type(dim) is int for dim in src_meta.shape)
+                and math.prod(cast(tuple[int, ...], src_meta.shape)) == shape[0]
+            )
+            if not whole_nz_flatten:
+                return None
+        # Unlike an omitted parameter layout, a reshape result is known ND.
+        # Keep it explicit so a dependency's annotation cannot overwrite it.
+        return TensorMeta(shape=shape, dtype=src_meta.dtype, layout=_ir.TensorLayout.ND)
 
     def _slice_meta(call: ast.Call, target: str | None = None) -> TensorMeta | None:
         # pl.slice(input, shape, offset, ...) / pl.tensor.slice(tensor, shape,
@@ -2654,11 +2666,10 @@ def _overlay_dep_declared_dyn_dims(
 def _overlay_dep_declared_layouts(dep: JITFunction, dep_tensor_meta: dict[str, TensorMeta]) -> None:
     """Fill in layouts a dep declares itself, in place.
 
-    Nothing on the caller side carries them — an argument's meta reflects the
-    *caller's* annotation — so without this a dep declaring
-    ``pl.Tensor[[...], pl.NZ]`` under a caller that declares none compiles as
-    ND, silently. The caller wins on conflict, matching how the DynDim overlay
-    only fills what the caller left plain.
+    An omitted caller layout leaves ``meta.layout`` as None, so without this a
+    dep declaring ``pl.Tensor[[...], pl.NZ]`` under a caller that declares none
+    compiles as ND, silently. Known caller layouts, including an operation's
+    inferred ND result, win on conflict; only None is filled.
 
     Args:
         dep: The dep whose own annotations to read
