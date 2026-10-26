@@ -247,6 +247,9 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    if (canonical_branch_storage_ && !LoopMayExecute(op, false)) {
+      return IRMutator::VisitStmt_(As<ForStmt>(FixupCanonicalLoop(op)));
+    }
     // First recurse into nested control flow
     auto result = IRMutator::VisitStmt_(op);
     auto for_stmt = As<ForStmt>(result);
@@ -351,6 +354,9 @@ class YieldFixupMutator : public StorageBoundaryMutator {
   }
 
   StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+    if (canonical_branch_storage_ && !LoopMayExecute(op, false)) {
+      return IRMutator::VisitStmt_(As<WhileStmt>(FixupCanonicalLoop(op)));
+    }
     auto result = IRMutator::VisitStmt_(op);
     if (!canonical_branch_storage_) return result;
     return FixupCanonicalLoop(As<WhileStmt>(result));
@@ -495,6 +501,22 @@ class YieldFixupMutator : public StorageBoundaryMutator {
 
   template <typename LoopPtr>
   StmtPtr FixupCanonicalLoop(const LoopPtr& loop) {
+    // Tensor descriptors are reanchored by their dedicated boundary logic.
+    // This fixup only reconciles Tile storage; preserve Tensor-only bodies,
+    // including their writeback statements and sequence structure at zero trips.
+    if (std::none_of(loop->iter_args_.begin(), loop->iter_args_.end(),
+                     [](const IterArgPtr& argument) { return As<TileType>(argument->GetType()); })) {
+      return loop;
+    }
+    if (!LoopMayExecute(loop, false)) {
+      // The body cannot run, so no transfer into a carry is needed. Give the
+      // unreachable boundary canonical identity yields rather than requesting
+      // an unsupported copy solely to reconcile its dead source storage.
+      auto result = MutableCopy(loop);
+      std::vector<ExprPtr> values(loop->iter_args_.begin(), loop->iter_args_.end());
+      result->body_ = std::make_shared<YieldStmt>(std::move(values), loop->span_);
+      return result;
+    }
     std::vector<VarPtr> targets(loop->iter_args_.begin(), loop->iter_args_.end());
     auto body = FixupCanonicalBoundary(loop->body_, targets, loop->span_);
     if (body == loop->body_) return loop;
