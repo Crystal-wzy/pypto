@@ -351,6 +351,11 @@ class BackendHandler {
    */
   [[nodiscard]] virtual bool SupportsBf16AtomicAdd() const = 0;
 
+  /// Maximum logical columns in one FP32 Acc -> FP32 NZ GM store; zero means
+  /// unsupported. Tiling and final emission must use the same instruction bound.
+  /// Source dtype, layout and full-parent-row legality are checked separately.
+  [[nodiscard]] virtual int GetAccToNzGmStoreMaxCols() const { return 0; }
+
   /**
    * @brief Whether the cube fix-pipe may store an Acc-resident tile straight
    *        into a GM tensor of @p dtype.
