@@ -896,12 +896,14 @@ std::unordered_set<const Var*> ScopeOutliner::ComputeFallbackUsedAfter(const Sco
   if (!inside_nested_scope_body_) {
     var_collectors::VarDefUseCollector def_collector;
     def_collector.VisitStmt(scope->body_);
-    // Scalars and tuple unpacking temporaries are not runtime outputs. The
-    // latter already expose their tensor projections as separate definitions;
-    // exporting both would produce a nested tuple at a terminal SPMD boundary.
+    // Scalars, tuple unpacking temporaries, and Reg values are not runtime
+    // outputs. Tuple projections already expose their tensor definitions;
+    // exporting the tuple too would create a nested terminal SPMD output.
     // Actual live-out uses are handled by the explicit tail-use analysis.
     for (const Var* var : def_collector.var_defs) {
-      if (As<ScalarType>(var->GetType()) || As<TupleType>(var->GetType())) continue;
+      if (As<ScalarType>(var->GetType()) || As<TupleType>(var->GetType()) || As<RegType>(var->GetType())) {
+        continue;
+      }
       used_after.insert(var);
     }
   }
