@@ -27,7 +27,12 @@ from .syntax_helpers import is_pl_call
 from .type_resolver import (
     _is_dump_call,  # noqa: PLC2701
 )
-from .type_semantics import derive_return_types_from_body
+from .type_semantics import (
+    InlineReturnProvenanceCollector,
+    derive_return_types_from_body,
+    inline_argument_return_type,
+    inline_immutable_aliases,
+)
 
 if TYPE_CHECKING:
     from .decorator import InlineFunction
@@ -60,6 +65,9 @@ class CallParser:
         # object (not id()) keeps a strong reference, so there is no id-reuse
         # hazard from a collected-and-reallocated Function.
         self.derived_return_types_cache: dict[ir.Function, list[ir.Type]] = {}
+        self.inline_return_provenance_cache: dict[
+            ir.Function, tuple[tuple[ir.Expr, ...], frozenset[int], dict[int, ir.Expr]]
+        ] = {}
 
     def parse_submit_assignment(self, target: ast.Tuple, call: ast.Call, *, is_spmd: bool = False) -> None:
         """Parse ``out, tid = pl.submit(self.kernel, *args, deps=[...])`` and the
@@ -514,11 +522,15 @@ class CallParser:
                 args,
                 as_submit=as_submit,
             )
+            # Void inline wrappers can still carry independent placeholders.
+            # Defer their Tile contracts to expansion; format checks run in either mode.
             return_types = ir.deduce_call_return_type(
                 callee_params_for_return,
                 args_for_return,
                 return_types,
+                is_inline=bool(return_types) and func_obj.func_type == ir.FunctionType.Inline,
             )
+            return_types = self.inline_argument_return_types(func_obj, args, return_types)
         return self.make_call_with_return_type(
             gvar,
             args,
@@ -558,6 +570,44 @@ class CallParser:
             cached = derive_return_types_from_body(func.body)
             self.derived_return_types_cache[func] = cached
         return list(cached)
+
+    def inline_argument_return_types(
+        self, func: ir.Function, args: list[ir.Expr], return_types: list[ir.Type]
+    ) -> list[ir.Type]:
+        """Keep direct Tile returns in caller scope after native contract checking.
+
+        Different inline operands may specialize one generic symbol differently.
+        An unresolved callee symbol cannot survive in a caller's temporary type,
+        so recover proven parameter returns from the corresponding actual type.
+        A single trailing return and an unmodified formal (possibly reached
+        through immutable aliases) are required; computed values and competing
+        return paths retain native inference.
+        """
+        if func.func_type != ir.FunctionType.Inline or len(args) != len(func.params):
+            return return_types
+        cached = self.inline_return_provenance_cache.get(func)
+        if cached is None:
+            collector = InlineReturnProvenanceCollector()
+            collector.visit_stmt(func.body)
+            trailing = func.body
+            if isinstance(trailing, ir.SeqStmts) and trailing.stmts:
+                trailing = trailing.stmts[-1]
+            values = (
+                tuple(trailing.value)
+                if collector.return_count == 1 and isinstance(trailing, ir.ReturnStmt)
+                else ()
+            )
+            aliases = inline_immutable_aliases(func, collector) if values else {}
+            cached = (values, frozenset(collector.assigned_ids), aliases)
+            self.inline_return_provenance_cache[func] = cached
+        values, assigned_ids, aliases = cached
+        if len(values) != len(return_types):
+            return return_types
+        argument_types = {p.unique_id: a.type for p, a in zip(func.params, args)}
+        return [
+            inline_argument_return_type(v, t, argument_types, assigned_ids, aliases) or t
+            for v, t in zip(values, return_types)
+        ]
 
     def make_call_with_return_type(  # noqa: PLR0913, PLR0912 — cohesive call-builder; bundling args/branches hurts clarity
         self,
@@ -1006,11 +1056,16 @@ class CallParser:
         args = [self.callbacks.expression(arg) for arg in call.args]
 
         gvar = ir.GlobalVar(func_name)
+        return_types = self.effective_return_types(ext_func)
         return_types = ir.deduce_call_return_type(
             list(ext_func.params),
             args,
-            self.effective_return_types(ext_func),
+            return_types,
+            # Match method calls: void wrappers validate Tile contracts only
+            # after expansion supplies their final arguments. Format checks remain active.
+            is_inline=bool(return_types) and ext_func.func_type == ir.FunctionType.Inline,
         )
+        return_types = self.inline_argument_return_types(ext_func, args, return_types)
         return self.make_call_with_return_type(gvar, args, return_types, span)
 
     @staticmethod

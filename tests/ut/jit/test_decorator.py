@@ -14,6 +14,7 @@ import importlib
 import inspect
 import re
 import textwrap
+import types
 import warnings
 from copy import deepcopy
 from pathlib import Path
@@ -22,6 +23,8 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 from pypto import backend
+from pypto.backend import BackendType
+from pypto.backend._ptoas_locate import find_ptoas_binary
 from pypto.ir import OptimizationStrategy, PassManager
 from pypto.ir.compiled_program import CompiledProgram
 from pypto.jit._arguments import (
@@ -59,8 +62,9 @@ from pypto.language.parser.diagnostics.exceptions import (
     ParserTypeError,
     UnsupportedFeatureError,
 )
-from pypto.pypto_core import DataType, InternalError, ir
-from pypto.runtime.runner import RunConfig
+from pypto.language.typing.direction import InOut as TileDirection
+from pypto.pypto_core import DataType, InternalError, ir, passes
+from pypto.runtime.runner import ExecutionMode, RunConfig
 
 # ---------------------------------------------------------------------------
 # Decoration tests (no torch needed)
@@ -3930,6 +3934,726 @@ class TestInlineFuncIntegration:
             return y
 
         entry.compile(torch.zeros(16, 64), torch.zeros(16, 64))
+
+
+class TestInlineTileAnnotations:
+    """Typed inline Tile parameters keep their on-core contract (issue #3034)."""
+
+    @staticmethod
+    def _entry(copy_incore: JITFunction, shape) -> JITFunction:
+        """Wrap an in-core caller without moving its helper bindings out of the test."""
+
+        @jit
+        def entry(src: pl.Tensor[shape, pl.FP32], dst: pl.Out[pl.Tensor[shape, pl.FP32]]):
+            return copy_incore(src, dst)
+
+        return entry
+
+    @staticmethod
+    def _compile(entry: JITFunction, *args, output_dir: Path | None = None) -> CompiledProgram:
+        compiled = entry.compile(
+            *args,
+            config=RunConfig(
+                backend_type=BackendType.Ascend910,
+                execution_mode=ExecutionMode.SIM,
+                codegen_only=True,
+                save_kernels_dir=str(output_dir) if output_dir is not None else None,
+            ),
+        )
+        assert isinstance(compiled, CompiledProgram)
+        return compiled
+
+    @staticmethod
+    def _postponed(raw, annotations: dict[str, str], **namespace):
+        """Keep inspectable source while emulating a module's postponed annotations."""
+        function = types.FunctionType(
+            raw.__code__, {**raw.__globals__, **namespace}, raw.__name__, closure=raw.__closure__
+        )
+        function.__annotations__ = annotations
+        return function
+
+    @staticmethod
+    def _pto_source(output_dir: Path) -> str:
+        paths = list(output_dir.rglob("*.pto"))
+        assert paths
+        return "\n".join(path.read_text() for path in paths)
+
+    @pytest.mark.parametrize("postponed", [False, True])
+    @pytest.mark.parametrize("nested", [False, True], ids=["flat", "nested_mixed"])
+    def test_tuple_tile_parameters_compile(self, postponed, nested):
+        """Tuple leaves retain independent Tile dimensions and the selected caller's type."""
+        ROWS = pl.dynamic("TUPLE_TILE_ROWS")
+        if nested:
+
+            def choose(
+                pair: pl.Tuple[
+                    pl.Tensor[[32, 64], pl.FP32],
+                    pl.Scalar[pl.INDEX],
+                    pl.Tuple[pl.Tile[[ROWS, 64], pl.FP32], pl.Tile[[ROWS, 64], pl.FP32]],
+                ],
+            ) -> pl.Tile:
+                return pair[2][1]
+
+            annotation = (
+                "pl.Tuple[pl.Tensor[[32, 64], pl.FP32], pl.Scalar[pl.INDEX], "
+                "pl.Tuple[pl.Tile[[ROWS, 64], pl.FP32], pl.Tile[[ROWS, 64], pl.FP32]]]"
+            )
+        else:
+
+            def choose(
+                pair: pl.Tuple[pl.Tile[[ROWS, 64], pl.FP32], pl.Tile[[ROWS, 64], pl.FP32]],
+            ) -> pl.Tile:
+                return pair[1]
+
+            annotation = "pl.Tuple[pl.Tile[[ROWS, 64], pl.FP32], pl.Tile[[ROWS, 64], pl.FP32]]"
+
+        raw = choose
+        if postponed:
+            raw = self._postponed(raw, {"pair": annotation, "return": "pl.Tile"}, ROWS=ROWS)
+        choose = jit.inline(auto_scope=False)(raw)
+
+        if nested:
+
+            @jit.incore
+            def copy_incore(src: pl.Tensor[[32, 64], pl.FP32], dst: pl.Out[pl.Tensor[[32, 64], pl.FP32]]):
+                first = pl.load(src, [0, 0], [16, 64])
+                second = pl.load(src, [0, 0], [32, 64])
+                # Pyright cannot correlate the nested flag with the conditional helper signature.
+                selected = choose((src, pl.const(7, pl.INDEX), (first, second)))  # pyright: ignore[reportArgumentType]
+                result = pl.add(selected, second)
+                return pl.store(result, [0, 0], dst)
+
+        else:
+
+            @jit.incore
+            def copy_incore(src: pl.Tensor[[32, 64], pl.FP32], dst: pl.Out[pl.Tensor[[32, 64], pl.FP32]]):
+                first = pl.load(src, [0, 0], [16, 64])
+                second = pl.load(src, [0, 0], [32, 64])
+                selected = choose((first, second))
+                # The selected Tile keeps the second caller's extent before inline expansion.
+                result = pl.add(selected, second)
+                return pl.store(result, [0, 0], dst)
+
+        self._compile(self._entry(copy_incore, [32, 64]))
+
+    def test_tuple_factory_annotations_specialize_each_leaf_and_invalidate_cache(self):
+        """Erased factory values and distinct constexpr formals survive in separate Tuple leaves."""
+
+        def factory(columns):
+            FIRST = 8
+            SECOND = 8
+            VIEW = pl.TileView(valid_shape=[3, columns])
+
+            @jit.inline(auto_scope=False)
+            def choose(
+                pair: pl.Tuple[
+                    pl.Tile[[FIRST, columns], pl.FP32],
+                    pl.Tuple[pl.Tile[[SECOND, columns], pl.FP32, pl.Mem.Vec, VIEW]],
+                ],
+                FIRST: pl.constexpr,
+                SECOND: pl.constexpr,
+            ) -> pl.Tile:
+                return pair[1][0]
+
+            return choose
+
+        choose = factory(64)
+        assert not choose._func.__code__.co_freevars
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[16, 64], pl.FP32], dst: pl.Out[pl.Tensor[[16, 64], pl.FP32]]):
+            first = pl.load(src, [0, 0], [8, 64], valid_shape=[3, 64], target_memory=pl.Mem.Vec)
+            second = pl.load(src, [0, 0], [16, 64], valid_shape=[3, 64], target_memory=pl.Mem.Vec)
+            selected = choose((first, (second,)), 8, 16)
+            output = pl.store(selected, [0, 0], dst)
+            swapped = choose((second, (first,)), 16, 8)
+            return pl.store(swapped, [0, 0], output)
+
+        entry = self._entry(copy_incore, [16, 64])
+
+        source_hash = entry._get_source_hash()
+        persistent_digest = entry._persistent_source_digest()
+        compiled = self._compile(entry)
+        assert self._compile(entry) is compiled
+
+        choose = factory(128)
+        assert entry._get_source_hash() != source_hash
+        assert entry._persistent_source_digest() != persistent_digest
+        with pytest.raises(ValueError, match=r"Inline call to 'choose.*physical shape dimension\[1\]"):
+            self._compile(entry)
+
+    def test_tuple_tile_contract_is_checked_for_an_unused_leaf(self):
+        """The retained tuple signature reaches recursive validation before the helper disappears."""
+
+        @jit.inline(auto_scope=False)
+        def choose(pair: pl.Tuple[pl.Tile[[8, 64], pl.FP32], pl.Tile[[8, 64], pl.FP32]]) -> pl.Tile:
+            return pair[0]
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[16, 64], pl.FP32], dst: pl.Out[pl.Tensor[[16, 64], pl.FP32]]):
+            first = pl.load(src, [0, 0], [8, 64])
+            second = pl.load(src, [0, 0], [16, 64])
+            selected = choose((first, second))
+            return pl.store(selected, [0, 0], dst)
+
+        entry = self._entry(copy_incore, [16, 64])
+
+        with pytest.raises(
+            ValueError, match=r"Inline call to 'choose'.*parameter 'pair'.*tuple element\[1\].*physical shape"
+        ):
+            self._compile(entry)
+
+    @pytest.mark.parametrize("affine", [False, True])
+    def test_immutable_tile_alias_return_compiles(self, affine):
+        """A returned local alias can be consumed before inline expansion resolves generic dimensions."""
+        rows = pl.dynamic("JIT_IMMUTABLE_ALIAS_ROWS")
+        extent = 2 * rows if affine else rows
+
+        @jit.inline(auto_scope=False)
+        def choose_second(first: pl.Tile[[extent, 64], pl.FP32], second: pl.Tile[[extent, 64], pl.FP32]):
+            alias = second
+            result = alias
+            return result
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[32, 64], pl.FP32], dst: pl.Out[pl.Tensor[[32, 64], pl.FP32]]):
+            first = pl.load(src, [0, 0], [16, 64])
+            second = pl.load(src, [0, 0], [32, 64])
+            selected = choose_second(first, second)
+            result = pl.add(selected, second)
+            return pl.store(result, [0, 0], dst)
+
+        self._compile(self._entry(copy_incore, [32, 64]))
+
+    @pytest.mark.parametrize("physical_rows, constexpr_rows", [(8, 16), (16, 8)])
+    @pytest.mark.parametrize("mixed_axes", [False, True])
+    def test_free_dynvar_is_independent_of_same_named_constexpr(
+        self, physical_rows, constexpr_rows, mixed_axes
+    ):
+        """A canonical DynVar label must not make a generic extent use an unrelated constexpr."""
+        M = pl.dynamic("ROWS")
+        ROWS = 99
+        if mixed_axes:
+
+            @jit.inline(auto_scope=False)
+            def keep_tile(tile: pl.Tile[[M, ROWS], pl.FP32], ROWS: pl.constexpr) -> pl.Tile:
+                return tile
+
+            cols = constexpr_rows
+        else:
+
+            @jit.inline(auto_scope=False)
+            def keep_tile(tile: pl.Tile[[M, 64], pl.FP32], ROWS: pl.constexpr) -> pl.Tile:
+                return tile
+
+            cols = 64
+
+        @jit.incore
+        def copy_incore(
+            src: pl.Tensor[[physical_rows, cols], pl.FP32],
+            dst: pl.Out[pl.Tensor[[physical_rows, cols], pl.FP32]],
+        ):
+            tile = pl.load(src, [0, 0], [physical_rows, cols])
+            kept = keep_tile(tile, constexpr_rows)
+            return pl.store(kept, [0, 0], dst)
+
+        self._compile(self._entry(copy_incore, [physical_rows, cols]))
+
+    @pytest.mark.parametrize("postponed", [False, True])
+    @pytest.mark.parametrize("symbol_name", ["tile", "anchor"])
+    def test_generic_tile_symbol_matching_nonscalar_parameter_compiles(self, postponed, symbol_name):
+        """A module-level shape symbol can share a name with a Tile or Tensor formal."""
+        ROWS = pl.dynamic(symbol_name)
+
+        def keep_tile(anchor: pl.Tensor[[8, 64], pl.FP32], tile: pl.Tile[[ROWS, 64], pl.FP32]) -> pl.Tile:
+            return tile
+
+        raw = keep_tile
+        if postponed:
+            raw = self._postponed(
+                raw,
+                {
+                    "anchor": "pl.Tensor[[8, 64], pl.FP32]",
+                    "tile": "pl.Tile[[ROWS, 64], pl.FP32]",
+                    "return": "pl.Tile",
+                },
+                ROWS=ROWS,
+            )
+        keep_tile = jit.inline(auto_scope=False)(raw)
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[8, 64], pl.FP32], dst: pl.Out[pl.Tensor[[8, 64], pl.FP32]]):
+            tile = pl.load(src, [0, 0], [8, 64])
+            kept = keep_tile(src, tile)
+            return pl.store(kept, [0, 0], dst)
+
+        self._compile(self._entry(copy_incore, [8, 64]))
+
+    @pytest.mark.parametrize("changed", ["factory-shape", "memory-space"])
+    def test_eager_factory_shape_with_constexpr_space_compiles_and_invalidates_cache(self, changed):
+        """SPACE specialization retains erased rows and rechecks changed contracts."""
+        SPACE = pl.Mem.Vec
+
+        def factory(rows):
+            @jit.inline(auto_scope=False)
+            def keep_tile(tile: pl.Tile[[rows, 64], pl.FP32, SPACE], SPACE: pl.constexpr) -> pl.Tile:
+                return tile
+
+            return keep_tile
+
+        keep_tile = factory(8)
+        assert not keep_tile._func.__code__.co_freevars
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[8, 64], pl.FP32], dst: pl.Out[pl.Tensor[[8, 64], pl.FP32]]):
+            tile = pl.load(src, [0, 0], [8, 64], target_memory=pl.Mem.Vec)
+            kept = keep_tile(tile, SPACE)
+            return pl.store(kept, [0, 0], dst)
+
+        entry = self._entry(copy_incore, [8, 64])
+
+        source_hash = entry._get_source_hash()
+        persistent_digest = entry._persistent_source_digest()
+        first = self._compile(entry)
+        assert self._compile(entry) is first
+        if changed == "factory-shape":
+            keep_tile = factory(16)
+            conflict = "physical shape dimension"
+        else:
+            # Intentionally rebind the annotation constant to test cache invalidation.
+            SPACE = pl.Mem.Mat  # pyright: ignore[reportConstantRedefinition]
+            conflict = "memory space"
+        assert entry._get_source_hash() != source_hash
+        assert entry._persistent_source_digest() != persistent_digest
+        with pytest.raises(ValueError, match=f"Inline call to 'keep_tile'.*{conflict}"):
+            self._compile(entry)
+
+    @pytest.mark.parametrize(
+        "changed",
+        ["dynvar", "shape", "view", "constexpr-view", "Out", "InOut", "direction-alias", "contract"],
+    )
+    def test_postponed_annotation_rebinding_invalidates_cache(self, changed):
+        """Each annotation form enters both cache keys and rechecks a rebound contract."""
+        ROWS = pl.dynamic("FIRST_ROWS") if changed == "dynvar" else 99
+        SHAPE = [pl.dynamic("FIRST_ROWS"), 64]
+        VIEW = pl.TileView(valid_shape=[1, 64], stride=[64, 1])
+        CONTRACT = pl.Tile[[8, 64], pl.FP32, pl.Mem.Vec]
+        if changed == "dynvar":
+
+            def keep_tile(tile: pl.Tile[[ROWS, 64], pl.FP32, pl.Mem.Vec]) -> pl.Tile:
+                return tile
+
+            annotation = "pl.Tile[[ROWS, 64], pl.FP32, pl.Mem.Vec]"
+        elif changed == "contract":
+            # Runtime Tile aliases are valid DSL annotations, outside Python's static type grammar.
+            def keep_tile(tile: CONTRACT) -> pl.Tile:  # pyright: ignore[reportInvalidTypeForm]
+                return tile
+
+            annotation = "CONTRACT"
+        elif changed == "Out":
+
+            def keep_tile(tile: pl.Out[pl.Tile[[ROWS, 64], pl.FP32, VIEW]], ROWS: pl.constexpr) -> pl.Tile:
+                return tile
+
+            annotation = "pl.Out[pl.Tile[[ROWS, 64], pl.FP32, VIEW]]"
+        elif changed == "InOut":
+
+            def keep_tile(tile: pl.InOut[pl.Tile[[ROWS, 64], pl.FP32, VIEW]], ROWS: pl.constexpr) -> pl.Tile:
+                return tile
+
+            annotation = "pl.InOut[pl.Tile[[ROWS, 64], pl.FP32, VIEW]]"
+        elif changed == "direction-alias":
+
+            def keep_tile(
+                tile: TileDirection[pl.Tile[[ROWS, 64], pl.FP32, VIEW]], ROWS: pl.constexpr
+            ) -> pl.Tile:
+                return tile
+
+            annotation = "TileDirection[pl.Tile[[ROWS, 64], pl.FP32, VIEW]]"
+        elif changed == "constexpr-view":
+
+            def keep_tile(
+                tile: pl.Tile[[ROWS, 64], pl.FP32, pl.Mem.Vec, VIEW], ROWS: pl.constexpr
+            ) -> pl.Tile:
+                return tile
+
+            annotation = "pl.Tile[[ROWS, 64], pl.FP32, pl.Mem.Vec, VIEW]"
+        else:
+
+            def keep_tile(tile: pl.Tile[SHAPE, pl.FP32, pl.Mem.Vec, VIEW], ROWS: pl.constexpr) -> pl.Tile:
+                return tile
+
+            annotation = "pl.Tile[SHAPE, pl.FP32, pl.Mem.Vec, VIEW]"
+
+        annotations = {"tile": annotation, "return": "pl.Tile"}
+        if changed not in ("dynvar", "contract"):
+            annotations["ROWS"] = "pl.constexpr"
+        postponed = self._postponed(
+            keep_tile, annotations, ROWS=ROWS, SHAPE=SHAPE, VIEW=VIEW, CONTRACT=CONTRACT
+        )
+        keep_tile = jit.inline(auto_scope=False)(postponed)
+        if changed in ("dynvar", "contract"):
+
+            @jit.incore
+            def copy_incore(src: pl.Tensor[[8, 64], pl.FP32], dst: pl.Out[pl.Tensor[[8, 64], pl.FP32]]):
+                tile = pl.load(src, [0, 0], [8, 64], target_memory=pl.Mem.Vec)
+                kept = keep_tile(tile)
+                return pl.store(kept, [0, 0], dst)
+
+        else:
+
+            @jit.incore
+            def copy_incore(src: pl.Tensor[[8, 64], pl.FP32], dst: pl.Out[pl.Tensor[[8, 64], pl.FP32]]):
+                tile = pl.load(src, [0, 0], [8, 64], target_memory=pl.Mem.Vec)
+                kept = keep_tile(tile, 8)
+                return pl.store(kept, [0, 0], dst)
+
+        entry = self._entry(copy_incore, [8, 64])
+        source_hash, persistent_digest = entry._get_source_hash(), entry._persistent_source_digest()
+        first = self._compile(entry)
+        assert self._compile(entry) is first
+
+        name, value = {
+            "dynvar": ("ROWS", pl.dynamic("SECOND_ROWS")),
+            "shape": ("SHAPE", [pl.dynamic("SECOND_ROWS"), 64]),
+            "contract": ("CONTRACT", pl.Tile[[16, 64], pl.FP32, pl.Mem.Vec]),
+        }.get(changed, ("VIEW", pl.TileView(valid_shape=[2, 64], stride=[64, 1])))
+        postponed.__globals__[name] = value
+        assert entry._get_source_hash() != source_hash
+        assert entry._persistent_source_digest() != persistent_digest
+        if changed == "contract":
+            # A stale artifact would skip validation of the new 16-row contract.
+            with pytest.raises(ValueError, match="Inline call to 'keep_tile'.*physical shape dimension"):
+                self._compile(entry)
+        else:
+            assert self._compile(entry) is not first
+
+    @pytest.mark.parametrize("rows", [8, 16])
+    def test_eager_factory_annotation_compiles_and_invalidates_cache(self, rows, tmp_path):
+        """Annotation-only factory values survive and rebinding rechecks the cached contract."""
+
+        def factory(tile_rows):
+            @jit.inline(auto_scope=False)
+            def keep_tile(tile: pl.Tile[[tile_rows, 64], pl.FP32, pl.Mem.Vec]) -> pl.Tile:
+                return tile
+
+            return keep_tile
+
+        keep_tile = factory(rows)
+        assert "tile_rows" not in keep_tile._func.__code__.co_freevars
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[rows, 64], pl.FP32], dst: pl.Out[pl.Tensor[[rows, 64], pl.FP32]]):
+            tile = pl.load(src, [0, 0], [rows, 64], target_memory=pl.Mem.Vec)
+            kept = keep_tile(tile)
+            return pl.store(kept, [0, 0], dst)
+
+        entry = self._entry(copy_incore, [rows, 64])
+        static_hash = entry._get_static_source_hash()
+        source_hash, persistent_digest = entry._get_source_hash(), entry._persistent_source_digest()
+        self._compile(entry, output_dir=tmp_path)
+        source = self._pto_source(tmp_path)
+        assert f"rows={rows}, cols=64" in source
+        assert source.count("pto.tload ") == source.count("pto.tstore ") == 1
+
+        # Saving generated files bypasses caching; use normal compiles to check artifact reuse.
+        compiled = self._compile(entry)
+        assert self._compile(entry) is compiled
+        keep_tile = factory(rows * 2)
+        assert entry._get_static_source_hash() == static_hash
+        assert entry._get_source_hash() != source_hash
+        assert entry._persistent_source_digest() != persistent_digest
+        # Reusing the old artifact would bypass validation of the changed shape.
+        with pytest.raises(ValueError, match="Inline call to 'keep_tile'.*physical shape dimension"):
+            self._compile(entry)
+
+    def test_rebound_parameterized_factory_contract_invalidates_cached_artifact(self):
+        """A constexpr axis must not hide a changed annotation-only factory axis."""
+        ROWS = 99
+
+        def factory(cols):
+            @jit.inline(auto_scope=False)
+            def keep_tile(tile: pl.Tile[[ROWS, cols], pl.FP32, pl.Mem.Vec], ROWS: pl.constexpr) -> pl.Tile:
+                return tile
+
+            return keep_tile
+
+        keep_tile = factory(64)
+        assert not keep_tile._func.__code__.co_freevars
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[8, 128], pl.FP32], dst: pl.Out[pl.Tensor[[8, 128], pl.FP32]]):
+            tile = pl.load(src, [0, 0], [8, 64], target_memory=pl.Mem.Vec)
+            kept = keep_tile(tile, 8)
+            return pl.store(kept, [0, 0], dst)
+
+        entry = self._entry(copy_incore, [8, 128])
+
+        static_hash = entry._get_static_source_hash()
+        source_hash = entry._get_source_hash()
+        persistent_digest = entry._persistent_source_digest()
+        compiled = self._compile(entry)
+        assert self._compile(entry) is compiled
+
+        keep_tile = factory(128)
+        assert entry._get_static_source_hash() == static_hash
+        assert entry._get_source_hash() != source_hash
+        assert entry._persistent_source_digest() != persistent_digest
+        with pytest.raises(ValueError, match="Inline call to 'keep_tile'.*physical shape dimension"):
+            self._compile(entry)
+
+    def test_eager_generic_tile_with_dynamic_tensor_anchor_compiles(self, tmp_path):
+        """A Tensor anchor declares M while the helper's physical M binds to eight."""
+        M = pl.dynamic("M")
+
+        @jit.inline(auto_scope=False)
+        def keep_tile(tile: pl.Tile[[M, 64], pl.FP32, pl.Mem.Vec]) -> pl.Tile:
+            return tile
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[M, 64], pl.FP32], dst: pl.Out[pl.Tensor[[M, 64], pl.FP32]]):
+            valid_rows = pl.min(pl.tensor.dim(src, 0), 8)
+            tile = pl.load(src, [0, 0], [8, 64], valid_shape=[valid_rows, 64], target_memory=pl.Mem.Vec)
+            kept = keep_tile(tile)
+            return pl.store(kept, [0, 0], dst)
+
+        entry = self._entry(copy_incore, [M, 64])
+
+        self._compile(entry, output_dir=tmp_path)
+        source = self._pto_source(tmp_path)
+        assert "rows=8, cols=64" in source
+        assert "v_row=?" in source
+        assert source.count("pto.tload ") == source.count("pto.tstore ") == 1
+
+    @pytest.mark.parametrize("symbol_name", ["M", "TILE_ROWS"])
+    def test_tile_only_generic_dim_compiles(self, symbol_name, tmp_path):
+        """A generic Tile formal declares its symbol even when every Tensor is static."""
+        ROWS = pl.dynamic(symbol_name)
+
+        def factory(dimension):
+            @jit.inline(auto_scope=False)
+            def keep_tile(tile: pl.Tile[[dimension, 64], pl.FP32, pl.Mem.Vec]) -> pl.Tile:
+                return tile
+
+            return keep_tile
+
+        keep_tile = factory(ROWS)
+        assert not keep_tile._func.__code__.co_freevars
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[8, 64], pl.FP32], dst: pl.Out[pl.Tensor[[8, 64], pl.FP32]]):
+            tile = pl.load(src, [0, 0], [8, 64], target_memory=pl.Mem.Vec)
+            kept = keep_tile(tile)
+            return pl.store(kept, [0, 0], dst)
+
+        entry = self._entry(copy_incore, [8, 64])
+
+        self._compile(entry, output_dir=tmp_path)
+        source = self._pto_source(tmp_path)
+        assert "rows=8, cols=64" in source
+        assert source.count("pto.tload ") == source.count("pto.tstore ") == 1
+
+    @pytest.mark.parametrize(
+        "shape, dtype, space, mismatch",
+        [
+            ([16, 64], pl.FP32, pl.Mem.Vec, "physical shape dimension"),
+            ([8, 64], pl.BF16, pl.Mem.Vec, "dtype"),
+            ([8, 64], pl.FP32, pl.Mem.Mat, "memory space"),
+        ],
+        ids=["shape", "dtype", "memory-space"],
+    )
+    def test_compile_rejects_conflicting_inline_tile(self, shape, dtype, space, mismatch):
+        """The default compile pipeline checks a Tile before erasing the helper."""
+
+        @jit.inline(auto_scope=False)
+        def keep_tile(tile: pl.Tile[[8, 64], pl.FP32, pl.Mem.Vec]) -> pl.Tile:
+            return tile
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[16, 64], dtype]):
+            tile = pl.load(src, [0, 0], shape, target_memory=space)
+            _kept = keep_tile(tile)
+
+        @jit
+        def entry(src: pl.Tensor[[16, 64], dtype]):
+            copy_incore(src)
+
+        with pytest.raises(ValueError, match=f"Inline call to 'keep_tile' parameter 'tile': .*{mismatch}"):
+            self._compile(entry)
+
+    @classmethod
+    def _dynamic_entries(cls):
+        M = pl.dynamic("INLINE_TILE_ROWS")
+
+        @jit.inline(auto_scope=False)
+        def keep_tile(t: pl.Tile[[8, 64], pl.FP32, pl.Mem.Vec]) -> pl.Tile:
+            return t
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[M, 64], pl.FP32], dst: pl.Out[pl.Tensor[[M, 64], pl.FP32]]):
+            valid_rows = pl.min(pl.tensor.dim(src, 0), 8)
+            tile = pl.load(src, [0, 0], [8, 64], valid_shape=[valid_rows, 64], target_memory=pl.Mem.Vec)
+            kept = keep_tile(tile)
+            return pl.store(kept, [0, 0], dst)
+
+        @jit.incore
+        def baseline_incore(src: pl.Tensor[[M, 64], pl.FP32], dst: pl.Out[pl.Tensor[[M, 64], pl.FP32]]):
+            valid_rows = pl.min(pl.tensor.dim(src, 0), 8)
+            tile = pl.load(src, [0, 0], [8, 64], valid_shape=[valid_rows, 64], target_memory=pl.Mem.Vec)
+            return pl.store(tile, [0, 0], dst)
+
+        return cls._entry(copy_incore, [M, 64]), cls._entry(baseline_incore, [M, 64])
+
+    @staticmethod
+    def _assert_tile_type(ty: ir.Type, rows: int) -> ir.TileType:
+        assert isinstance(ty, ir.TileType)
+        assert len(ty.shape) == 2
+        for dim, expected in zip(ty.shape, (rows, 64)):
+            assert isinstance(dim, ir.ConstInt)
+            assert dim.value == expected
+        assert ty.dtype == DataType.FP32
+        assert ty.memory_space == ir.MemorySpace.Vec
+        return ty
+
+    @staticmethod
+    def _tile_calls(program: ir.Program) -> list[ir.Call]:
+        calls: list[ir.Call] = []
+        load_name = ir.get_op("tile.load").name
+        store_name = ir.get_op("tile.store").name
+
+        class Collector(ir.IRVisitor):
+            def visit_call(self, op: ir.Call) -> None:
+                if op.op.name in (load_name, store_name):
+                    calls.append(op)
+                super().visit_call(op)
+
+        Collector().visit_program(program)
+        return calls
+
+    def test_dynamic_tensor_to_inline_tile_preserves_type_and_valid_shape(self):
+        """The helper's static allocation shape must not erase its caller's valid rows."""
+        torch = pytest.importorskip("torch")
+        entry, _ = self._dynamic_entries()
+        program = entry.specialize(torch.empty(3, 64), torch.empty(3, 64))
+        helper = program.get_function("keep_tile")
+        assert helper is not None
+        self._assert_tile_type(helper.params[0].type, 8)
+
+        # Runtime samples supply dtype/rank, not a fixed value for M. Both
+        # Tensor boundaries remain dynamic while the on-core Tile stays 8x64.
+        for name in ("entry", "copy_incore"):
+            func = program.get_function(name)
+            assert func is not None
+            for param in func.params:
+                assert isinstance(param.type, ir.TensorType)
+                assert not isinstance(param.type.shape[0], ir.ConstInt)
+                assert isinstance(param.type.shape[1], ir.ConstInt)
+                assert param.type.shape[1].value == 64
+
+        inlined = passes.inline_functions()(program)
+        assert inlined.get_function("keep_tile") is None
+        calls = self._tile_calls(inlined)
+        assert len(calls) == 2
+        load, store = calls
+        stored_type = self._assert_tile_type(store.args[0].type, 8)
+        actual_view = stored_type.get_effective_tile_view()
+        assert not isinstance(actual_view.valid_shape[0], ir.ConstInt)
+        # The formal annotation has no view. Inlining must retain the actual
+        # argument's dynamic view instead of restoring an implicit 8x64 view.
+        ir.assert_structural_equal(load.type, store.args[0].type, enable_auto_mapping=True)
+
+    def test_inline_tile_compiles_like_direct_load_store(self, tmp_path):
+        """The Tile identity helper adds no storage or memory-space transfer."""
+        torch = pytest.importorskip("torch")
+        entry, baseline = self._dynamic_entries()
+        sources: list[str] = []
+        for kernel, name in ((entry, "inline"), (baseline, "baseline")):
+            output_dir = tmp_path / name
+            self._compile(kernel, torch.empty(3, 64), torch.empty(3, 64), output_dir=output_dir)
+            sources.append(self._pto_source(output_dir))
+            if find_ptoas_binary() is not None:
+                cpp_files = list((output_dir / "kernels").rglob("*.cpp"))
+                assert cpp_files
+                assert all("TMOV" not in path.read_text() for path in cpp_files)
+
+        for source in sources:
+            assert source.count("pto.tload ") == 1
+            assert source.count("pto.tstore ") == 1
+            assert "pto.tmov" not in source
+            assert "v_row=?" in source
+        # An inline return can introduce a second tile declaration for its
+        # alias. Both declarations must address the baseline's single buffer.
+        allocation_addresses = [
+            set(re.findall(r"pto\.alloc_tile addr = (%[\w.$]+)", source)) for source in sources
+        ]
+        assert len(allocation_addresses[0]) == len(allocation_addresses[1]) == 1
+        # Match operation lines, excluding type names such as !pto.tile_buf.
+        tile_op_pattern = r"^\s*(?:%[\w.$]+\s*=\s*)?(pto\.t\w+)\b"
+        assert re.findall(tile_op_pattern, sources[0], re.MULTILINE) == re.findall(
+            tile_op_pattern, sources[1], re.MULTILINE
+        )
+
+    @pytest.mark.parametrize("direction", ["bare", "Out", "InOut"])
+    def test_inline_tile_shape_uses_each_constexpr_binding(self, tmp_path, direction):
+        """Two calls retain an erased factory column and bind their own row extent."""
+        # This ambient value makes Python's eager annotation legal. The JIT
+        # must fold each call's ROWS first, rather than capture this value or
+        # reuse the first helper specialization at the second call site.
+        ROWS = 99
+
+        def factory(cols):
+            if direction == "Out":
+
+                @jit.inline(auto_scope=False)
+                def keep_tile(
+                    t: pl.Out[pl.Tile[[ROWS, cols], pl.FP32, pl.Mem.Vec]], ROWS: pl.constexpr
+                ) -> pl.Tile:
+                    return t
+
+            elif direction == "InOut":
+
+                @jit.inline(auto_scope=False)
+                def keep_tile(
+                    t: pl.InOut[pl.Tile[[ROWS, cols], pl.FP32, pl.Mem.Vec]], ROWS: pl.constexpr
+                ) -> pl.Tile:
+                    return t
+
+            else:
+
+                @jit.inline(auto_scope=False)
+                def keep_tile(t: pl.Tile[[ROWS, cols], pl.FP32, pl.Mem.Vec], ROWS: pl.constexpr) -> pl.Tile:
+                    return t
+
+            return keep_tile
+
+        keep_tile = factory(64)
+        assert not keep_tile._func.__code__.co_freevars
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor[[24, 64], pl.FP32], dst: pl.Out[pl.Tensor[[24, 64], pl.FP32]]):
+            first = pl.load(src, [0, 0], [8, 64], target_memory=pl.Mem.Vec)
+            second = pl.load(src, [8, 0], [16, 64], target_memory=pl.Mem.Vec)
+            first = keep_tile(first, 8)
+            second = keep_tile(second, 16)
+            dst = pl.store(first, [0, 0], dst)
+            return pl.store(second, [8, 0], dst)
+
+        entry = self._entry(copy_incore, [24, 64])
+
+        program = entry.specialize()
+        for name, rows in (("keep_tile", 8), ("keep_tile__2", 16)):
+            helper = program.get_function(name)
+            assert helper is not None
+            assert len(helper.params) == 1
+            self._assert_tile_type(helper.params[0].type, rows)
+
+        self._compile(entry, output_dir=tmp_path)
+        source = self._pto_source(tmp_path)
+        assert source.count("pto.tload ") == 2
+        assert source.count("pto.tstore ") == 2
+        assert "rows=8, cols=64" in source
+        assert "rows=16, cols=64" in source
+        assert "rows=99" not in source
 
 
 class TestOpaqueFuncIntegration:
