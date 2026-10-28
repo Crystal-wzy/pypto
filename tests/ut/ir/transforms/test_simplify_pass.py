@@ -21,6 +21,8 @@ reaches the parser as an un-evaluated ``Add`` (Python never sees two bare
 literals to pre-fold).
 """
 
+import operator
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
@@ -316,6 +318,529 @@ class TestRangeAwareSimplification:
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
+
+
+_PY_OPS = {
+    "==": operator.eq,
+    "!=": operator.ne,
+    "<": operator.lt,
+    "<=": operator.le,
+    ">": operator.gt,
+    ">=": operator.ge,
+}
+
+
+def _remake_for(loop, loop_var=None, body=None):
+    """Rebuild `loop` with a different loop variable and/or body (hand-built IR)."""
+    return ir.ForStmt(
+        loop_var if loop_var is not None else loop.loop_var, loop.start, loop.stop, loop.step,
+        list(loop.iter_args), body if body is not None else loop.body, list(loop.return_vars),
+        loop.span, loop.kind,
+    )  # fmt: skip
+
+
+def _with_body(program, body):
+    """Return `program` with its single function's body replaced (hand-built IR). A
+    ForStmt `body` replaces just the leading loop of a `_single_loop` program."""
+    func = next(iter(program.functions.values()))
+    if isinstance(body, ir.ForStmt):
+        func_body = func.body
+        assert isinstance(func_body, ir.SeqStmts)
+        body = ir.SeqStmts([body, *func_body.stmts[1:]], func_body.span)
+    rebuilt = ir.Function(
+        func.name, list(zip(func.params, func.param_directions)), list(func.return_types), body,
+        func.span, func.func_type,
+    )  # fmt: skip
+    return ir.Program([rebuilt], program.name, program.span)
+
+
+@pl.program
+class _SingleLoop:
+    @pl.function
+    def main(
+        self,
+        a: pl.Tensor[[16, 64], pl.BF16],
+        b: pl.Tensor[[64, 64], pl.BF16],
+        acc: pl.Tensor[[16, 64], pl.FP32],
+    ) -> pl.Tensor[[16, 64], pl.FP32]:
+        for i in pl.range(0, 8):
+            acc = pl.matmul_acc(acc, a, b, init_cond=(i == 0))
+        return acc
+
+
+def _single_loop():
+    """`(program, loop, call_stmt)` of `_SingleLoop`, for tests that rebuild it by hand."""
+    func_body = next(iter(_SingleLoop.functions.values())).body
+    assert isinstance(func_body, ir.SeqStmts)
+    loop = func_body.stmts[0]
+    assert isinstance(loop, ir.ForStmt)
+    call_stmt = loop.body
+    if isinstance(call_stmt, ir.SeqStmts):
+        call_stmt = call_stmt.stmts[0]
+    assert isinstance(call_stmt, ir.AssignStmt)
+    return _SingleLoop, loop, call_stmt
+
+
+def _with_init_cond(call_stmt, cond):
+    """`call_stmt` with its matmul_acc `init_cond` operand replaced by `cond`."""
+    call = call_stmt.value
+    assert isinstance(call, ir.Call)
+    args = list(call.args)
+    args[3] = cond
+    new_call = ir.Call(call.op, args, call.kwargs, call.type, call.span)
+    return ir.AssignStmt(call_stmt.var, new_call, call_stmt.span)
+
+
+_MATMUL_ACC_OPS = frozenset({ir.get_op("tensor.matmul_acc").name, ir.get_op("tile.matmul_acc").name})
+
+
+class _ReplaceInitCond(ir.IRMutator):
+    """Replace the `init_cond` operand of the single `matmul_acc` call."""
+
+    def __init__(self, new_cond: ir.Expr) -> None:
+        super().__init__()
+        self._new_cond = new_cond
+        self.replaced = 0
+
+    def visit_call(self, op: ir.Call) -> ir.Expr:
+        new = super().visit_call(op)
+        assert isinstance(new, ir.Call)
+        if new.op.name in _MATMUL_ACC_OPS:
+            args = list(new.args)
+            args[3] = self._new_cond
+            self.replaced += 1
+            return ir.Call(new.op, args, new.kwargs, new.type, new.span)
+        return new
+
+
+def _simplify(program, ssa: bool = True, roundtrip: bool = True):
+    """Run ConvertToSSA (unless `ssa=False`) then Simplify; return the transformed program."""
+    if ssa:
+        program = passes.convert_to_ssa()(program)
+    if roundtrip:
+        return passes.simplify()(program)
+    with passes.PassContext([]):
+        return passes.simplify()(program)
+
+
+def _with_expected_init_cond(program, expected: ir.Expr):
+    """`program` with its single `matmul_acc` predicate replaced by `expected`."""
+    mutator = _ReplaceInitCond(expected)
+    replaced = mutator.visit_program(program)
+    assert mutator.replaced == 1, f"expected one matmul_acc call, replaced {mutator.replaced}"
+    return replaced
+
+
+def _init_cond_of(program) -> ir.Expr:
+    """The single `matmul_acc` predicate, read structurally (not from printed text)."""
+    conds: list[ir.Expr] = []
+
+    class Collect(ir.IRVisitor):
+        def visit_call(self, op: ir.Call) -> None:
+            if op.op.name in _MATMUL_ACC_OPS:
+                conds.append(op.args[3])
+            super().visit_call(op)
+
+    Collect().visit_program(program)
+    assert len(conds) == 1, f"expected one matmul_acc call, found {len(conds)}"
+    return conds[0]
+
+
+def _prepare(program, ssa: bool = True):
+    """The input Simplify actually receives (ConvertToSSA unless `ssa=False`)."""
+    return passes.convert_to_ssa()(program) if ssa else program
+
+
+def _assert_simplified(
+    program,
+    expected: ir.Expr | None = None,
+    *,
+    expected_program=None,
+    ssa: bool = True,
+    roundtrip: bool = True,
+):
+    """Assert Simplify's **complete** output, not only the rendered predicate.
+
+    With `expected_program`, the transformed program must be structurally equal to it.
+    Otherwise two structural checks cover every node:
+    * everything except the `matmul_acc` predicate must be unchanged (both sides get the same
+      sentinel predicate, so a dropped statement, a retyped result, or a rewritten sibling
+      operand fails here);
+    * the predicate itself must equal `expected` (a `ConstBool` literal) when the fold applies,
+      or must not be a literal when `expected=None`.
+
+    The predicate's symbolic form is deliberately not compared when the fold does not apply:
+    the ordinary rewrite rules may canonicalize a comparison (`i < c` -> `c > i`), which is
+    out of scope for this test class and covered by the rewriting tests.
+    """
+    prepared = _prepare(program, ssa)
+    after = _simplify(prepared, ssa=False, roundtrip=roundtrip)
+
+    if expected_program is not None:
+        ir.assert_structural_equal(after, expected_program)
+        return after
+
+    sentinel = ir.ConstBool(True, ir.Span.unknown())
+    ir.assert_structural_equal(
+        _with_expected_init_cond(after, sentinel),
+        _with_expected_init_cond(prepared, sentinel),
+    )
+
+    actual = _init_cond_of(after)
+    if expected is None:
+        assert not isinstance(actual, ir.ConstBool), f"predicate was unexpectedly folded: {actual}"
+    else:
+        ir.assert_structural_equal(actual, expected)
+    return after
+
+
+class TestProvableComparisonFold:
+    """Simplify folds `loop_var OP constant` to a literal when the loop's static range decides
+    it, wherever the comparison appears, so a call-argument predicate becomes a literal like
+    an IfStmt condition does. Everything else must be left exactly as written."""
+
+    def test_unbound_int64_min_comparison_is_kept(self):
+        # x is a parameter: x == INT64_MIN is reachable, and the analyzer's -inf sentinel
+        # is INT64_MIN + 1, so a bound-based proof would wrongly decide False.
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                acc: pl.Tensor[[16, 64], pl.FP32],
+                x: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                r = pl.matmul_acc(acc, a, b, init_cond=(x == -9223372036854775808))
+                return r
+
+        _assert_simplified(Before)
+
+    def test_overflowing_product_comparison_is_kept(self):
+        # i * (2**62 - 1) wraps negative at i == 3, so 0 < product is not always true.
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                acc: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                for i in pl.range(2, 4):
+                    acc = pl.matmul_acc(acc, a, b, init_cond=(0 < i * 4611686018427387903))
+                return acc
+
+        _assert_simplified(Before)
+
+    def test_narrow_loop_var_is_kept(self):
+        # IR built through the bindings: an INT32 loop variable over INDEX bounds outside
+        # INT32 wraps at run time (to -2147483648, -2147483647), so its header range does
+        # not describe it. Only INDEX loop variables are trusted.
+        program, loop, call_stmt = _single_loop()
+        sp = loop.span
+        i32 = ir.Var("i", ir.ScalarType(DataType.INT32), sp)
+        cond = ir.Eq(i32, ir.ConstInt(-2147483647, DataType.INDEX, sp), DataType.BOOL, sp)
+        rebuilt = ir.ForStmt(
+            i32, ir.ConstInt(2147483648, DataType.INDEX, sp), ir.ConstInt(2147483650, DataType.INDEX, sp),
+            loop.step, [], _with_init_cond(call_stmt, cond), [], sp, loop.kind,
+        )  # fmt: skip
+        _assert_simplified(_with_body(program, rebuilt), ssa=False, roundtrip=False)
+
+    def test_loop_var_reassigned_after_a_nested_use_is_kept(self):
+        # Pre-SSA: the second inner iteration reads i == 100, although the use precedes
+        # the reassignment textually. A loop variable assigned anywhere is never trusted.
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                acc: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                for i in pl.range(0, 8):
+                    for j in pl.range(0, 2):  # noqa: B007
+                        acc = pl.matmul_acc(acc, a, b, init_cond=(i < 8))
+                        i = 100
+                return acc
+
+        _assert_simplified(Before, ssa=False)
+
+    def test_reassigned_loop_var_inside_a_single_trip_clone_is_kept(self):
+        # Fold B clones the single-trip `k` body with fresh Vars; the clone's `i` must
+        # inherit the "assigned" exclusion of the original.
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                acc: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                for k in pl.range(0, 1):  # noqa: B007
+                    for i in pl.range(0, 8):
+                        for j in pl.range(0, 2):  # noqa: B007
+                            r = pl.matmul_acc(acc, a, b, init_cond=(i < 8))  # noqa: F841
+                            i = 100
+                return acc
+
+        # Fold B inlines the single-trip `k` loop, so the expected program is the input
+        # with that loop replaced by its (cloned) body; the predicate must survive.
+        prepared = _prepare(Before, ssa=False)
+        func_body = next(iter(prepared.functions.values())).body
+        assert isinstance(func_body, ir.SeqStmts)
+        single_trip = func_body.stmts[0]
+        assert isinstance(single_trip, ir.ForStmt)
+        expected = _with_body(prepared, ir.SeqStmts([single_trip.body, *func_body.stmts[1:]], func_body.span))
+        _assert_simplified(Before, expected_program=expected, ssa=False)
+
+    def test_if_constraint_from_a_wrapping_operand_does_not_decide(self):
+        # `c + 1` wraps to -128 at run time, so the `if` always holds and j == 125 is
+        # reachable. The analyzer believes `c + 1 == 128` and would narrow j to
+        # [128, 135]; the fold reads only the loop header range [120, 135].
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                acc: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                for j in pl.range(120, 136):
+                    for i in pl.range(120, 128):
+                        if i == 127:
+                            c: pl.Scalar[pl.INT8] = pl.cast(i, pl.INT8)
+                            if j >= pl.cast(c + pl.const(1, pl.INT8), pl.INDEX):
+                                acc = pl.matmul_acc(acc, a, b, init_cond=(j == 125))
+                return acc
+
+        # The ordinary rewrite rules canonicalize the wrapping `j >= cast(...)` guard to
+        # `cast(...) <= j`; encode that rewrite so the full program can be compared.
+        prepared = _prepare(Before)
+
+        class CanonicalizeGe(ir.IRMutator):
+            def visit_ge(self, op: ir.Ge) -> ir.Expr:
+                return ir.Le(op.right, op.left, DataType.BOOL, op.span)
+
+        expected = CanonicalizeGe().visit_program(prepared)
+        _assert_simplified(Before, expected_program=expected)
+
+    def test_out_of_range_narrow_loop_bound_is_kept(self):
+        # The INT32 bounds fold to 2147483648 and 2147483650, outside INT32; codegen
+        # emits them as i32 and sign-extends, so i takes -2147483648 and -2147483647.
+        # Only loops with INDEX bounds are trusted. (The out-of-range literal does not
+        # survive the print/parse round trip on main either, hence roundtrip=False.)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                acc: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                for i in pl.range(
+                    pl.const(2147483647, pl.INT32) + pl.const(1, pl.INT32),
+                    pl.const(2147483647, pl.INT32) + pl.const(3, pl.INT32),
+                ):
+                    acc = pl.matmul_acc(acc, a, b, init_cond=(i == -2147483647))
+                return acc
+
+        # Simplify folds the INT32 bound arithmetic; encode that so the whole program
+        # (including the untouched predicate) can be compared structurally.
+        prepared = _prepare(Before)
+
+        class FoldInt32Bounds(ir.IRMutator):
+            def visit_for_stmt(self, op: ir.ForStmt) -> ir.Stmt:
+                new = super().visit_for_stmt(op)
+                assert isinstance(new, ir.ForStmt)
+                if isinstance(new.start, ir.ConstInt):
+                    return new
+                return ir.ForStmt(
+                    new.loop_var,
+                    ir.ConstInt(2147483648, DataType.INT32, new.start.span),
+                    ir.ConstInt(2147483650, DataType.INT32, new.stop.span),
+                    new.step,
+                    list(new.iter_args),
+                    new.body,
+                    list(new.return_vars),
+                    new.span,
+                    new.kind,
+                )
+
+        expected = FoldInt32Bounds().visit_program(prepared)
+        _assert_simplified(Before, expected_program=expected, roundtrip=False)
+
+    def test_loop_var_redefined_by_a_nested_loop_is_kept(self):
+        # IR built directly through the bindings (the parser renames shadowed loop
+        # variables, and cannot re-parse a reused Var, hence roundtrip=False): the inner
+        # loop reuses the outer Var, so inside it i in [10, 19] and i == 15 is reachable.
+        # A Var with more than one definition is never trusted.
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                acc: pl.Tensor[[16, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                for i in pl.range(0, 4):  # noqa: B007
+                    for j in pl.range(10, 20):
+                        acc = pl.matmul_acc(acc, a, b, init_cond=(j == 15))
+                return acc
+
+        func = next(iter(Before.functions.values()))
+        func_body = func.body
+        assert isinstance(func_body, ir.SeqStmts)
+        outer = func_body.stmts[0]
+        assert isinstance(outer, ir.ForStmt)
+        inner = outer.body
+        assert isinstance(inner, ir.ForStmt)
+        shared = outer.loop_var
+        inner_body = ir.substitute_stmt(inner.body, [(inner.loop_var, shared)])
+        new_outer = _remake_for(outer, body=_remake_for(inner, loop_var=shared, body=inner_body))
+        program = _with_body(Before, ir.SeqStmts([new_outer, *func_body.stmts[1:]], func_body.span))
+        _assert_simplified(program, ssa=False, roundtrip=False)
+
+    def test_parameter_reused_as_loop_var_is_kept(self):
+        # IR built through the bindings: the parameter `n` is also the loop variable, and
+        # Fold A binds r -> n from the always-true branch. `r == 7` means "parameter n is
+        # 7" at that point, not the loop range, so the loop variable must not be trusted.
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                acc: pl.Tensor[[16, 64], pl.FP32],
+                n: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                k: pl.Scalar[pl.INDEX] = 3
+                if k > 0:
+                    r: pl.Scalar[pl.INDEX] = pl.yield_(n)
+                else:
+                    r: pl.Scalar[pl.INDEX] = pl.yield_(pl.const(5, pl.INDEX))
+                for i in pl.range(0, 4):  # noqa: B007
+                    acc = pl.matmul_acc(acc, a, b, init_cond=(r == 7))
+                return acc
+
+        func = next(iter(Before.functions.values()))
+        func_body = func.body
+        assert isinstance(func_body, ir.SeqStmts)
+        stmts = list(func_body.stmts)
+        idx = next(k for k, s in enumerate(stmts) if isinstance(s, ir.ForStmt))
+        loop = stmts[idx]
+        assert isinstance(loop, ir.ForStmt)
+        stmts[idx] = _remake_for(loop, loop_var=func.params[3])
+        program = _with_body(Before, ir.SeqStmts(stmts, func_body.span))
+
+        # Fold A collapses the constant `if k > 0` branch and remaps r -> n, so the
+        # expected program drops the pre-loop statements and folds `r == 7` to `n == 7`.
+        param_loop = stmts[idx]
+        assert isinstance(param_loop, ir.ForStmt)
+        loop_body = param_loop.body
+        if isinstance(loop_body, ir.SeqStmts):
+            loop_body = loop_body.stmts[0]
+        assert isinstance(loop_body, ir.AssignStmt)
+        assert isinstance(loop_body.value, ir.Call)
+        old_cond = loop_body.value.args[3]
+        assert isinstance(old_cond, ir.Eq)
+        param_n = func.params[3]
+        new_cond = ir.Eq(param_n, old_cond.right, DataType.BOOL, old_cond.span)
+        expected = _with_body(
+            program,
+            ir.SeqStmts(
+                [_remake_for(param_loop, body=_with_init_cond(loop_body, new_cond)), *stmts[idx + 1 :]],
+                func_body.span,
+            ),
+        )
+        _assert_simplified(program, expected_program=expected, ssa=False, roundtrip=False)
+
+    def test_non_bool_comparison_is_kept(self):
+        # IR built through the bindings: `Eq(i, 100)` typed INT32 feeds an addition.
+        # Folding it to a ConstBool would not type-check there, so only BOOL-typed
+        # comparisons are decided.
+        program, loop, call_stmt = _single_loop()
+        sp = loop.span
+        int_cmp = ir.Eq(loop.loop_var, ir.ConstInt(100, DataType.INDEX, sp), DataType.INT32, sp)
+        shifted = ir.Add(int_cmp, ir.ConstInt(1, DataType.INT32, sp), DataType.INT32, sp)
+        cond = ir.Eq(shifted, ir.ConstInt(2, DataType.INT32, sp), DataType.BOOL, sp)
+        rebuilt = _remake_for(loop, body=_with_init_cond(call_stmt, cond))
+        _assert_simplified(_with_body(program, rebuilt), ssa=False, roundtrip=False)
+
+    def test_narrow_constant_against_an_index_loop_var_is_kept(self):
+        # IR built through the bindings: an INT32 literal 4294967303 wraps to 7 at run
+        # time, so `i == 4294967303` holds at i == 7 although the literal is outside
+        # [0, 7]. Only INDEX constants are decided.
+        program, loop, call_stmt = _single_loop()
+        sp = loop.span
+        cond = ir.Eq(loop.loop_var, ir.ConstInt(4294967303, DataType.INT32, sp), DataType.BOOL, sp)
+        rebuilt = _remake_for(loop, body=_with_init_cond(call_stmt, cond))
+        _assert_simplified(_with_body(program, rebuilt), ssa=False, roundtrip=False)
+
+    @pytest.mark.parametrize("binder", ["if", "for", "while"])
+    def test_loop_var_rebound_by_a_control_flow_result_is_kept(self, binder):
+        # IR built through the bindings: a control-flow statement in the loop body binds
+        # its result to the loop variable i, so at the call i is 100 (outside [0, 7]).
+        program, loop, call_stmt = _single_loop()
+        i, sp = loop.loop_var, loop.span
+        hundred = ir.ConstInt(100, DataType.INDEX, sp)
+        if binder == "if":
+            cond = ir.Lt(i, ir.ConstInt(2, DataType.INDEX, sp), DataType.BOOL, sp)
+            rebind = ir.IfStmt(cond, ir.YieldStmt([hundred], sp), ir.YieldStmt([hundred], sp), [i], sp)
+        elif binder == "for":
+            k, x = ir.Var("k", i.type, sp), ir.IterArg("x", i.type, hundred, sp)
+            zero, one, two = (ir.ConstInt(v, DataType.INDEX, sp) for v in (0, 1, 2))
+            rebind = ir.ForStmt(k, zero, two, one, [x], ir.YieldStmt([x], sp), [i], sp)
+        else:
+            x = ir.IterArg("x", i.type, hundred, sp)
+            rebind = ir.WhileStmt(ir.Lt(x, hundred, DataType.BOOL, sp), [x], ir.YieldStmt([x], sp), [i], sp)
+        cond = ir.Eq(i, hundred, DataType.BOOL, sp)
+        rebuilt = _remake_for(loop, body=ir.SeqStmts([rebind, _with_init_cond(call_stmt, cond)], sp))
+        _assert_simplified(_with_body(program, rebuilt), ssa=False, roundtrip=False)
+
+    @pytest.mark.parametrize("op", list(_PY_OPS))
+    @pytest.mark.parametrize("start, stop", [(0, 8), (-2, 6), (3, 5)])
+    def test_decision_matches_every_loop_value(self, op, start, stop):
+        """Oracle: for both operand orders and constants around the range, the fold yields
+        a literal exactly when every loop value agrees, and that literal is the value."""
+        for constant in range(start - 2, stop + 2):
+            for var_first in (True, False):
+                cond = f"i {op} {constant}" if var_first else f"{constant} {op} i"
+                program = pl.parse_program(f"""
+import pypto.language as pl
+
+@pl.program
+class P:
+    @pl.function
+    def main(self, a: pl.Tensor[[16, 64], pl.BF16], b: pl.Tensor[[64, 64], pl.BF16],
+             acc: pl.Tensor[[16, 64], pl.FP32]) -> pl.Tensor[[16, 64], pl.FP32]:
+        for i in pl.range({start}, {stop}):
+            acc = pl.matmul_acc(acc, a, b, init_cond=({cond}))
+        return acc
+""")
+                outcomes = {
+                    _PY_OPS[op](i, constant) if var_first else _PY_OPS[op](constant, i)
+                    for i in range(start, stop)
+                }
+                expected = (
+                    ir.ConstBool(next(iter(outcomes)), ir.Span.unknown()) if len(outcomes) == 1 else None
+                )
+                _assert_simplified(program, expected)
 
 
 # ============================================================================
