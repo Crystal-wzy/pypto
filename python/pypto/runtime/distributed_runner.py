@@ -407,8 +407,15 @@ def add_chip_tensor_arg(
     if index in host_slots:
         from simpler.buffer import TensorTransfer  # noqa: PLC0415
 
-        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
-            raise ValueError(f"Chip {name!r} host control tensor slot {index} requires a CPU tensor")
+        is_host = isinstance(tensor, torch.Tensor) and tensor.device.type == "cpu"
+        if not is_host and _is_simpler_tensor(tensor):
+            from simpler.buffer import AddressSpace, Tensor  # noqa: PLC0415
+
+            is_host = isinstance(tensor, Tensor) and tensor.buffer.address_space == AddressSpace.HOST
+        if not is_host:
+            raise ValueError(
+                f"Chip {name!r} host control tensor slot {index} requires a CPU tensor or a HOST Tensor"
+            )
         args.add_tensor(make_tensor_arg(worker, tensor), tag, transfer=TensorTransfer.NONE)
     else:
         args.add_tensor(make_tensor_arg(worker, tensor), tag)

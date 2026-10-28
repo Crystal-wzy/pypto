@@ -160,7 +160,8 @@ def make_tensor_arg(worker: Any, arg: Any) -> Any:
               whose retained ``Buffer`` yields an address-free wire ``Tensor``
               (memory is caller-managed). The descriptor is built once per
               handle and reused.
-            - simpler ``Tensor``: returned as-is (already device-side).
+            - simpler ``Tensor``: returned as-is, preserving its HOST or DEVICE
+              address space. The caller retains its backing through completion.
 
     Returns:
         A simpler ``Tensor`` ready to add to ``TaskArgs``.

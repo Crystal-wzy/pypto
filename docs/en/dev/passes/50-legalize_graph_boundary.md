@@ -396,6 +396,12 @@ normal upload behavior. This metadata is preserved by saved artifacts and worker
 reuse, including distributed chip dispatch. Scheduler predicate operands remain
 device tensors and use the normal device transfer path. Control tensors must stay alive until the call completes.
 
+Distributed dispatch also accepts an existing `simpler.Tensor` backed by HOST
+storage for a host control argument. The address-free descriptor is reused with
+`TensorTransfer.NONE`. Keep the owning Buffer and any fork-inherited storage alive until completion. A wire
+Tensor snapshots its view metadata, so construct another view when the shape,
+strides, or storage changes.
+
 A control tensor (including a view or loop-carried alias) cannot also be passed
 to a device kernel through the same argument. Pass host control data and device
 data in separate parameters. Host writes do not upload to device storage.

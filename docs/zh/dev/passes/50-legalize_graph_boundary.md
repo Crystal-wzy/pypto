@@ -337,5 +337,10 @@ CPU 张量参数。生成的参数元数据为这些参数选择 `HOST/NONE` 传
 构图期间不能读取 runtime 分配的张量或本次图中设备任务产生的数据。
 为 host 控制参数传入 `DeviceTensor` 时，会在派发前报错。
 
+分布式派发也接受以 HOST 存储为后端的现成 `simpler.Tensor` 作为主机控制参数。
+该无地址描述符以 `TensorTransfer.NONE` 复用，不建立隐式 Torch 描述符缓存。
+调用完成前必须保留其 Buffer 和可能的 fork 继承存储。wire Tensor 保存视图元数据的快照，
+形状、stride 或存储改变后，需要重新构造视图。
+
 分布式芯片派发同样保留主机控制张量的传输元数据。调度器谓词（Scheduler Predicate）的
 操作数仍属于设备张量，使用普通设备传输路径，不作为主机读取处理。
