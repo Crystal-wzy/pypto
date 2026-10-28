@@ -1009,8 +1009,8 @@ class TestRegionAllocationHoisting:
         # `InOut`, not `In`: the region writes it. Declared `In`, codegen emits
         # `add_input`, the launch never registers as a writer of the buffer, and
         # a caller that hoisted the allocation out of its own loop would get no
-        # ordering between successive launches over it. `Out` is illegal on a
-        # Graph boundary — it means the *runtime* allocates.
+        # ordering between successive launches over it. Hoisting runs after
+        # direction derivation, so it retains conservative InOut ordering.
         assert _param_directions(layer)["tmp"] == ir.ParamDirection.InOut
         # The region no longer allocates at all.
         assert "pl.tensor.create" not in python_print(layer), python_print(layer)
