@@ -98,8 +98,8 @@ void CheckExplicitL0OperandCapacity(const VarPtr& operand, const TileTypePtr& ti
 std::optional<MatmulTiling> AnalyzeMatmul(
     const AssignStmtPtr& assign, std::vector<Diagnostic>& hints, bool force_output_stationary,
     std::optional<tile_view_semantics::BoxedTileAlignment> output_box_alignment,
-    const DirectDefMap* direct_defs, bool restrict_output_grid, const ForStmtPtr& source_reduction,
-    int64_t fixed_output_m) {
+    const DirectDefMap* direct_defs, bool restrict_output_grid, bool keep_output_shape,
+    const ForStmtPtr& source_reduction, int64_t fixed_output_m) {
   auto call = As<Call>(assign->value_);
   if (!call || !call->op_) return std::nullopt;
 
@@ -453,7 +453,8 @@ std::optional<MatmulTiling> AnalyzeMatmul(
   // requirement for this optimization: narrowing it would replace a legal
   // K-only rewrite with an unsupported bias-window fold. Keep its old grid.
   const bool can_bound_bias = !is_bias || bias_load || bias_tile->GetMemorySpace() == MemorySpace::Bias;
-  if (restrict_output_grid && lhs_tile->GetMemorySpace() == MemorySpace::Mat && can_bound_bias) {
+  if (restrict_output_grid && !keep_output_shape && lhs_tile->GetMemorySpace() == MemorySpace::Mat &&
+      can_bound_bias) {
     auto work_extent = [&](int64_t physical, const ExprPtr& valid, int alignment) {
       const auto extent = As<ConstInt>(valid);
       if (!extent || extent->value_ <= 0) return physical;
@@ -464,6 +465,18 @@ std::optional<MatmulTiling> AnalyzeMatmul(
     // without expanding a physical source that is below the chooser minimum.
     cfg.N = static_cast<int>(std::min<int64_t>(
         N, std::max<int64_t>(cfg.min_n, work_extent(N, output_valid_shape[1], cfg.align_n))));
+  }
+
+  if (keep_output_shape) {
+    // The consumer cannot accept an M/N grid. Search only reductions that keep
+    // the original output intact, rather than leaving oversized L0 operands
+    // for an allocator to pack. A K-only reduction has one accumulator and no
+    // output-grid pipeline, so dbC and operand-stationary regimes cannot apply.
+    cfg.min_m = cfg.M;
+    cfg.min_n = cfg.N;
+    cfg.allow_a_stationary = false;
+    cfg.allow_b_stationary = false;
+    cfg.allow_double_buffer_c = false;
   }
 
   if (fixed_output_m != 0) {
@@ -519,6 +532,17 @@ std::optional<MatmulTiling> AnalyzeMatmul(
     return std::nullopt;
   }
   if (is_bias && res.n != N && bias_tile->GetMemorySpace() == MemorySpace::Mat && !bias_load) {
+    // An unsupported bias window rules out this N grid, not a K-only plan.
+    // Retry once with the full output to reuse the original bias snapshot.
+    // Preserve source-reduction scheduling and NZ store limits in the retry.
+    if (!keep_output_shape) {
+      std::vector<Diagnostic> fallback_hints;
+      if (auto k_only = AnalyzeMatmul(assign, fallback_hints, true, output_box_alignment, direct_defs,
+                                      restrict_output_grid, true, source_reduction, fixed_output_m)) {
+        for (const auto& hint : fallback_hints) hints.push_back(hint);
+        return k_only;
+      }
+    }
     hints.emplace_back(
         DiagnosticSeverity::PerfHint, kPassName, 0, "PH-AT-011",
         "tile.matmul_bias needs N tiling, but its Mat bias is not a single-use full-rectangular [1, N] "

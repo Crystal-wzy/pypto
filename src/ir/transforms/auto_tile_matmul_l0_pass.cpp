@@ -729,7 +729,27 @@ std::optional<DirectGmStoreInfo> AnalyzeDirectGmStore(const CallPtr& call) {
   if (!offsets || !tensor) return std::nullopt;
   const bool is_nz = tensor->tensor_view_ && tensor->tensor_view_->layout == TensorLayout::NZ;
   if (!is_nz) {
-    if (call->args_.size() != 3 || offsets->elements_.size() != 2) return std::nullopt;
+    const size_t rank = offsets->elements_.size();
+    if (rank < 2 || tensor->shape_.size() != rank) return std::nullopt;
+    if (call->args_.size() == 4) {
+      auto source = As<TileType>(call->args_[0]->GetType());
+      auto shape = As<MakeTuple>(call->args_[3]);
+      if (!source || source->shape_.size() != 2 || !shape || shape->elements_.size() != rank) {
+        return std::nullopt;
+      }
+      // Selection and emission share this check against physical M/N, before
+      // valid bounds narrow the output grid. Only singleton batch prefixes
+      // preserve the matrix row/column mapping.
+      for (size_t axis = 0; axis < rank; ++axis) {
+        auto dim = As<ConstInt>(shape->elements_[axis]);
+        auto expected = axis + 2 < rank ? nullptr : As<ConstInt>(source->shape_[axis + 2 - rank]);
+        if (!dim || (axis + 2 < rank ? dim->value_ != 1 : !expected || dim->value_ != expected->value_)) {
+          return std::nullopt;
+        }
+      }
+    } else if (rank != 2) {
+      return std::nullopt;
+    }
     return DirectGmStoreInfo{call};
   }
 
@@ -788,7 +808,7 @@ std::optional<DirectGmStoreInfo> AnalyzeDirectGmStore(const CallPtr& call) {
 ///   * ``use_counts[v]`` — number of reads of ``v`` (excluding defs).
 ///   * ``store_of[v]`` — the top-level direct ``tile.store`` whose source operand
 ///     is ``v`` (its sole direct consumer when ``use_counts[v] == 1``).
-///     Includes ordinary 2-D stores and blocked rank-5 NZ partitions.
+///     Includes ordinary 2-D stores, ND batch pages, and blocked rank-5 NZ partitions.
 /// Counts/sites reflect the original (pre-rewrite) siblings, which is what the
 /// foldability check needs (a matmul result is freshly defined; its uses do
 /// not change until we rewrite it).
@@ -808,8 +828,7 @@ SiblingIndex BuildSiblingIndex(const std::vector<StmtPtr>& stmts) {
     if (!as) continue;
     auto call = As<Call>(as->value_);
     if (!call || !call->op_) continue;
-    // Keep existing three-argument stores indexed, and additionally recognize
-    // the explicit rank-5 partition carried by an NZ direct store.
+    // Keep ordinary stores indexed, and recognize supported ND/NZ partitions.
     if (IsOp(call, "tile.store") && (call->args_.size() == 3 || AnalyzeDirectGmStore(call).has_value())) {
       if (auto src = AsVarLike(call->args_[0])) idx.store_of.emplace(src.get(), as.get());
     } else if (IsOp(call, "tile.cast") && !call->args_.empty()) {
@@ -879,8 +898,19 @@ class DirectGmPlacer : public SubtilePlacer {
     std::vector<ExprPtr> offsets = base_offsets->elements_;
     ExprPtr partition;
     if (!store_.is_nz()) {
-      offsets[0] = AddOffset(offsets[0], row_off, sp_);
-      offsets[1] = AddOffset(offsets[1], col_off, sp_);
+      const size_t rank = offsets.size();
+      offsets[rank - 2] = AddOffset(offsets[rank - 2], row_off, sp_);
+      offsets[rank - 1] = AddOffset(offsets[rank - 1], col_off, sp_);
+      if (store_.call->args_.size() == 4) {
+        auto tile = As<TileType>(sub->GetType());
+        INTERNAL_CHECK_SPAN(tile, sp_) << "Internal error: direct-store subtile lost its TileType";
+        const auto valid = tile_view_semantics::GetEffectiveTileView(*tile).valid_shape;
+        INTERNAL_CHECK_SPAN(valid.size() == 2, sp_) << "Internal error: direct-store subtile must be 2D";
+        // The destination window follows valid elements, not padded allocation.
+        std::vector<ExprPtr> shape(rank - 2, MakeIndex(1, sp_));
+        shape.insert(shape.end(), valid.begin(), valid.end());
+        partition = std::make_shared<MakeTuple>(std::move(shape), sp_);
+      }
     } else {
       auto tile = As<TileType>(sub->GetType());
       auto rows = tile && tile->shape_.size() == 2 ? As<ConstInt>(tile->shape_[0]) : nullptr;
@@ -1545,7 +1575,7 @@ std::optional<CanonicalSplitKFold> TryFoldCanonicalSplitKAcc(const CanonicalSpli
   const bool preserve_selected_k = planner != MemoryPlanner::PtoAS;
   auto tiling =
       AnalyzeMatmul(match.shape_source(), hints, /*force_output_stationary=*/true, output_box_alignment,
-                    /*direct_defs=*/nullptr, /*restrict_output_grid=*/false,
+                    /*direct_defs=*/nullptr, /*restrict_output_grid=*/false, /*keep_output_shape=*/false,
                     preserve_selected_k ? match.loop : nullptr, store_info->full_m);
   if (!tiling || (!preserve_selected_k && !tiling->needs_mn_tiling())) return std::nullopt;
   if (preserve_selected_k) {
@@ -1907,7 +1937,7 @@ std::pair<std::vector<StmtPtr>, VarPtr> BuildSplitKGrid(const MatmulTiling& t, S
 /// Mat-resident, so only the output Acc overflows; sub-tiling keeps every Acc
 /// tile within L0c. This helper handles the direct-store consumer:
 ///
-///   * **Direct-store** — the sole consumer is a 2D ``tile.store(c, base, out)``:
+///   * **Direct-store** — the sole consumer stores a matrix page via ``tile.store``:
 ///     each sub-tile stores straight to ``out[mi:, ni:]`` (the DDR-output case
 ///     our solver kernels need).  The store is folded in and emitted at the
 ///     store site.
@@ -1947,7 +1977,7 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
   // K-loop+peel, so test k == K rather than the integer-division proxy K/k < 2.
   const bool full_k = t.k == t.K;
 
-  // Direct-store: the sole consumer is a 2D or blocked NZ tile.store. The grid is emitted
+  // Direct-store: the sole consumer is a 2D, ND-page, or blocked NZ store. The grid is emitted
   // later at the store site, where the caller re-applies the then-current remap
   // — so a prior fold that redefined this output is rewritten correctly (a
   // stale-output SSA guard); resolving it here would miss folds emitted before
@@ -1970,7 +2000,7 @@ std::optional<MNFold> TryFoldMNTiling(const MatmulTiling& t, int result_uses, co
   }
 
   return skip(
-      "tile.matmul output exceeds L0c but its result is not consumed by a single 2D tile.store "
+      "tile.matmul needs M/N tiling but its result is not consumed by a single supported tile.store "
       "(direct-store) — a result consumed on-chip (chained matmul / elementwise), stored-and-reused, "
       "or fed to a non-store consumer is deferred; left untouched");
 }
@@ -2404,24 +2434,26 @@ class AutoTileMutator : public IRMutator {
         if (auto tiling =
                 AnalyzeMatmul(assign, hints, /*force_output_stationary=*/false,
                               /*output_box_alignment=*/std::nullopt, &direct_defs,
-                              consumer && consumer->supports_output_grid,
+                              consumer && consumer->supports_output_grid, /*keep_output_shape=*/false,
                               /*source_reduction=*/nullptr, consumer ? consumer->fixed_output_m : 0)) {
-          if (!tiling->needs_mn_tiling()) {
-            // Whole output fits L0c — tile K only.  k < K here (k == K with
-            // m == M, n == N needs no matmul tiling and was skipped by
-            // AnalyzeMatmul); the chooser may return a non-divisor k that
-            // BuildKLoopRewrite peels.
-            INTERNAL_CHECK_SPAN(tiling->k < tiling->K, tiling->assign->span_)
-                << "Internal error: K-only tiling expects k < K (K=" << tiling->K << ", k=" << tiling->k
-                << ")";
+          auto emit_k_only = [&](const MatmulTiling& plan) {
+            // AnalyzeMatmul skips a full M/N/K fit, so a shape-preserving plan
+            // reaching this emitter must split K. Preserve the original result
+            // shape and consumer, including the batch-assemble path in #2872.
+            INTERNAL_CHECK_SPAN(!plan.needs_mn_tiling() && plan.k < plan.K, plan.assign->span_)
+                << "Internal error: K-only tiling expects unchanged M/N and k < K";
             auto rewrite = BuildKLoopRewrite(
-                MakeKLoop(*tiling, /*mi=*/nullptr, /*ni=*/nullptr, tiling->m, tiling->n, /*name_base=*/""));
+                MakeKLoop(plan, /*mi=*/nullptr, /*ni=*/nullptr, plan.m, plan.n, /*name_base=*/""));
             remap[assign->var_.get()] = rewrite.return_var;
-            for (auto& s : rewrite.stmts) out.push_back(std::move(s));
+            for (auto& stmt : rewrite.stmts) out.push_back(std::move(stmt));
             changed = true;
+          };
+          if (!tiling->needs_mn_tiling()) {
+            emit_k_only(*tiling);
             continue;
           }
-          // Output exceeds L0c — tile M/N by folding the consumer store, found
+          const size_t mn_hint_start = hints.size();
+          // The chooser selected an M/N grid; fold its consumer store, found
           // via the raw (un-substituted) SiblingIndex: the matmul's result is
           // freshly defined here, so its use count / store site are never
           // affected by the running remap.
@@ -2498,7 +2530,31 @@ class AutoTileMutator : public IRMutator {
               continue;  // drop the matmul; sub-tile stmts emit at the store site
             }
           }
-          // M/N tiling not applicable — fall through and leave it untouched.
+          // A caller-owned accumulator belongs to an enclosing reduction.
+          // Replanning a rejected M/N choice here ignores that loop's buffering
+          // and can overflow L0A after nested pipeline lowering. Keep canonical
+          // split-K scheduling (including the PTOAS compatibility route) and
+          // manual storage decisions intact; retry only fresh/biased results.
+          if (!tiling->is_acc()) {
+            // A cost-optimal M/N grid is not necessarily required for capacity.
+            // If neither placement can emit it, retry with the whole output held
+            // in one Acc tile. The chooser still checks physical L0A/B/C limits;
+            // truly oversized outputs remain deferred. This applies to every
+            // planner: lifetime packing cannot repair one oversized operand.
+            std::vector<Diagnostic> fallback_hints;
+            if (auto k_only = AnalyzeMatmul(assign, fallback_hints, /*force_output_stationary=*/true,
+                                            /*output_box_alignment=*/std::nullopt, &direct_defs,
+                                            /*restrict_output_grid=*/false, /*keep_output_shape=*/true,
+                                            /*source_reduction=*/nullptr, consumer->fixed_output_m)) {
+              // The rejected grid's deferral no longer applies. Diagnostic spans
+              // are immutable, so remove by destruction and append by construction.
+              while (hints.size() > mn_hint_start) hints.pop_back();
+              for (auto& hint : fallback_hints) hints.push_back(std::move(hint));
+              emit_k_only(*k_only);
+              continue;
+            }
+          }
+          // Neither placement nor a K-only reduction is legal; leave untouched.
         }
       }
       auto visited = VisitStmt(current);
