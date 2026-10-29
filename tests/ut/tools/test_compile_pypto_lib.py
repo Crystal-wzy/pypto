@@ -366,6 +366,94 @@ def test_self_spawned_entry_preserves_audit_and_child_arguments(library, tmp_pat
     assert statuses == ([True, True, True, False] if child == "exit" else [True, True, passed])
 
 
+def test_compile_only_entry_gets_fresh_runtime_directory(library, tmp_path):
+    # Production entries require a manifest directory before invoking compile.
+    # Reusing the output root must still execute compilation on every audit.
+    (library / "models/glm5_3_flash").mkdir()
+    (library / "models/glm5_3_flash/prefill_fwd.py").write_text(
+        "import argparse\n"
+        "from pathlib import Path\n"
+        "from pypto.ir import compile\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('-p')\n"
+        "parser.add_argument('--compile-only', action='store_true')\n"
+        "parser.add_argument('--runtime-dir', type=Path)\n"
+        "args = parser.parse_args()\n"
+        "if not args.compile_only or args.runtime_dir is None:\n"
+        "    parser.error('--compile-only requires --runtime-dir')\n"
+        "assert not (args.runtime_dir / 'manifest.json').exists()\n"
+        "compile('ok')\n"
+        "(args.runtime_dir / 'manifest.json').write_text('{}')\n"
+    )
+    output = tmp_path / "out"
+    for _ in range(2):
+        result = audit.run_case(library, "models/glm5_3_flash/prefill_fwd.py", "a2a3", output, 10)
+        assert result["passed"]
+        assert len(result["compilations"]) == 1
+    assert len(list((output / "models/glm5_3_flash/prefill_fwd").glob("runtime-*/manifest.json"))) == 2
+
+
+@pytest.mark.parametrize("equals_form", [False, True])
+def test_self_dispatch_uses_fresh_runtime_directories(library, tmp_path, equals_form):
+    # A parent and two children must compile even when all inherit the same
+    # runtime-dir argument; a retained manifest would skip the child's compile.
+    (library / "models/glm5_3_flash").mkdir()
+    (library / "models/glm5_3_flash/prefill_fwd.py").write_text(
+        "import argparse, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "from pypto.ir import compile\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('-p')\n"
+        "parser.add_argument('--compile-only', action='store_true')\n"
+        "parser.add_argument('--runtime-dir', type=Path)\n"
+        "parser.add_argument('--case', default='all')\n"
+        "args = parser.parse_args()\n"
+        "manifest = args.runtime_dir / 'manifest.json'\n"
+        "if not manifest.exists():\n"
+        "    compile('ok')\n"
+        "    manifest.write_text(args.case)\n"
+        "if args.case == 'all':\n"
+        f"    runtime_args = ['--runtime-dir=' + str(args.runtime_dir)] if {equals_form!r} "
+        "else ['--runtime-dir', str(args.runtime_dir)]\n"
+        "    for case in ('first', 'second'):\n"
+        "        subprocess.run([sys.executable, __file__, '-p', args.p, '--compile-only', "
+        "*runtime_args, '--case', case], check=True)\n"
+    )
+    output = tmp_path / "out"
+    result = audit.run_case(library, "models/glm5_3_flash/prefill_fwd.py", "a2a3", output, 10)
+    assert result["passed"]
+    assert len(result["compilations"]) == 3
+    manifests = list((output / "models/glm5_3_flash/prefill_fwd").glob("runtime-*/manifest.json"))
+    assert sorted(path.read_text() for path in manifests) == ["all", "first", "second"]
+
+
+@pytest.mark.parametrize("entry", ["hc", "prefill_fwd", "sparse_attention"])
+def test_compile_does_not_enable_replay_or_checkpoint_arguments(library, tmp_path, entry):
+    # Mirror the A5 contracts: replay arguments change the default all-cases
+    # mode, while prefill declares runtime-dir only in an inactive CLI branch.
+    directory = library / "models/deepseek_v4_1_flash"
+    directory.mkdir()
+    (directory / f"{entry}.py").write_text(
+        "import argparse\n"
+        "from pypto.ir import compile\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('-p')\n"
+        "parser.add_argument('--compile-only', action='store_true')\n"
+        + (
+            "if False:\n    parser.add_argument('--runtime-dir')\n"
+            if entry == "prefill_fwd"
+            else "parser.add_argument('--runtime-dir')\n"
+        )
+        + "args = parser.parse_args()\n"
+        "assert getattr(args, 'runtime_dir', None) is None, 'replay was enabled'\n"
+        "assert args.compile_only\n"
+        "compile('ok')\n"
+    )
+    result = audit.run_case(library, f"models/deepseek_v4_1_flash/{entry}.py", "a5", tmp_path / "out", 10)
+    assert result["passed"]
+    assert len(result["compilations"]) == 1
+
+
 def test_entry_arguments_preserve_declared_ranks(tmp_path):
     script = tmp_path / "distributed.py"
     script.write_text('# ci: devices=4\nparser.add_argument("--compile-only")\n')
